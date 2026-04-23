@@ -1,42 +1,51 @@
 import pandas as pd
 import numpy as np
 
-# 1. identify grouping columns more carefully
-group_cols = df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
-
-# 2. identify numeric columns
-sum_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-# 3. optional: remove numeric columns you do NOT want summed
-# sum_cols = [c for c in sum_cols if c not in ['meter_id', 'account_id']]
-
-# 4. make a copy so we don't mess up original df
+# make a copy
 work_df = df.copy()
 
-# 5. force grouping columns to string so mixed types don't break groupby
+# 1. find group-by columns (text/categorical)
+group_cols = work_df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
+
+# 2. find numeric columns
+num_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+
+# optional: remove numeric columns you do NOT want summarized
+# num_cols = [c for c in num_cols if c not in ['meter_id', 'account_id']]
+
+# 3. force group columns to string to avoid mixed-type errors
 for col in group_cols:
     work_df[col] = work_df[col].astype('string')
 
-# 6. aggregate safely
-if group_cols and sum_cols:
+# 4. build aggregation dictionary: sum + mean for each numeric column
+agg_dict = {col: ['sum', 'mean'] for col in num_cols}
+
+# 5. create summary table
+if group_cols and num_cols:
     summary_df = (
-        work_df.groupby(group_cols, dropna=False, sort=False)[sum_cols]
-        .sum()
+        work_df.groupby(group_cols, dropna=False, sort=False)
+        .agg(agg_dict)
         .reset_index()
     )
-elif sum_cols:
-    summary_df = pd.DataFrame([work_df[sum_cols].sum()])
+elif num_cols:
+    summary_df = work_df[num_cols].agg(['sum', 'mean']).T.reset_index()
+    summary_df.columns = ['metric', 'sum', 'mean']
 else:
     summary_df = pd.DataFrame()
 
+# 6. flatten multi-level column names
+summary_df.columns = [
+    '_'.join(col).strip('_') if isinstance(col, tuple) else col
+    for col in summary_df.columns
+]
+
+# 7. optional sort
+# replace 'non_com_count_sum' with your actual column name
+sort_col = 'non_com_count_sum'
+
+if sort_col in summary_df.columns:
+    summary_df = summary_df.sort_values(by=sort_col, ascending=False)
+
+# 8. view result
 print(summary_df.head())
-
-
-
-agg_dict = {col: ['sum', 'mean'] for col in sum_cols}
-
-summary_df = (
-    work_df.groupby(group_cols, dropna=False, sort=False)
-    .agg(agg_dict)
-    .reset_index()
-)
+print(summary_df.columns.tolist())
