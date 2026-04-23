@@ -1,0 +1,102 @@
+#numeric and ctegory
+
+import pandas as pd
+import numpy as np
+from scipy.stats import f_oneway, kruskal
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# df = your dataframe
+# example:
+# df = pd.read_csv("your_file.csv")
+
+# --------------------------------------------------
+# 1. Pick categorical and numeric columns
+# --------------------------------------------------
+cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+# Optional: drop ID-like columns
+# cat_cols = [c for c in cat_cols if c != 'meter_number']
+# num_cols = [c for c in num_cols if c != 'meter_number']
+
+# --------------------------------------------------
+# 2. Grouped summary stats
+# --------------------------------------------------
+grouped_summaries = {}
+
+for cat_col in cat_cols:
+    grouped_summaries[cat_col] = {}
+    
+    for num_col in num_cols:
+        summary = (
+            df.groupby(cat_col)[num_col]
+            .agg(['count', 'mean', 'median', 'std', 'min', 'max'])
+            .sort_values('mean', ascending=False)
+        )
+        grouped_summaries[cat_col][num_col] = summary
+
+# Example: print one result
+# print(grouped_summaries['hardware']['days_to_noncom'])
+
+# --------------------------------------------------
+# 3. ANOVA / Kruskal test function
+# --------------------------------------------------
+results = []
+
+for cat_col in cat_cols:
+    for num_col in num_cols:
+        temp = df[[cat_col, num_col]].dropna().copy()
+        
+        # skip if category has too few unique values
+        if temp[cat_col].nunique() < 2:
+            continue
+        
+        # build groups
+        groups = [group[num_col].values for _, group in temp.groupby(cat_col)]
+        
+        # skip if any weird issue leaves less than 2 groups
+        if len(groups) < 2:
+            continue
+        
+        # optional: require at least 2 rows per group
+        groups = [g for g in groups if len(g) > 1]
+        if len(groups) < 2:
+            continue
+        
+        # ANOVA
+        try:
+            anova_stat, anova_p = f_oneway(*groups)
+        except:
+            anova_stat, anova_p = np.nan, np.nan
+        
+        # Kruskal-Wallis
+        try:
+            kruskal_stat, kruskal_p = kruskal(*groups)
+        except:
+            kruskal_stat, kruskal_p = np.nan, np.nan
+        
+        results.append({
+            'categorical_column': cat_col,
+            'numeric_column': num_col,
+            'num_categories': temp[cat_col].nunique(),
+            'anova_stat': anova_stat,
+            'anova_p_value': anova_p,
+            'kruskal_stat': kruskal_stat,
+            'kruskal_p_value': kruskal_p
+        })
+
+results_df = pd.DataFrame(results)
+
+# sort by strongest evidence of difference
+results_df = results_df.sort_values(['kruskal_p_value', 'anova_p_value'], ascending=True)
+
+print("Top categorical vs numeric relationships:")
+print(results_df.head(20))
+
+
+# Example: save one summary table
+# grouped_summaries['hardware']['days_to_noncom'].to_csv('hardware_days_to_noncom_summary.csv')
+
+# Save all test results
+results_df.to_csv('categorical_vs_numeric_tests.csv', index=False)
