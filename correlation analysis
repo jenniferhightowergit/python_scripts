@@ -1,0 +1,71 @@
+import pandas as pd
+import numpy as np
+
+# df = your dataframe
+# example:
+# df = pd.read_csv("your_file.csv")
+
+# -----------------------------
+# 1. Keep only numeric columns
+# -----------------------------
+numeric_df = df.select_dtypes(include=[np.number]).copy()
+
+# Optional: drop ID-like columns if needed
+# numeric_df = numeric_df.drop(columns=['meter_number'], errors='ignore')
+
+# -----------------------------
+# 2. Pearson correlation
+#    Good for linear relationships
+# -----------------------------
+pearson_corr = numeric_df.corr(method='pearson')
+
+print("Pearson Correlation Matrix:")
+print(pearson_corr)
+
+# -----------------------------
+# 3. Spearman correlation
+#    Good for monotonic relationships
+#    and a little safer if data is skewed
+# -----------------------------
+spearman_corr = numeric_df.corr(method='spearman')
+
+print("\nSpearman Correlation Matrix:")
+print(spearman_corr)
+
+# -----------------------------
+# 4. Optional: flatten results
+#    so you can see top correlations
+# -----------------------------
+def flatten_corr_matrix(corr_matrix):
+    corr_pairs = (
+        corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        .stack()
+        .reset_index()
+    )
+    corr_pairs.columns = ['feature_1', 'feature_2', 'correlation']
+    corr_pairs['abs_correlation'] = corr_pairs['correlation'].abs()
+    corr_pairs = corr_pairs.sort_values('abs_correlation', ascending=False)
+    return corr_pairs
+
+pearson_pairs = flatten_corr_matrix(pearson_corr)
+spearman_pairs = flatten_corr_matrix(spearman_corr)
+
+print("\nTop Pearson Correlations:")
+print(pearson_pairs.head(20))
+
+print("\nTop Spearman Correlations:")
+print(spearman_pairs.head(20))
+
+
+  import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure(figsize=(12, 8))
+sns.heatmap(pearson_corr, annot=False, cmap='coolwarm', center=0)
+plt.title('Pearson Correlation Heatmap')
+plt.show()
+
+plt.figure(figsize=(12, 8))
+sns.heatmap(spearman_corr, annot=False, cmap='coolwarm', center=0)
+plt.title('Spearman Correlation Heatmap')
+plt.show()
