@@ -30,3 +30,13 @@ else:
     summary_df = pd.DataFrame()
 
 print(summary_df.head())
+
+
+
+agg_dict = {col: ['sum', 'mean'] for col in sum_cols}
+
+summary_df = (
+    work_df.groupby(group_cols, dropna=False, sort=False)
+    .agg(agg_dict)
+    .reset_index()
+)
