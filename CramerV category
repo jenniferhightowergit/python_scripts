@@ -1,0 +1,94 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import chi2_contingency
+
+# df = your dataframe
+# example:
+# df = pd.read_csv("your_file.csv")
+
+# -----------------------------------
+# 1. Select categorical columns only
+# -----------------------------------
+cat_df = df.select_dtypes(include=['object', 'category']).copy()
+
+# Optional: manually include columns that are categorical but stored differently
+# cat_df['firmware_version'] = df['firmware_version'].astype(str)
+
+# Optional: drop ID-like columns
+# cat_df = cat_df.drop(columns=['meter_number'], errors='ignore')
+
+# -----------------------------------
+# 2. Function to calculate Cramér’s V
+# -----------------------------------
+def cramers_v(x, y):
+    confusion_matrix = pd.crosstab(x, y)
+    
+    if confusion_matrix.empty:
+        return np.nan
+    
+    chi2 = chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    
+    if n == 0:
+        return np.nan
+    
+    r, k = confusion_matrix.shape
+    phi2 = chi2 / n
+    
+    # Bias correction
+    phi2corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
+    rcorr = r - ((r - 1) ** 2) / (n - 1)
+    kcorr = k - ((k - 1) ** 2) / (n - 1)
+    
+    denom = min((kcorr - 1), (rcorr - 1))
+    
+    if denom <= 0:
+        return np.nan
+    
+    return np.sqrt(phi2corr / denom)
+
+# -----------------------------------
+# 3. Build Cramér’s V matrix
+# -----------------------------------
+cols = cat_df.columns
+cramers_matrix = pd.DataFrame(index=cols, columns=cols, dtype=float)
+
+for col1 in cols:
+    for col2 in cols:
+        if col1 == col2:
+            cramers_matrix.loc[col1, col2] = 1.0
+        else:
+            cramers_matrix.loc[col1, col2] = cramers_v(cat_df[col1], cat_df[col2])
+
+print("Cramér’s V Matrix:")
+print(cramers_matrix)
+
+# -----------------------------------
+# 4. Flatten matrix to see top pairs
+# -----------------------------------
+def flatten_cramers_matrix(matrix):
+    pairs = (
+        matrix.where(np.triu(np.ones(matrix.shape), k=1).astype(bool))
+        .stack()
+        .reset_index()
+    )
+    pairs.columns = ['feature_1', 'feature_2', 'cramers_v']
+    pairs = pairs.sort_values('cramers_v', ascending=False)
+    return pairs
+
+cramers_pairs = flatten_cramers_matrix(cramers_matrix)
+
+print("\nTop Categorical Associations (Cramér’s V):")
+print(cramers_pairs.head(20))
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure(figsize=(12, 8))
+sns.heatmap(cramers_matrix, annot=False, cmap='Blues', vmin=0, vmax=1)
+plt.title("Cramér’s V Heatmap")
+plt.show()
+
+
+cat_df = cat_df.fillna("Missing")
