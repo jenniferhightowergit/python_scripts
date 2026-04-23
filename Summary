@@ -1,13 +1,32 @@
+import pandas as pd
+import numpy as np
+
+# 1. identify grouping columns more carefully
 group_cols = df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
+
+# 2. identify numeric columns
 sum_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-summary_df = (
-    df.groupby(group_cols, dropna=False)[sum_cols]
-      .sum()
-      .reset_index()
-)
+# 3. optional: remove numeric columns you do NOT want summed
+# sum_cols = [c for c in sum_cols if c not in ['meter_id', 'account_id']]
 
-# sort by non_conflicts (largest first)
-summary_df = summary_df.sort_values(by='non_conflicts', ascending=False)
+# 4. make a copy so we don't mess up original df
+work_df = df.copy()
+
+# 5. force grouping columns to string so mixed types don't break groupby
+for col in group_cols:
+    work_df[col] = work_df[col].astype('string')
+
+# 6. aggregate safely
+if group_cols and sum_cols:
+    summary_df = (
+        work_df.groupby(group_cols, dropna=False, sort=False)[sum_cols]
+        .sum()
+        .reset_index()
+    )
+elif sum_cols:
+    summary_df = pd.DataFrame([work_df[sum_cols].sum()])
+else:
+    summary_df = pd.DataFrame()
 
 print(summary_df.head())
