@@ -1,0 +1,13 @@
+group_cols = df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
+sum_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+summary_df = (
+    df.groupby(group_cols, dropna=False)[sum_cols]
+      .sum()
+      .reset_index()
+)
+
+# sort by non_conflicts (largest first)
+summary_df = summary_df.sort_values(by='non_conflicts', ascending=False)
+
+print(summary_df.head())
