@@ -1,0 +1,14 @@
+import json
+
+# Convert your event dataframe to JSON
+events_json = events_df[[
+    "event_date", "month", "year", "day_of_week",
+    "quarter", "event_type", "op_area",
+    "non_com_flag", "meter_change_flag"
+]].to_json(orient="records")
+
+print(events_json[:500])  # preview it
+
+
+
+const RAW_EVENTS = [  /* paste your JSON array here */  ];
