@@ -1,14 +1,78 @@
-import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
-# Convert your event dataframe to JSON
-events_json = events_df[[
-    "event_date", "month", "year", "day_of_week",
-    "quarter", "event_type", "op_area",
-    "non_com_flag", "meter_change_flag"
-]].to_json(orient="records")
+plt.style.use("dark_background")
 
-print(events_json[:500])  # preview it
+events_df = pd.read_json("events_export.json")
+events_df["event_date"] = pd.to_datetime(events_df["event_date"])
+events_df.head()
+
+# Group by month and event type
+monthly = (
+    events_df
+    .groupby([events_df["event_date"].dt.to_period("M"), "event_type"])
+    .size()
+    .unstack(fill_value=0)
+)
+
+fig, ax = plt.subplots(figsize=(16, 5))
+for col in monthly.columns:
+    ax.plot(monthly.index.astype(str), monthly[col], label=col, linewidth=2)
+
+ax.set_title("Monthly Event Count by Type", fontsize=14, pad=12)
+ax.set_xlabel("")
+ax.xaxis.set_major_locator(mticker.MultipleLocator(6))
+plt.xticks(rotation=45, ha="right")
+ax.legend()
+ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.show()
+
+
+# Group by month number and year so each year is its own line
+yoy = (
+    events_df
+    .groupby([events_df["event_date"].dt.year, events_df["event_date"].dt.month])
+    .size()
+    .unstack(level=0, fill_value=0)
+)
+yoy.index = ["Jan","Feb","Mar","Apr","May","Jun",
+             "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+fig, ax = plt.subplots(figsize=(12, 5))
+for year in yoy.columns:
+    ax.plot(yoy.index, yoy[year], label=str(year), linewidth=2, marker="o", markersize=4)
+
+ax.set_title("Year-over-Year Monthly Event Volume", fontsize=14, pad=12)
+ax.legend(title="Year")
+ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.show()
 
 
 
-const RAW_EVENTS = [  /* paste your JSON array here */  ];
+yearly = (
+    events_df
+    .groupby([events_df["event_date"].dt.year, "event_type"])
+    .size()
+    .unstack(fill_value=0)
+)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+yearly.plot(kind="bar", stacked=True, ax=ax, width=0.6)
+
+ax.set_title("Total Event Volume by Year", fontsize=14, pad=12)
+ax.set_xlabel("")
+plt.xticks(rotation=0)
+ax.legend(title="Event Type", bbox_to_anchor=(1.01, 1), loc="upper left")
+ax.grid(alpha=0.2, axis="y")
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
