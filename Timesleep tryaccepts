@@ -1,3 +1,64 @@
+def _fetch_year_for_cells(
+    cells: pd.DataFrame,
+    year: int,
+    overall_start: pd.Timestamp,
+    overall_end: pd.Timestamp,
+    lat_col: str,
+    lon_col: str,
+    verbose: bool,
+) -> pd.DataFrame:
+    year_start = max(pd.Timestamp(f"{year}-01-01"), overall_start).strftime("%Y-%m-%d")
+    year_end = min(pd.Timestamp(f"{year}-12-31"), overall_end).strftime("%Y-%m-%d")
+
+    rows: list[dict] = []
+    n_batches = (len(cells) + OPEN_METEO_BATCH - 1) // OPEN_METEO_BATCH
+    
+    batch_wait = 2  # start fast, slow down if we hit trouble
+
+    for b_idx, i in enumerate(range(0, len(cells), OPEN_METEO_BATCH), start=1):
+        batch = cells.iloc[i : i + OPEN_METEO_BATCH]
+        if verbose:
+            print(f"  {year}: batch {b_idx}/{n_batches} ({len(batch)} cells) — waiting {batch_wait}s between batches")
+        
+        try:
+            results = _open_meteo_request(
+                batch[lat_col].tolist(),
+                batch[lon_col].tolist(),
+                year_start,
+                year_end,
+            )
+            # If successful, try to speed back up a little
+            batch_wait = max(2, batch_wait - 1)
+            
+        except RuntimeError as e:
+            # All retries inside _open_meteo_request failed, slow down and skip batch
+            batch_wait = min(120, batch_wait * 2)
+            print(f"  Batch {b_idx} failed completely, skipping. Increasing wait to {batch_wait}s")
+            continue
+
+        for cell_row, result in zip(batch.itertuples(index=False), results):
+            daily = result.get("daily", {}) or {}
+            dates = pd.to_datetime(daily.get("time", []))
+            tmax = daily.get("temperature_2m_max", []) or []
+            tmin = daily.get("temperature_2m_min", []) or []
+            precip = daily.get("precipitation_sum", []) or []
+            for d, tx, tn, pr in zip(dates, tmax, tmin, precip):
+                rows.append({
+                    lat_col: getattr(cell_row, lat_col),
+                    lon_col: getattr(cell_row, lon_col),
+                    "date": d,
+                    "tmax_f": tx,
+                    "tmin_f": tn,
+                    "precip_in": pr,
+                })
+        
+        time.sleep(batch_wait)
+
+    return pd.DataFrame(rows)
+
+
+
+
 def _open_meteo_request(
     lats: list[float],
     lons: list[float],
