@@ -1,28 +1,52 @@
 """
 shared_drive_ncm.py
 ===================
-Find the latest file whose name contains "ncm" on a shared (or local) drive,
+Find the latest file whose name contains "ncm" on a Windows shared drive,
 retrieve its last-modified date, and stamp that date onto any DataFrame as a
 new column.
 
-Works with:
-  - UNC / Windows network paths  (\\\\server\\share\\folder)
-  - Linux / macOS mount points   (/mnt/shared/folder)
-  - Google Drive via PyDrive2    (set use_google_drive=True)
+Two access modes
+----------------
+1. **Mounted share** – the Windows share is already mapped or mounted as a
+   drive letter (Windows) or CIFS mount (Linux).  Use
+   ``find_latest_ncm_file(path)``.
 
-Quick start
------------
-    from shared_drive_ncm import find_latest_ncm_file, stamp_ncm_date
+2. **Direct SMB** – connect over the network without mounting first.  Requires
+   ``pip install smbprotocol``.  Use ``find_latest_ncm_file_smb(...)``.
 
-    path, mtime = find_latest_ncm_file(r"\\server\share\data")
+Quick start — mounted share (simplest)
+---------------------------------------
+    from shared_drive_ncm import load_ncm_with_date
+
+    # Windows drive letter
+    df, path, mtime = load_ncm_with_date(r"Z:\\AMI\\reports", meters_df)
+
+    # Linux CIFS mount (sudo mount -t cifs //server/share /mnt/share ...)
+    df, path, mtime = load_ncm_with_date("/mnt/share/AMI/reports", meters_df)
+
+    print(f"NCM file : {path.name}")
+    print(f"Updated  : {mtime.date()}")
+    print(df[["meter_id", "ncm_file_date"]].head())
+
+Quick start — direct SMB (no mount needed)
+-------------------------------------------
+    from shared_drive_ncm import find_latest_ncm_file_smb, stamp_ncm_date
+
+    fname, mtime = find_latest_ncm_file_smb(
+        server="fileserver",
+        share="AMI",
+        remote_dir="reports",
+        username="DOMAIN\\\\user",
+        password="secret",
+    )
     df = stamp_ncm_date(df, mtime)
-    print(df["ncm_file_date"].iloc[0])   # e.g. 2024-03-15
+    print(f"NCM file : {fname}  updated: {mtime.date()}")
+    print(df[["meter_id", "ncm_file_date"]].head())
 """
 
 from __future__ import annotations
 
 import os
-import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -31,7 +55,7 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Core: find the latest NCM file on a local / network share
+# Mode 1: mounted share (drive letter or CIFS mount point)
 # ---------------------------------------------------------------------------
 
 def find_latest_ncm_file(
@@ -41,21 +65,25 @@ def find_latest_ncm_file(
 ) -> Tuple[Path, datetime]:
     """Return the most recently modified file matching *pattern* under *directory*.
 
+    Works with Windows drive letters (``Z:\\folder``), UNC paths that are
+    already accessible as a filesystem path, or Linux CIFS mount points
+    (``/mnt/share/folder``).
+
     Parameters
     ----------
     directory : str | Path
-        Root folder to search (e.g. ``r"\\\\server\\share\\data"`` or
-        ``"/mnt/gdrive/data"``).
+        Root folder to search.
     pattern : str
-        Glob pattern used to filter filenames.  Defaults to ``"*ncm*"``.
+        Glob pattern for filenames.  Default ``"*ncm*"`` matches any file
+        whose name contains "ncm" (case-sensitive on Linux).
     recursive : bool
-        If True, search subdirectories as well.
+        If True, descend into subdirectories.
 
     Returns
     -------
     (Path, datetime)
-        Absolute path to the latest matching file and its last-modified time
-        (UTC-aware).
+        Absolute path of the newest matching file and its last-modified time
+        (UTC-aware datetime).
 
     Raises
     ------
@@ -75,89 +103,98 @@ def find_latest_ncm_file(
             + (" (recursive)" if recursive else "")
         )
 
-    # Sort by modification time descending; take the newest
     latest = max(matches, key=lambda p: p.stat().st_mtime)
     mtime_utc = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
     return latest, mtime_utc
 
 
 # ---------------------------------------------------------------------------
-# Core: find the latest NCM file via Google Drive API (PyDrive2)
+# Mode 2: direct SMB connection (no mount required)
 # ---------------------------------------------------------------------------
 
-def find_latest_ncm_file_gdrive(
-    folder_id: str,
+def find_latest_ncm_file_smb(
+    server: str,
+    share: str,
+    remote_dir: str = "",
+    username: Optional[str] = None,
+    password: Optional[str] = None,
     name_contains: str = "ncm",
-    credentials_file: Optional[str] = "mycreds.txt",
-    client_secrets_file: str = "client_secrets.json",
-) -> Tuple[str, str, datetime]:
-    """Return the most recently modified Google Drive file whose name contains
-    *name_contains*.
+    port: int = 445,
+) -> Tuple[str, datetime]:
+    """Return the most recently modified file whose name contains *name_contains*
+    on a Windows SMB share, without requiring the share to be mounted first.
 
-    Requires ``pydrive2`` (``pip install pydrive2``).
+    Requires ``smbprotocol`` (``pip install smbprotocol``).
 
     Parameters
     ----------
-    folder_id : str
-        Google Drive folder ID (the long string in the Drive URL).
+    server : str
+        Hostname or IP address of the file server (e.g. ``"fileserver"`` or
+        ``"192.168.1.10"``).
+    share : str
+        Share name (e.g. ``"AMI"`` for ``\\\\fileserver\\AMI``).
+    remote_dir : str
+        Path inside the share to search (e.g. ``"reports\\ncm_exports"``).
+        Use forward or back slashes; leave empty for the share root.
+    username : str | None
+        Domain or local account, e.g. ``"DOMAIN\\\\user"`` or just ``"user"``.
+        If None, attempts anonymous / current-user auth (Windows only).
+    password : str | None
+        Password for *username*.
     name_contains : str
         Substring that must appear in the filename (case-insensitive).
-    credentials_file : str | None
-        Path where cached OAuth tokens are stored.  Created automatically on
-        first run if it does not exist.
-    client_secrets_file : str
-        Path to the OAuth 2.0 client secrets JSON downloaded from Google Cloud
-        Console.
+    port : int
+        SMB port.  Default 445.
 
     Returns
     -------
-    (file_id, file_name, modified_datetime_utc)
+    (filename, modified_datetime_utc)
+        The bare filename of the newest matching file and its last-modified
+        time as a UTC-aware datetime.
+
+    Raises
+    ------
+    ImportError
+        If ``smbprotocol`` is not installed.
+    FileNotFoundError
+        If no matching files are found.
     """
     try:
-        from pydrive2.auth import GoogleAuth
-        from pydrive2.drive import GoogleDrive
+        import smbclient
+        import smbclient.path as smbpath
     except ImportError as exc:
         raise ImportError(
-            "pydrive2 is required for Google Drive access.  "
-            "Install it with:  pip install pydrive2"
+            "smbprotocol is required for direct SMB access.  "
+            "Install it with:  pip install smbprotocol"
         ) from exc
 
-    gauth = GoogleAuth()
-    gauth.settings["client_config_file"] = client_secrets_file
-    if credentials_file and os.path.exists(credentials_file):
-        gauth.LoadCredentialsFile(credentials_file)
-        if gauth.credentials is None or gauth.access_token_expired:
-            gauth.Refresh()
-    else:
-        gauth.LocalWebserverAuth()
-    if credentials_file:
-        gauth.SaveCredentialsFile(credentials_file)
-
-    drive = GoogleDrive(gauth)
-
-    query = (
-        f"'{folder_id}' in parents and trashed=false "
-        f"and mimeType != 'application/vnd.google-apps.folder'"
+    smbclient.register_session(
+        server, username=username, password=password, port=port
     )
-    file_list = drive.ListFile({"q": query}).GetList()
 
-    ncm_files = [
-        f for f in file_list
-        if name_contains.lower() in f["title"].lower()
-    ]
-    if not ncm_files:
+    remote_path = f"\\\\{server}\\{share}"
+    if remote_dir:
+        remote_path = remote_path + "\\" + remote_dir.replace("/", "\\")
+
+    try:
+        entries = list(smbclient.scandir(remote_path))
+    except Exception as exc:
         raise FileNotFoundError(
-            f"No files containing '{name_contains}' found in Drive folder {folder_id}"
+            f"Could not list {remote_path}: {exc}"
+        ) from exc
+
+    matches = [
+        e for e in entries
+        if not e.is_dir() and name_contains.lower() in e.name.lower()
+    ]
+    if not matches:
+        raise FileNotFoundError(
+            f"No files containing '{name_contains}' found in {remote_path}"
         )
 
-    latest = max(
-        ncm_files,
-        key=lambda f: f["modifiedDate"],  # ISO 8601 string; lexicographic sort works
-    )
-    mtime_utc = datetime.fromisoformat(
-        latest["modifiedDate"].replace("Z", "+00:00")
-    )
-    return latest["id"], latest["title"], mtime_utc
+    latest = max(matches, key=lambda e: e.stat().st_mtime)
+    mtime_utc = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
+    return latest.name, mtime_utc
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +214,12 @@ def stamp_ncm_date(
     df : pd.DataFrame
         The DataFrame to annotate.
     file_modified : datetime
-        Last-modified timestamp returned by ``find_latest_ncm_file`` or
-        ``find_latest_ncm_file_gdrive``.
+        Last-modified timestamp from ``find_latest_ncm_file`` or
+        ``find_latest_ncm_file_smb``.
     col_name : str
-        Name of the new column.
+        Name of the new column.  Default ``"ncm_file_date"``.
     date_only : bool
-        If True (default), store only the date portion (``datetime.date``).
+        If True (default), store the date portion only (``datetime.date``).
         If False, store the full UTC-aware ``datetime``.
 
     Returns
@@ -197,7 +234,7 @@ def stamp_ncm_date(
 
 
 # ---------------------------------------------------------------------------
-# Convenience wrapper: one call does everything for a local/network share
+# Convenience wrapper for mounted shares
 # ---------------------------------------------------------------------------
 
 def load_ncm_with_date(
@@ -208,7 +245,7 @@ def load_ncm_with_date(
     col_name: str = "ncm_file_date",
     date_only: bool = True,
 ) -> Tuple[pd.DataFrame, Path, datetime]:
-    """Find the latest NCM file, read its modified date, and stamp *df*.
+    """Find the latest NCM file on a mounted share, get its date, and stamp *df*.
 
     Returns
     -------
@@ -219,12 +256,14 @@ def load_ncm_with_date(
     ::
 
         df, ncm_path, ncm_date = load_ncm_with_date(
-            r"\\\\fileserver\\AMI\\reports",
+            r"Z:\\AMI\\reports",   # or "/mnt/share/AMI/reports" on Linux
             meters_df,
         )
         print(f"NCM file: {ncm_path.name}  updated: {ncm_date.date()}")
         print(df[["meter_id", "ncm_file_date"]].head())
     """
-    file_path, mtime = find_latest_ncm_file(directory, pattern=pattern, recursive=recursive)
+    file_path, mtime = find_latest_ncm_file(
+        directory, pattern=pattern, recursive=recursive
+    )
     stamped = stamp_ncm_date(df, mtime, col_name=col_name, date_only=date_only)
     return stamped, file_path, mtime
