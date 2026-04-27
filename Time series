@@ -4,6 +4,33 @@ import matplotlib.ticker as mticker
 
 plt.style.use("dark_background")
 
+
+# Sum the flag columns by month instead of counting rows
+monthly = (
+    events_df
+    .groupby(events_df["event_date"].dt.to_period("M"))[["non_com_flag", "meter_change_flag"]]
+    .sum()
+)
+
+# Rename so the chart labels are cleaner
+monthly.columns = ["Non-Com", "Meter Change"]
+
+fig, ax = plt.subplots(figsize=(16, 5))
+for col in monthly.columns:
+    ax.plot(monthly.index.astype(str), monthly[col], label=col, linewidth=2)
+
+ax.set_title("Monthly Event Count by Type", fontsize=14, pad=12)
+ax.set_xlabel("")
+ax.xaxis.set_major_locator(mticker.MultipleLocator(6))
+plt.xticks(rotation=45, ha="right")
+ax.legend()
+ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.show()
+
+
+
+
 events_df = pd.read_json("events_export.json")
 events_df["event_date"] = pd.to_datetime(events_df["event_date"])
 events_df.head()
