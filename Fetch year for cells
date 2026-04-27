@@ -1,0 +1,102 @@
+def _fetch_year_for_cells(
+    cells: pd.DataFrame,
+    year: int,
+    overall_start: pd.Timestamp,
+    overall_end: pd.Timestamp,
+    lat_col: str,
+    lon_col: str,
+    verbose: bool,
+    cache_dir: str = "./weather_cache",
+) -> pd.DataFrame:
+    year_start = max(pd.Timestamp(f"{year}-01-01"), overall_start).strftime("%Y-%m-%d")
+    year_end = min(pd.Timestamp(f"{year}-12-31"), overall_end).strftime("%Y-%m-%d")
+
+    n_batches = (len(cells) + OPEN_METEO_BATCH - 1) // OPEN_METEO_BATCH
+    wait_times = [2, 5, 10, 30, 60, 120]
+
+    # ── Check for an existing checkpoint so we can resume ──────────────────
+    checkpoint_file = Path(cache_dir) / f"checkpoint_{year}.parquet"
+    if checkpoint_file.exists():
+        checkpoint_df = pd.read_parquet(checkpoint_file)
+        rows = checkpoint_df.to_dict("records")
+        # Figure out which cells already have data so we can skip them
+        done_keys = set(
+            zip(checkpoint_df[lat_col].round(2), checkpoint_df[lon_col].round(2))
+        )
+        if verbose:
+            print(f"  {year}: resuming from checkpoint — {len(done_keys)} cells already done")
+    else:
+        rows = []
+        done_keys = set()
+
+    for b_idx, i in enumerate(range(0, len(cells), OPEN_METEO_BATCH), start=1):
+        batch = cells.iloc[i : i + OPEN_METEO_BATCH]
+
+        # Skip cells we already have data for
+        batch = batch[
+            ~batch.apply(
+                lambda r: (round(r[lat_col], 2), round(r[lon_col], 2)) in done_keys,
+                axis=1,
+            )
+        ]
+        if len(batch) == 0:
+            if verbose:
+                print(f"  {year}: batch {b_idx}/{n_batches} already cached, skipping")
+            continue
+
+        if verbose:
+            print(f"  {year}: batch {b_idx}/{n_batches} ({len(batch)} cells)")
+
+        # Retry with escalating waits
+        results = None
+        for attempt, wait in enumerate(wait_times):
+            try:
+                results = _open_meteo_request(
+                    batch[lat_col].tolist(),
+                    batch[lon_col].tolist(),
+                    year_start,
+                    year_end,
+                )
+                break
+            except RuntimeError as e:
+                print(f"  Batch {b_idx} failed (attempt {attempt+1}), waiting {wait}s...")
+                time.sleep(wait)
+
+        if results is None:
+            print(f"  Batch {b_idx} exhausted all retries, skipping.")
+            continue
+
+        # Add successful batch results to rows
+        for cell_row, result in zip(batch.itertuples(index=False), results):
+            daily = result.get("daily", {}) or {}
+            dates = pd.to_datetime(daily.get("time", []))
+            tmax = daily.get("temperature_2m_max", []) or []
+            tmin = daily.get("temperature_2m_min", []) or []
+            precip = daily.get("precipitation_sum", []) or []
+            for d, tx, tn, pr in zip(dates, tmax, tmin, precip):
+                rows.append({
+                    lat_col: getattr(cell_row, lat_col),
+                    lon_col: getattr(cell_row, lon_col),
+                    "date": d,
+                    "tmax_f": tx,
+                    "tmin_f": tn,
+                    "precip_in": pr,
+                })
+            done_keys.add((round(getattr(cell_row, lat_col), 2),
+                           round(getattr(cell_row, lon_col), 2)))
+
+        # ── Save checkpoint after every batch ──────────────────────────────
+        checkpoint_df = pd.DataFrame(rows)
+        checkpoint_df.to_parquet(checkpoint_file, index=False)
+        if verbose:
+            print(f"  {year}: checkpoint saved ({len(rows):,} rows so far)")
+
+        time.sleep(wait_times[0])
+
+    # Clean up checkpoint file once the year completes successfully
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+        if verbose:
+            print(f"  {year}: complete, checkpoint cleaned up")
+
+    return pd.DataFrame(rows)
