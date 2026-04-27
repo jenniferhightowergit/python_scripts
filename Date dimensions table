@@ -1,0 +1,23 @@
+# Build a date dimension table
+date_dim = pd.DataFrame({
+    "date": pd.date_range(start="2021-01-01", end="2026-04-26", freq="D")
+})
+
+# Add all the columns you'd want in a SQL date dim
+date_dim["year"]          = date_dim["date"].dt.year
+date_dim["month"]         = date_dim["date"].dt.month
+date_dim["month_name"]    = date_dim["date"].dt.strftime("%B")
+date_dim["day"]           = date_dim["date"].dt.day
+date_dim["day_of_week"]   = date_dim["date"].dt.dayofweek      # 0=Monday, 6=Sunday
+date_dim["day_name"]      = date_dim["date"].dt.strftime("%A")
+date_dim["quarter"]       = date_dim["date"].dt.quarter
+date_dim["is_weekend"]    = date_dim["day_of_week"].isin([5, 6])
+date_dim["season"]        = date_dim["month"].map({
+                                12: "Winter", 1: "Winter",  2: "Winter",
+                                3:  "Spring", 4: "Spring",  5: "Spring",
+                                6:  "Summer", 7: "Summer",  8: "Summer",
+                                9:  "Fall",   10: "Fall",   11: "Fall"
+                            })
+
+print(date_dim.shape)
+date_dim.head()
