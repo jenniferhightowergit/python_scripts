@@ -1,3 +1,4 @@
+
 def _fetch_year_for_cells(
     cells: pd.DataFrame,
     year: int,
@@ -13,27 +14,30 @@ def _fetch_year_for_cells(
     rows: list[dict] = []
     n_batches = (len(cells) + OPEN_METEO_BATCH - 1) // OPEN_METEO_BATCH
     
-    batch_wait = 2  # start fast, slow down if we hit trouble
+    wait_times = [2, 5, 10, 30, 60, 120]  # same ladder as _open_meteo_request
 
     for b_idx, i in enumerate(range(0, len(cells), OPEN_METEO_BATCH), start=1):
         batch = cells.iloc[i : i + OPEN_METEO_BATCH]
         if verbose:
-            print(f"  {year}: batch {b_idx}/{n_batches} ({len(batch)} cells) — waiting {batch_wait}s between batches")
-        
-        try:
-            results = _open_meteo_request(
-                batch[lat_col].tolist(),
-                batch[lon_col].tolist(),
-                year_start,
-                year_end,
-            )
-            # If successful, try to speed back up a little
-            batch_wait = max(2, batch_wait - 1)
-            
-        except RuntimeError as e:
-            # All retries inside _open_meteo_request failed, slow down and skip batch
-            batch_wait = min(120, batch_wait * 2)
-            print(f"  Batch {b_idx} failed completely, skipping. Increasing wait to {batch_wait}s")
+            print(f"  {year}: batch {b_idx}/{n_batches} ({len(batch)} cells)")
+
+        # Retry this batch with escalating waits before giving up
+        results = None
+        for attempt, wait in enumerate(wait_times):
+            try:
+                results = _open_meteo_request(
+                    batch[lat_col].tolist(),
+                    batch[lon_col].tolist(),
+                    year_start,
+                    year_end,
+                )
+                break  # success, stop retrying
+            except RuntimeError as e:
+                print(f"  Batch {b_idx} failed (attempt {attempt+1}), waiting {wait}s before retry...")
+                time.sleep(wait)
+
+        if results is None:
+            print(f"  Batch {b_idx} exhausted all retries, skipping.")
             continue
 
         for cell_row, result in zip(batch.itertuples(index=False), results):
@@ -51,8 +55,8 @@ def _fetch_year_for_cells(
                     "tmin_f": tn,
                     "precip_in": pr,
                 })
-        
-        time.sleep(batch_wait)
+
+        time.sleep(wait_times[0])  # always wait at least 2s between batches
 
     return pd.DataFrame(rows)
 
