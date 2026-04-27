@@ -1,0 +1,39 @@
+def _open_meteo_request(
+    lats: list[float],
+    lons: list[float],
+    start_date: str,
+    end_date: str,
+    retries: int = 6,
+) -> list[dict]:
+    params = {
+        "latitude": ",".join(f"{x:.4f}" for x in lats),
+        "longitude": ",".join(f"{x:.4f}" for x in lons),
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "America/Chicago",
+    }
+    
+    wait_times = [2, 5, 10, 30, 60, 120]  # seconds to wait on each retry
+    
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(OPEN_METEO_URL, params=params, timeout=120,
+                              headers={"User-Agent": DEFAULT_USER_AGENT}, verify=False)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                data = [data]
+            return data
+        except Exception as e:
+            last_exc = e
+            wait = wait_times[attempt] if attempt < len(wait_times) else 120
+            print(f"  Request failed (attempt {attempt+1}), waiting {wait}s before retry...")
+            time.sleep(wait)
+    
+    raise RuntimeError(
+        f"Open-Meteo request failed after {retries} retries: {last_exc}"
+    )
