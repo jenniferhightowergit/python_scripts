@@ -1,3 +1,45 @@
+# Run this ONCE right after you load events_df
+# Everything below will be fast after this
+
+events_df["event_date"] = pd.to_datetime(events_df["event_date"])
+events_df["month_period"] = events_df["event_date"].dt.to_period("M")
+events_df["year"] = events_df["event_date"].dt.year
+events_df["month"] = events_df["event_date"].dt.month
+
+# Pre-aggregate your summary tables
+monthly_outages = (
+    events_df[events_df["event_type"] == "Outage"]
+    .groupby("month_period")
+    .size()
+)
+
+monthly_noncoms = (
+    events_df["non_com_flag"]
+    .groupby(events_df["month_period"])
+    .sum()
+)
+
+# Year over year
+yoy_outages = (
+    events_df[events_df["event_type"] == "Outage"]
+    .groupby(["year", "month"])
+    .size()
+    .unstack(level=0, fill_value=0)
+)
+
+yoy_noncoms = (
+    events_df.groupby(["year", "month"])["non_com_flag"]
+    .sum()
+    .unstack(level=0, fill_value=0)
+)
+
+print("Done aggregating — charts will be fast from here")
+print(f"Monthly outage periods: {len(monthly_outages)}")
+print(f"Monthly non-com periods: {len(monthly_noncoms)}")
+
+
+
+
 fig, ax1 = plt.subplots(figsize=(16, 5))
 
 # Outages on left axis
