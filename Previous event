@@ -1,0 +1,28 @@
+# Make sure data is sorted correctly with outages before non-coms on same day
+combined = combined.sort_values(
+    by=["meter_num", "event_date", "event_priority"],
+    ascending=[True, True, True]
+).reset_index(drop=True)
+
+# Get previous 3 events per meter using shift
+combined["prev_event_1_type"] = combined.groupby("meter_num")["event_type"].shift(1)
+combined["prev_event_1_date"] = combined.groupby("meter_num")["event_date"].shift(1)
+
+combined["prev_event_2_type"] = combined.groupby("meter_num")["event_type"].shift(2)
+combined["prev_event_2_date"] = combined.groupby("meter_num")["event_date"].shift(2)
+
+combined["prev_event_3_type"] = combined.groupby("meter_num")["event_type"].shift(3)
+combined["prev_event_3_date"] = combined.groupby("meter_num")["event_date"].shift(3)
+
+# Now filter down to only non-com rows
+noncoms_with_history = combined[combined["non_com_flag"] == 1][[
+    "meter_num",
+    "event_date",
+    "event_type",
+    "prev_event_1_type", "prev_event_1_date",
+    "prev_event_2_type", "prev_event_2_date",
+    "prev_event_3_type", "prev_event_3_date",
+]]
+
+print(noncoms_with_history.shape)
+noncoms_with_history.head(20)
