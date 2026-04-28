@@ -1,0 +1,56 @@
+# ── Temperature buckets ──────────────────────────────────────────
+weather_df["temp_bucket"] = pd.cut(
+    weather_df["surface_temp_f"],
+    bins=[-float("inf"), 32, 45, 60, 80, 95, 100, float("inf")],
+    labels=["Freezing", "Very Cold", "Cold", "Mild", "Warm", "Hot", "Extreme Heat"]
+)
+
+# ── Dew point buckets ────────────────────────────────────────────
+weather_df["dewpoint_bucket"] = pd.cut(
+    weather_df["dewpoint_temp_f"],
+    bins=[-float("inf"), 32, 50, 60, 65, 70, float("inf")],
+    labels=["Dry", "Comfortable", "Moderate", "Humid", "Very Humid", "Oppressive"]
+)
+
+# ── Wet bulb buckets ─────────────────────────────────────────────
+weather_df["wetbulb_bucket"] = pd.cut(
+    weather_df["wetbulb_temp_f"],
+    bins=[-float("inf"), 32, 60, 75, 85, float("inf")],
+    labels=["Freezing", "Cool", "Moderate", "Stressful", "Dangerous"]
+)
+
+# ── Humidity buckets ─────────────────────────────────────────────
+weather_df["humidity_bucket"] = pd.cut(
+    weather_df["relative_humidity"],
+    bins=[0, 30, 50, 70, 85, 100],
+    labels=["Dry", "Comfortable", "Moderate", "Humid", "Very Humid"]
+)
+
+# ── Wind speed buckets ───────────────────────────────────────────
+weather_df["wind_bucket"] = pd.cut(
+    weather_df["wind_speed_mph"],
+    bins=[0, 10, 20, 35, 50, float("inf")],
+    labels=["Calm", "Breezy", "Windy", "Very Windy", "Severe"]
+)
+
+# ── Heat index buckets ───────────────────────────────────────────
+weather_df["heat_index_bucket"] = pd.cut(
+    weather_df["heat_index_f"],
+    bins=[-float("inf"), 80, 90, 103, 125, float("inf")],
+    labels=["Normal", "Caution", "Extreme Caution", "Danger", "Extreme Danger"]
+)
+
+# ── Pressure buckets (dropping pressure = storm coming) ──────────
+weather_df["pressure_bucket"] = pd.cut(
+    weather_df["pressure_mb"],
+    bins=[0, 980, 1000, 1013, 1025, float("inf")],
+    labels=["Stormy", "Low", "Normal", "High", "Very High"]
+)
+
+# Preview
+weather_df[[
+    "surface_temp_f", "temp_bucket",
+    "relative_humidity", "humidity_bucket",
+    "wind_speed_mph", "wind_bucket",
+    "heat_index_f", "heat_index_bucket"
+]].head(20)
