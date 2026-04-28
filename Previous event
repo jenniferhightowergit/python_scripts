@@ -26,3 +26,134 @@ noncoms_with_history = combined[combined["non_com_flag"] == 1][[
 
 print(noncoms_with_history.shape)
 noncoms_with_history.head(20)
+
+
+
+
+import pandas as pd
+
+# Sort correctly — outages before non-coms on same day
+combined = combined.sort_values(
+    by=["meter_num", "event_date", "event_priority"],
+    ascending=[True, True, True]
+).reset_index(drop=True)
+
+# ── Pull out non-com anchor rows ──────────────────────────────────────────────
+noncoms = (
+    combined[combined["non_com_flag"] == 1]
+    [["meter_num", "event_date", "event_type"]]
+    .copy()
+    .rename(columns={"event_date": "noncom_date", "event_type": "noncom_event_type"})
+)
+
+# ── All events as the history pool ───────────────────────────────────────────
+history_pool = combined[["meter_num", "event_date", "event_type"]].copy()
+
+# ── Self-join on meter, then filter to 30-day lookback window ─────────────────
+merged = noncoms.merge(history_pool, on="meter_num")
+
+merged = merged[
+    (merged["event_date"] < merged["noncom_date"]) &                          # strictly before
+    (merged["event_date"] >= merged["noncom_date"] - pd.Timedelta(days=30))   # within 30 days
+]
+
+# ── Rank events within each non-com window (1 = earliest in window) ───────────
+merged["rank"] = (
+    merged.groupby(["meter_num", "noncom_date"])["event_date"]
+    .rank(method="first", ascending=True)
+    .astype(int)
+)
+
+merged = merged[merged["rank"] <= 3]  # keep only first 3
+
+# ── Pivot ranks into columns ──────────────────────────────────────────────────
+pivot = merged.pivot_table(
+    index=["meter_num", "noncom_date"],
+    columns="rank",
+    values=["event_type", "event_date"],
+    aggfunc="first"
+)
+
+# Flatten multi-level columns → prev_event_1_type, prev_event_1_date, etc.
+pivot.columns = [
+    f"prev_event_{rank}_{field.replace('event_', '')}"
+    for field, rank in pivot.columns
+]
+pivot = pivot.reset_index()
+
+# ── Merge history back onto non-com rows ──────────────────────────────────────
+noncoms_with_history = (
+    noncoms
+    .merge(pivot, on=["meter_num", "noncom_date"], how="left")
+    .rename(columns={"noncom_date": "event_date", "noncom_event_type": "event_type"})
+)
+
+print(noncoms_with_history.shape)
+noncoms_with_history.head(20)
+
+
+
+
+
+import pandas as pd
+
+# Sort correctly — outages before non-coms on same day
+combined = combined.sort_values(
+    by=["meter_num", "event_date", "event_priority"],
+    ascending=[True, True, True]
+).reset_index(drop=True)
+
+# ── Pull out non-com anchor rows ──────────────────────────────────────────────
+noncoms = (
+    combined[combined["non_com_flag"] == 1]
+    [["meter_num", "event_date", "event_type"]]
+    .copy()
+    .rename(columns={"event_date": "noncom_date", "event_type": "noncom_event_type"})
+)
+
+# ── All events as the history pool ───────────────────────────────────────────
+history_pool = combined[["meter_num", "event_date", "event_type"]].copy()
+
+# ── Self-join on meter, then filter to 30-day lookback window ─────────────────
+merged = noncoms.merge(history_pool, on="meter_num")
+
+merged = merged[
+    (merged["event_date"] < merged["noncom_date"]) &                          # strictly before
+    (merged["event_date"] >= merged["noncom_date"] - pd.Timedelta(days=30))   # within 30 days
+]
+
+# ── Rank events within each non-com window (1 = earliest in window) ───────────
+merged["rank"] = (
+    merged.groupby(["meter_num", "noncom_date"])["event_date"]
+    .rank(method="first", ascending=True)
+    .astype(int)
+)
+
+merged = merged[merged["rank"] <= 3]  # keep only first 3
+
+# ── Pivot ranks into columns ──────────────────────────────────────────────────
+pivot = merged.pivot_table(
+    index=["meter_num", "noncom_date"],
+    columns="rank",
+    values=["event_type", "event_date"],
+    aggfunc="first"
+)
+
+# Flatten multi-level columns → prev_event_1_type, prev_event_1_date, etc.
+pivot.columns = [
+    f"prev_event_{rank}_{field.replace('event_', '')}"
+    for field, rank in pivot.columns
+]
+pivot = pivot.reset_index()
+
+# ── Merge history back onto non-com rows ──────────────────────────────────────
+noncoms_with_history = (
+    noncoms
+    .merge(pivot, on=["meter_num", "noncom_date"], how="left")
+    .rename(columns={"noncom_date": "event_date", "noncom_event_type": "event_type"})
+)
+
+print(noncoms_with_history.shape)
+noncoms_with_history.head(20)
+
+
