@@ -1,0 +1,39 @@
+Weather Data Obstacles
+	•	SSL certificate blocking issue — had to find a workaround
+	•	Timeout issues — had to work around those too
+	•	Hit a critical bug, made the call to pivot rather than keep spinning
+Data Assembly Work
+	•	Built out an events table from outage data
+	•	Joined meter data + outage data onto a date dimension table
+	•	Cleaned and normalized the data
+	•	Started building trend line visualizations
+Data Limitation Discoveries
+	•	Outage data only goes back one year — killed the year-over-year analysis plan
+	•	Weather table also only goes back one year
+	•	Firmware update data nowhere to be found — may be buried in event logs
+	•	Event log data not even looked at yet — still on the list
+Current Blockers
+	•	Don’t know the historical database or its tables
+	•	No clear person to go to for data navigation
+	•	Conflicting info from coworkers about what data even exists
+
+Data Scale & Complexity
+	•	Massive raw data volumes — visuals and correlation analysis keep failing under the load
+	•	Sampling data just to get anything to run
+	•	No data warehouse, no fact tables, no dimension tables — working from raw data
+	•	Had to reverse-engineer views to find base tables just to write efficient queries
+	•	Built your own fact table, dimension table, date dimension from scratch
+	•	Deconstructed a view that would’ve taken 1.5 days to run down to a 20 minute query
+The Actual Scope of This Project
+	•	Goal is a versatile dataset that can feed Tableau for sophisticated drill-down analysis
+	•	85-90% of the work is data engineering — invisible to anyone watching from outside
+	•	No normalized data to start from — building the foundation AND the analysis simultaneously
+The Real Root Problem
+	•	No requirements were given
+	•	No defined end goal
+	•	No guidance on what’s meaningful to the end user
+	•	Risk of building something and being told “we already knew that”
+
+
+
+
