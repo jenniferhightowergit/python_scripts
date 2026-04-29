@@ -1,0 +1,199 @@
+## “””
+optimize_dataset.py
+
+Optimizes a pandas DataFrame for analytics by:
+
+- Converting object/string columns to category dtype
+- Standardizing numeric columns (z-score normalization by default, or min-max)
+- Printing a before/after memory usage summary
+
+Usage:
+from optimize_dataset import optimize_dataset
+df_optimized, report = optimize_dataset(df)
+
+```
+# Or run as a standalone script against a CSV/Excel file:
+python optimize_dataset.py --input data.csv --output data_optimized.csv
+```
+
+“””
+
+import argparse
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ── Core optimization ──────────────────────────────────────────────────────────
+
+def optimize_dataset(
+df: pd.DataFrame,
+numeric_method: str = “zscore”,      # “zscore” | “minmax” | “none”
+cat_threshold: float = 0.5,          # convert object col if unique% <= this
+exclude_cols: list[str] | None = None,
+verbose: bool = True,
+) -> tuple[pd.DataFrame, dict]:
+“””
+Optimize a DataFrame for analytics.
+
+```
+Parameters
+----------
+df              : Input DataFrame.
+numeric_method  : How to scale numeric columns.
+                  "zscore"  – subtract mean, divide by std  (default)
+                  "minmax"  – scale to [0, 1]
+                  "none"    – skip numeric scaling
+cat_threshold   : Object columns where (n_unique / n_rows) <= this value
+                  are converted to category. Set to 1.0 to convert all.
+exclude_cols    : Columns to leave untouched.
+verbose         : Print summary report.
+
+Returns
+-------
+(optimized_df, report_dict)
+"""
+exclude_cols = set(exclude_cols or [])
+df_out = df.copy()
+report = {
+    "original_memory_mb": _mem_mb(df),
+    "converted_to_category": [],
+    "scaled_numeric": [],
+    "skipped_cols": [],
+    "numeric_method": numeric_method,
+}
+
+for col in df_out.columns:
+    if col in exclude_cols:
+        report["skipped_cols"].append(col)
+        continue
+
+    col_dtype = df_out[col].dtype
+
+    # ── Strings / objects → category ──────────────────────────────────────
+    if col_dtype == object or isinstance(col_dtype, pd.StringDtype):
+        unique_ratio = df_out[col].nunique(dropna=False) / max(len(df_out), 1)
+        if unique_ratio <= cat_threshold:
+            df_out[col] = df_out[col].astype("category")
+            report["converted_to_category"].append(
+                {"column": col, "n_unique": df_out[col].nunique(), "unique_ratio": round(unique_ratio, 4)}
+            )
+        else:
+            report["skipped_cols"].append(col)   # high-cardinality free text
+
+    # ── Numerics → standardize ─────────────────────────────────────────────
+    elif pd.api.types.is_numeric_dtype(col_dtype):
+        if numeric_method == "none":
+            continue
+
+        series = df_out[col].astype(float)
+
+        if numeric_method == "zscore":
+            std = series.std()
+            if std == 0 or np.isnan(std):
+                report["skipped_cols"].append(col)
+                continue
+            df_out[col] = (series - series.mean()) / std
+
+        elif numeric_method == "minmax":
+            col_min, col_max = series.min(), series.max()
+            if col_max == col_min:
+                report["skipped_cols"].append(col)
+                continue
+            df_out[col] = (series - col_min) / (col_max - col_min)
+
+        report["scaled_numeric"].append(
+            {"column": col, "method": numeric_method, "original_dtype": str(col_dtype)}
+        )
+
+report["optimized_memory_mb"] = _mem_mb(df_out)
+report["memory_savings_pct"] = round(
+    (1 - report["optimized_memory_mb"] / max(report["original_memory_mb"], 1e-9)) * 100, 1
+)
+
+if verbose:
+    _print_report(report)
+
+return df_out, report
+```
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _mem_mb(df: pd.DataFrame) -> float:
+return round(df.memory_usage(deep=True).sum() / 1024 ** 2, 4)
+
+def _print_report(report: dict) -> None:
+sep = “─” * 58
+print(f”\n{‘Dataset Optimization Report’:^58}”)
+print(sep)
+print(f”  Memory before : {report[‘original_memory_mb’]:.4f} MB”)
+print(f”  Memory after  : {report[‘optimized_memory_mb’]:.4f} MB”)
+print(f”  Savings       : {report[‘memory_savings_pct’]}%”)
+print(sep)
+
+```
+if report["converted_to_category"]:
+    print(f"\n  {'→ Converted to category'} ({len(report['converted_to_category'])} cols):")
+    for item in report["converted_to_category"]:
+        print(f"    • {item['column']:<30} {item['n_unique']} unique  ({item['unique_ratio']:.1%})")
+
+if report["scaled_numeric"]:
+    print(f"\n  {'→ Numeric columns scaled'} [{report['numeric_method']}] ({len(report['scaled_numeric'])} cols):")
+    for item in report["scaled_numeric"]:
+        print(f"    • {item['column']:<30} (was {item['original_dtype']})")
+
+if report["skipped_cols"]:
+    print(f"\n  ⚠  Skipped ({len(report['skipped_cols'])} cols): {', '.join(report['skipped_cols'])}")
+
+print(sep + "\n")
+```
+
+# ── CLI entry point ────────────────────────────────────────────────────────────
+
+def _load_file(path: str) -> pd.DataFrame:
+p = Path(path)
+ext = p.suffix.lower()
+if ext == “.csv”:
+return pd.read_csv(path)
+elif ext in (”.xlsx”, “.xls”):
+return pd.read_excel(path)
+elif ext == “.parquet”:
+return pd.read_parquet(path)
+else:
+raise ValueError(f”Unsupported file type: {ext}”)
+
+def _save_file(df: pd.DataFrame, path: str) -> None:
+p = Path(path)
+ext = p.suffix.lower()
+if ext == “.csv”:
+df.to_csv(path, index=False)
+elif ext in (”.xlsx”, “.xls”):
+df.to_excel(path, index=False)
+elif ext == “.parquet”:
+df.to_parquet(path, index=False)
+else:
+raise ValueError(f”Unsupported output type: {ext}”)
+print(f”Saved optimized dataset → {path}”)
+
+if **name** == “**main**”:
+parser = argparse.ArgumentParser(description=“Optimize a dataset for analytics.”)
+parser.add_argument(”–input”,          required=True,  help=“Path to input file (csv/xlsx/parquet)”)
+parser.add_argument(”–output”,         required=True,  help=“Path to output file”)
+parser.add_argument(”–numeric-method”, default=“zscore”,
+choices=[“zscore”, “minmax”, “none”],
+help=“Numeric scaling method (default: zscore)”)
+parser.add_argument(”–cat-threshold”,  type=float, default=0.5,
+help=“Max unique-ratio to convert object col to category (default: 0.5)”)
+parser.add_argument(”–exclude”,        nargs=”*”, default=[],
+help=“Column names to skip”)
+args = parser.parse_args()
+
+```
+df_raw = _load_file(args.input)
+df_opt, _ = optimize_dataset(
+    df_raw,
+    numeric_method=args.numeric_method,
+    cat_threshold=args.cat_threshold,
+    exclude_cols=args.exclude,
+)
+_save_file(df_opt, args.output)
+```
