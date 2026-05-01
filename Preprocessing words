@@ -1,0 +1,62 @@
+import pandas as pd
+import re
+
+# Sample dataframe
+data = {
+    "work_order_id": ["WR001", "WR002", "WR003", "WR004"],
+    "comment": [
+        "checked 120V outlet and replaced breaker",
+        "tested unit 456 and confirmed 240V reading stable",
+        "inspected panel no issues found",
+        "measured 12V battery and unit 789 showing low output"
+    ]
+}
+
+df = pd.DataFrame(data)
+
+# Define the cleaning function
+def replace_voltage_indicators(comment):
+    # If number followed by V like 120V, 240V → replace with VNUM
+    comment = re.sub(r'\b\d+V\b', 'VNUM', comment, flags=re.IGNORECASE)
+    
+    # If standalone number like 123, 456 → replace with [###]
+    comment = re.sub(r'\b\d+\b', '[###]', comment)
+    
+    return comment
+
+# Apply to the comments column
+df["cleaned_comment"] = df["comment"].apply(replace_voltage_indicators)
+
+print(df[["work_order_id", "comment", "cleaned_comment"]].to_string())
+
+
+def replace_meter_numbers(comment):
+    # 9 digit number ending in LG → XXXXXXXXXLG
+    comment = re.sub(r'\b\d{9}LG\b', 'XXXXXXXXXLG', comment, flags=re.IGNORECASE)
+    
+    # 9 digit number ending in VI → XXXXXXXXXVI
+    comment = re.sub(r'\b\d{9}VI\b', 'XXXXXXXXXVI', comment, flags=re.IGNORECASE)
+    
+    return comment
+
+
+
+
+he
+
+
+# Dictionary of acronyms and symbols to expand
+replacements = {
+    r'\bmtr\b': 'meter',
+    r'@': 'at'
+}
+
+def replace_acronyms(comment):
+    for pattern, replacement in replacements.items():
+        comment = re.sub(pattern, replacement, comment, flags=re.IGNORECASE)
+    return comment
+
+
+
+
+
