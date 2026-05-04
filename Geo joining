@@ -1,0 +1,37 @@
+import geopandas as gpd
+from shapely.geometry import Point
+
+meter_gdf = gpd.GeoDataFrame(meter_df, geometry=gpd.points_from_xy(meter_df.long, meter_df.lat), crs="EPSG:4326")
+weather_gdf = gpd.GeoDataFrame(weather_df, geometry=gpd.points_from_xy(weather_df.long, weather_df.lat), crs="EPSG:4326")
+
+result = gpd.sjoin_nearest(meter_gdf, weather_gdf, how='left', distance_col='distance')
+
+
+
+
+from scipy.spatial import cKDTree
+import numpy as np
+
+# Build a tree from weather points
+weather_coords = weather_df[['lat', 'long']].values
+tree = cKDTree(weather_coords)
+
+# Query: for each meter point, find the nearest weather point
+meter_coords = meter_df[['lat', 'long']].values
+distances, indices = tree.query(meter_coords, k=1)
+
+# Join
+meter_df['weather_idx'] = indices
+meter_df['distance'] = distances
+result = meter_df.join(weather_df, on='weather_idx', rsuffix='_weather')
+
+
+
+
+from scipy.spatial.distance import cdist
+
+dist_matrix = cdist(meter_df[['lat', 'long']], weather_df[['lat', 'long']])
+meter_df['nearest_weather_idx'] = dist_matrix.argmin(axis=1)
+
+
+
