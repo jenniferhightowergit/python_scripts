@@ -1,4 +1,35 @@
 
+CREATE OR REPLACE TABLE ncm_enriched AS
+
+SELECT 
+    n.meter_id,
+    n.ncm_date1,
+    n.ncm_date2,
+    n.lat                   AS meter_lat,
+    n.lon                   AS meter_lon,
+    w.lat                   AS nearest_wx_lat,
+    w.lon                   AS nearest_wx_lon,
+    w.zip_code              AS nearest_wx_zip,
+    ROUND(SQRT(
+        POWER(n.lat - w.lat, 2) + 
+        POWER(n.lon - w.lon, 2)
+    ), 4)                   AS distance
+
+FROM ncm n
+JOIN weather w
+    ON w.event_date BETWEEN n.ncm_date1 - INTERVAL 7 DAY
+                        AND n.ncm_date1
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY n.meter_id
+    ORDER BY SQRT(
+        POWER(n.lat - w.lat, 2) + 
+        POWER(n.lon - w.lon, 2)
+    )
+) = 1
+
+
+
+
 -- NCM leg (now carries nearest weather station coords)
 SELECT
     n.meter_id,
