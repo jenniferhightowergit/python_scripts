@@ -1,0 +1,11 @@
+frames = []
+
+for _, row in ncm.iterrows():
+    mask = (dim_date['date'] >= row['date1']) & (dim_date['date'] <= row['date2'])
+    matched = dim_date[mask].copy()
+    # Attach the ncm row's columns to each matched date
+    for col in ncm.columns:
+        matched[col] = row[col]
+    frames.append(matched)
+
+result = pd.concat(frames, ignore_index=True)
