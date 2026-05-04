@@ -1,3 +1,45 @@
+
+-- NCM leg (now carries nearest weather station coords)
+SELECT
+    n.meter_id,
+    n.ncm_date1         AS event_date,
+    'NCM'               AS source,
+    NULL                AS event_type,
+    NULL                AS zip_code,
+    n.meter_lat,
+    n.meter_lon,
+    n.nearest_wx_lat,
+    n.nearest_wx_lon,
+    n.meter_to_wx_km
+
+FROM ncm_enriched n
+
+UNION ALL
+
+-- Weather leg
+SELECT
+    n.meter_id,
+    w.event_date,
+    'Weather'           AS source,
+    w.event_type,
+    w.zip_code,
+    n.meter_lat,
+    n.meter_lon,
+    w.lat               AS nearest_wx_lat,
+    w.lon               AS nearest_wx_lon,
+    n.meter_to_wx_km
+
+FROM ncm_enriched n
+JOIN weather w
+    ON w.event_date BETWEEN n.ncm_date1 - INTERVAL 7 DAY
+                        AND n.ncm_date1
+    AND w.lat = n.nearest_wx_lat
+    AND w.lon = n.nearest_wx_lon
+
+ORDER BY meter_id, event_date
+
+
+
 import geopandas as gpd
 from shapely.geometry import Point
 
