@@ -1,0 +1,68 @@
+import pandas as pd
+import pyodbc
+
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+CSV_PATH        = 'meter_numbers.csv'
+METER_COL       = 'meter_num'          # adjust to your CSV column name
+SAMPLE_SIZE     = 1000
+CHUNK_SIZE      = 10
+
+CONN_STRING = (
+    "DRIVER={SQL Server};"
+    "SERVER=your_server;"
+    "DATABASE=your_database;"
+    "Trusted_Connection=yes;"          # remove if using SQL auth
+    # "UID=your_user;PWD=your_password"  # uncomment for SQL auth
+)
+
+# ── LOAD & SAMPLE METERS ─────────────────────────────────────────────────────
+meters_df = pd.read_csv(CSV_PATH)
+meter_list = (
+    meters_df[METER_COL]
+    .drop_duplicates()
+    .sample(SAMPLE_SIZE, random_state=42)  # random_state for reproducibility
+    .astype(str)                           # cast to str to match SQL type
+    .tolist()
+)
+
+print(f"Loaded {len(meter_list)} meters — running in chunks of {CHUNK_SIZE}...")
+
+# ── HELPER: SPLIT LIST INTO CHUNKS ───────────────────────────────────────────
+def chunked(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
+
+# ── QUERY & CHUNK LOOP ───────────────────────────────────────────────────────
+results = []
+
+conn = pyodbc.connect(CONN_STRING)
+
+for i, chunk in enumerate(chunked(meter_list, CHUNK_SIZE)):
+    placeholders = ', '.join(['?' for _ in chunk])
+
+    query = f"""
+        SELECT *
+        FROM your_table
+        WHERE meter_num IN ({placeholders})
+    """
+
+    try:
+        chunk_df = pd.read_sql(query, conn, params=chunk)
+        results.append(chunk_df)
+
+        if (i + 1) % 10 == 0:   # print progress every 100 meters
+            print(f"  Processed chunk {i + 1} ({(i + 1) * CHUNK_SIZE} meters so far)...")
+
+    except Exception as e:
+        print(f"  ERROR on chunk {i + 1}: {e}")
+        continue
+
+conn.close()
+
+# ── COMBINE RESULTS ──────────────────────────────────────────────────────────
+if results:
+    final_df = pd.concat(results, ignore_index=True)
+    print(f"\nDone! {len(final_df)} total rows returned across {len(results)} chunks.")
+    print(final_df.head())
+else:
+    print("No results returned.")
