@@ -1,0 +1,49 @@
+simple
+
+import pandas as pd
+from datetime import datetime, timedelta
+
+PARQUET_PATH = "work_orders.parquet"
+LOOKBACK_DAYS = 30
+cutoff = datetime.today() - timedelta(days=LOOKBACK_DAYS)
+
+# 1. Pull only last 30 days from SQL
+query = """
+    SELECT * FROM work_order_time
+    WHERE created_date >= DATEADD(day, -30, GETDATE())
+"""
+df_new = pd.read_sql(query, conn)
+
+# 2. Load existing parquet, drop the overlapping window
+df_existing = pd.read_parquet(PARQUET_PATH)
+df_existing = df_existing[df_existing["created_date"] < cutoff]
+
+# 3. Combine and write back
+df_final = pd.concat([df_existing, df_new], ignore_index=True)
+df_final.to_parquet(PARQUET_PATH, index=False)
+
+
+
+data engineer
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime, timedelta
+
+PARQUET_DIR = "work_orders_partitioned/"
+
+# 1. Pull last 30 days from SQL
+df_new = pd.read_sql(query, conn)
+df_new["created_date"] = pd.to_datetime(df_new["created_date"])
+df_new["year"]  = df_new["created_date"].dt.year
+df_new["month"] = df_new["created_date"].dt.month
+
+# 2. Write ONLY the affected partitions (overwrites just those month folders)
+table = pa.Table.from_pandas(df_new)
+pq.write_to_dataset(
+    table,
+    root_path=PARQUET_DIR,
+    partition_cols=["year", "month"],
+    existing_data_behavior="delete_matching"  # key: only replaces matching partitions
+)
