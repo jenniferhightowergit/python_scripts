@@ -40,6 +40,16 @@ conn = pyodbc.connect(CONN_STRING)
 for i, chunk in enumerate(chunked(meter_list, CHUNK_SIZE)):
     placeholders = ', '.join(['?' for _ in chunk])
 
+
+oracledb
+# Oracle-style placeholders
+placeholders = ', '.join([f':{j+1}' for j in range(len(chunk))])
+# produces: :1, :2, :3, :4, :5, :6, :7, :8, :9, :10
+
+chunk_df = pd.read_sql(query, conn, params=chunk)
+
+
+
     query = f"""
         SELECT *
         FROM your_table
