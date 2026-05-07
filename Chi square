@@ -1,0 +1,313 @@
+import pandas as pd
+
+# --- Step 1: Build group-level denominators ---
+# Total events per noncom flag
+total_events = df.groupby("noncom_flag")["event_type"].count().rename("total_events")
+
+# Distinct meters per noncom flag
+total_meters = df.groupby("noncom_flag")["meter_num"].nunique().rename("total_meters")
+
+# --- Step 2: Count event types within each noncom group ---
+counts = (
+    df.groupby(["noncom_flag", "event_type"])
+    .agg(
+        event_count=("event_type", "count"),
+        meter_count=("meter_num", "nunique")  # meters that had this event
+    )
+    .reset_index()
+)
+
+# --- Step 3: Join denominators ---
+counts = counts.join(total_events, on="noncom_flag")
+counts = counts.join(total_meters, on="noncom_flag")
+
+# --- Step 4: Compute proportions ---
+counts["pct_of_events"]  = counts["event_count"] / counts["total_events"]
+counts["rate_per_meter"] = counts["event_count"] / counts["total_meters"]
+
+# --- Step 5: Pivot and compute lift ---
+# Separate the two groups for side-by-side comparison
+noncom   = counts[counts["noncom_flag"] == 1].set_index("event_type")
+no_noncom = counts[counts["noncom_flag"] == 0].set_index("event_type")
+
+summary = pd.DataFrame({
+    "count_noncom":        noncom["event_count"],
+    "count_no_noncom":     no_noncom["event_count"],
+    "pct_noncom":          noncom["pct_of_events"],
+    "pct_no_noncom":       no_noncom["pct_of_events"],
+    "rate_per_meter_noncom":    noncom["rate_per_meter"],
+    "rate_per_meter_no_noncom": no_noncom["rate_per_meter"],
+}).fillna(0)
+
+# Lift: how much more common is this event type in non-com meters?
+# Add small epsilon to avoid divide-by-zero for events that only appear in one group
+summary["pct_lift"]  = summary["pct_noncom"]  / (summary["pct_no_noncom"]  + 1e-10)
+summary["rate_lift"] = summary["rate_per_meter_noncom"] / (summary["rate_per_meter_no_noncom"] + 1e-10)
+
+# Sort by pct_lift descending to surface the most non-com-associated events
+summary = summary.sort_values("pct_lift", ascending=False)
+
+summary
+
+
+from scipy.stats import chi2_contingency
+
+# --- Group-level totals (you already have these, just making them explicit) ---
+total_noncom    = total_events[1]   # total events where noncom_flag == 1
+total_no_noncom = total_events[0]   # total events where noncom_flag == 0
+
+def chi_square_for_event(row):
+    a = row["count_noncom"]           # noncom, has this event
+    b = total_noncom - a              # noncom, does NOT have this event
+    c = row["count_no_noncom"]        # never noncom, has this event
+    d = total_no_noncom - c           # never noncom, does NOT have this event
+
+    # Skip if any cell is 0 — chi-square isn't valid
+    if min(a, b, c, d) == 0:
+        return pd.Series({"chi2": None, "p_value": None, "significant": None})
+
+    contingency_table = [[a, b], [c, d]]
+    chi2, p, _, _ = chi2_contingency(contingency_table)
+    return pd.Series({
+        "chi2": round(chi2, 2),
+        "p_value": p,
+        "significant": p < 0.05
+    })
+
+# --- Apply to summary and join results ---
+chi_results = summary.apply(chi_square_for_event, axis=1)
+summary = summary.join(chi_results)
+
+# --- Optional: apply Bonferroni correction for multiple comparisons ---
+# (You're testing many event types at once, so the bar should be higher)
+n_tests = summary["p_value"].notna().sum()
+summary["significant_bonferroni"] = summary["p_value"] < (0.05 / n_tests)
+
+# --- View significant results sorted by lift ---
+significant = summary[summary["significant_bonferroni"] == True].sort_values("pct_lift", ascending=False)
+significant
+
+
+
+
+full end to end block
+
+
+import pandas as pd
+from scipy.stats import chi2_contingency
+
+# =============================================================================
+
+# CONFIGURATION
+
+# =============================================================================
+
+NONCOM_COL   = “noncom_flag”   # column name for the non-com flag (0 or 1)
+EVENT_COL    = “event_type”    # column name for event type
+METER_COL    = “meter_num”     # column name for meter identifier
+P_THRESHOLD  = 0.05            # significance threshold (before Bonferroni)
+MIN_COUNT    = 5               # minimum event count in noncom group to include in results
+
+# =============================================================================
+
+# STEP 1: GROUP-LEVEL DENOMINATORS
+
+# =============================================================================
+
+# Total events per noncom flag
+
+total_events = df.groupby(NONCOM_COL)[EVENT_COL].count().rename(“total_events”)
+
+# Distinct meters per noncom flag
+
+total_meters = df.groupby(NONCOM_COL)[METER_COL].nunique().rename(“total_meters”)
+
+total_noncom    = total_events[1]
+total_no_noncom = total_events[0]
+
+print(”=” * 55)
+print(“GROUP SUMMARY”)
+print(”=” * 55)
+print(f”  Non-com meters   : {total_meters[1]:,} meters | {total_noncom:,} events”)
+print(f”  Never non-com    : {total_meters[0]:,} meters | {total_no_noncom:,} events”)
+print()
+
+# =============================================================================
+
+# STEP 2: EVENT TYPE COUNTS WITHIN EACH NONCOM GROUP
+
+# =============================================================================
+
+counts = (
+df.groupby([NONCOM_COL, EVENT_COL])
+.agg(
+event_count=(EVENT_COL, “count”),
+meter_count=(METER_COL, “nunique”)   # distinct meters that had this event
+)
+.reset_index()
+)
+
+counts = counts.join(total_events, on=NONCOM_COL)
+counts = counts.join(total_meters, on=NONCOM_COL)
+
+# =============================================================================
+
+# STEP 3: PROPORTIONS
+
+# =============================================================================
+
+counts[“pct_of_events”]  = counts[“event_count”] / counts[“total_events”]
+counts[“rate_per_meter”] = counts[“event_count”] / counts[“total_meters”]
+
+# =============================================================================
+
+# STEP 4: PIVOT INTO SIDE-BY-SIDE SUMMARY
+
+# =============================================================================
+
+noncom    = counts[counts[NONCOM_COL] == 1].set_index(EVENT_COL)
+no_noncom = counts[counts[NONCOM_COL] == 0].set_index(EVENT_COL)
+
+summary = pd.DataFrame({
+“count_noncom”            : noncom[“event_count”],
+“count_no_noncom”         : no_noncom[“event_count”],
+“meters_noncom”           : noncom[“meter_count”],
+“meters_no_noncom”        : no_noncom[“meter_count”],
+“pct_noncom”              : noncom[“pct_of_events”],
+“pct_no_noncom”           : no_noncom[“pct_of_events”],
+“rate_per_meter_noncom”   : noncom[“rate_per_meter”],
+“rate_per_meter_no_noncom”: no_noncom[“rate_per_meter”],
+}).fillna(0)
+
+# Lift: how much more common is this event type in non-com meters?
+
+# Small epsilon avoids divide-by-zero for events that only appear in one group
+
+summary[“pct_lift”]  = summary[“pct_noncom”]  / (summary[“pct_no_noncom”]  + 1e-10)
+summary[“rate_lift”] = summary[“rate_per_meter_noncom”] / (summary[“rate_per_meter_no_noncom”] + 1e-10)
+
+# =============================================================================
+
+# STEP 5: CHI-SQUARE TEST (per event type vs. all other events)
+
+# =============================================================================
+
+def chi_square_for_event(row):
+a = row[“count_noncom”]       # noncom,    has this event
+b = total_noncom    - a       # noncom,    does NOT have this event
+c = row[“count_no_noncom”]    # no noncom, has this event
+d = total_no_noncom - c       # no noncom, does NOT have this event
+
+```
+if min(a, b, c, d) == 0:
+    return pd.Series({"chi2": None, "p_value": None})
+
+chi2, p, _, _ = chi2_contingency([[a, b], [c, d]])
+return pd.Series({"chi2": round(chi2, 2), "p_value": p})
+```
+
+chi_results = summary.apply(chi_square_for_event, axis=1)
+summary = summary.join(chi_results)
+
+# =============================================================================
+
+# STEP 6: BONFERRONI CORRECTION
+
+# =============================================================================
+
+n_tests = summary[“p_value”].notna().sum()
+bonferroni_threshold = P_THRESHOLD / n_tests
+
+summary[“significant”]            = summary[“p_value”] < P_THRESHOLD
+summary[“significant_bonferroni”] = summary[“p_value”] < bonferroni_threshold
+
+print(f”  Tests run        : {n_tests}”)
+print(f”  Bonferroni p     : {bonferroni_threshold:.6f}  (0.05 / {n_tests})”)
+print()
+
+# =============================================================================
+
+# STEP 7: ISOLATE EVENTS THAT ONLY APPEAR IN ONE GROUP
+
+# =============================================================================
+
+only_in_noncom = summary[
+(summary[“count_noncom”] > 0) & (summary[“count_no_noncom”] == 0)
+].copy()
+
+only_in_no_noncom = summary[
+(summary[“count_noncom”] == 0) & (summary[“count_no_noncom”] > 0)
+].copy()
+
+# =============================================================================
+
+# STEP 8: FINAL FILTERED RESULTS
+
+# =============================================================================
+
+# Main results: both groups have this event, meets minimum count threshold
+
+testable = summary[
+(summary[“count_noncom”] >= MIN_COUNT) &
+(summary[“count_no_noncom”] > 0) &
+summary[“p_value”].notna()
+].sort_values(“pct_lift”, ascending=False)
+
+# — Print summaries —
+
+print(”=” * 55)
+print(f”SIGNIFICANT AFTER BONFERRONI (p < {bonferroni_threshold:.6f})”)
+print(”=” * 55)
+sig = testable[testable[“significant_bonferroni”]].copy()
+print(sig[[
+“count_noncom”, “count_no_noncom”,
+“pct_noncom”, “pct_no_noncom”,
+“pct_lift”, “rate_lift”,
+“chi2”, “p_value”
+]].to_string())
+print()
+
+print(”=” * 55)
+print(f”EVENTS EXCLUSIVE TO NON-COM METERS  (n={len(only_in_noncom)})”)
+print(”=” * 55)
+if len(only_in_noncom) > 0:
+print(only_in_noncom[[“count_noncom”, “meters_noncom”, “rate_per_meter_noncom”]]
+.sort_values(“count_noncom”, ascending=False).to_string())
+else:
+print(”  None found.”)
+print()
+
+print(”=” * 55)
+print(f”FULL RESULTS (sorted by lift, min count {MIN_COUNT})”)
+print(”=” * 55)
+print(testable[[
+“count_noncom”, “count_no_noncom”,
+“pct_noncom”, “pct_no_noncom”,
+“pct_lift”, “rate_lift”,
+“chi2”, “p_value”,
+“significant_bonferroni”
+]].to_string())
+
+# =============================================================================
+
+# OPTIONAL: EXPORT TO EXCEL
+
+# =============================================================================
+
+# Uncomment to export all result tabs to Excel
+
+# 
+
+# with pd.ExcelWriter(“noncom_event_analysis.xlsx”, engine=“openpyxl”) as writer:
+
+# testable.to_excel(writer, sheet_name=“All Results”)
+
+# sig.to_excel(writer, sheet_name=“Significant (Bonferroni)”)
+
+# only_in_noncom.to_excel(writer, sheet_name=“Exclusive to NonCom”)
+
+# only_in_no_noncom.to_excel(writer, sheet_name=“Exclusive to NeverNonCom”)
+
+# 
+
+# print(“Exported to noncom_event_analysis.xlsx”)
