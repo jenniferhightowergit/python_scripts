@@ -1,0 +1,19 @@
+sample_size = 8000
+n_per_group = sample_size // 2  # 4000 per flag
+
+# Get meters that appear in BOTH flag groups
+meters_in_0 = set(df[df['non_com_flag'] == 0]['meter_num'].unique())
+meters_in_1 = set(df[df['non_com_flag'] == 1]['meter_num'].unique())
+common_meters = list(meters_in_0 & meters_in_1)
+
+# Pick N meters to sample from (enough to fill your row quota)
+n_meters = 500  # tune this — more meters = more diverse sample
+sampled_meters = pd.Series(common_meters).sample(n=n_meters, random_state=42)
+
+# Filter to those meters, then sample rows per flag group
+df_common = df[df['meter_num'].isin(sampled_meters)]
+
+df_0 = df_common[df_common['non_com_flag'] == 0].sample(n=n_per_group, random_state=42)
+df_1 = df_common[df_common['non_com_flag'] == 1].sample(n=n_per_group, random_state=42)
+
+sampled_df = pd.concat([df_0, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
