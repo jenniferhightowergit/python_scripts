@@ -1,0 +1,110 @@
+import pandas as pd
+import numpy as np
+
+# ---- Sample final dataframe (what you built in steps 1 & 2) ----
+np.random.seed(42)
+n = 200
+
+final = pd.DataFrame({
+    'meter_num': [f'M{i:03d}' for i in range(n)],
+    'ncm_event_date': pd.date_range('2023-01-01', periods=n, freq='D'),
+    'evt_A_count': np.random.randint(0, 5, n),
+    'evt_B_count': np.random.randint(0, 3, n),
+    'evt_C_count': np.random.randint(0, 4, n),
+    'max_temp': np.random.randint(20, 105, n),
+    'total_precip': np.random.uniform(0, 3, n).round(2),
+    'extreme_heat_days': np.random.randint(0, 10, n),
+    'freezing_days': np.random.randint(0, 10, n),
+})
+
+# =====================================================================
+# ANALYSIS 1: Frequency Table
+# What % of NCMs preceded by Event A also had extreme weather?
+# =====================================================================
+
+# Create a binary flag for whether event A occurred at all
+final['had_evt_A'] = (final['evt_A_count'] > 0).map({True: 'Had Event A', False: 'No Event A'})
+final['had_extreme_heat'] = (final['extreme_heat_days'] > 3).map({True: 'Extreme Heat', False: 'No Extreme Heat'})
+
+freq_table = pd.crosstab(
+    final['had_evt_A'],
+    final['had_extreme_heat'],
+    normalize='index'  # gives you row percentages
+).round(2) * 100
+
+print("=== ANALYSIS 1: Event A vs Extreme Heat (% of rows) ===")
+print(freq_table)
+print()
+
+# =====================================================================
+# ANALYSIS 2: Average Days Before
+# On average how close to the NCM did each event type occur?
+# (requires your days_before columns - using sample data here)
+# =====================================================================
+
+final['evt_A_days_before'] = np.where(final['evt_A_count'] > 0, np.random.randint(1, 30, n), np.nan)
+final['evt_B_days_before'] = np.where(final['evt_B_count'] > 0, np.random.randint(1, 30, n), np.nan)
+final['evt_C_days_before'] = np.where(final['evt_C_count'] > 0, np.random.randint(1, 30, n), np.nan)
+
+days_before_summary = pd.DataFrame({
+    'Event Type': ['Event A', 'Event B', 'Event C'],
+    'Avg Days Before NCM': [
+        final['evt_A_days_before'].mean().round(1),
+        final['evt_B_days_before'].mean().round(1),
+        final['evt_C_days_before'].mean().round(1),
+    ],
+    'How Often It Occurred (%)': [
+        (final['evt_A_count'] > 0).mean().round(2) * 100,
+        (final['evt_B_count'] > 0).mean().round(2) * 100,
+        (final['evt_C_count'] > 0).mean().round(2) * 100,
+    ]
+})
+
+print("=== ANALYSIS 2: Average Days Before NCM ===")
+print(days_before_summary)
+print()
+
+# =====================================================================
+# ANALYSIS 3: Co-occurrence Correlation Matrix
+# Do certain events tend to show up together before an NCM?
+# =====================================================================
+
+event_cols = ['evt_A_count', 'evt_B_count', 'evt_C_count']
+
+corr_matrix = final[event_cols].corr().round(2)
+
+print("=== ANALYSIS 3: Event Co-occurrence Correlation ===")
+print(corr_matrix)
+print()
+
+# =====================================================================
+# ANALYSIS 4: Weather Buckets
+# Compare event patterns across hot / cold / mild weather groups
+# =====================================================================
+
+# Define buckets based on max temp
+conditions = [
+    final['max_temp'] >= 90,
+    final['max_temp'] <= 35,
+]
+choices = ['Hot', 'Cold']
+final['weather_bucket'] = np.select(conditions, choices, default='Mild')
+
+weather_bucket_summary = final.groupby('weather_bucket').agg(
+    ncm_count=('meter_num', 'count'),
+    avg_evt_A=('evt_A_count', 'mean'),
+    avg_evt_B=('evt_B_count', 'mean'),
+    avg_evt_C=('evt_C_count', 'mean'),
+    avg_precip=('total_precip', 'mean'),
+).round(2)
+
+print("=== ANALYSIS 4: Event Patterns by Weather Bucket ===")
+print(weather_bucket_summary)
+
+
+
+What each analysis tells you in plain terms:
+	•	Analysis 1 — “Of all the NCMs that had Event A beforehand, X% also had extreme heat in that window”
+	•	Analysis 2 — Events with a low average days-before are last-minute warning signs. Events with a high average are early indicators you could act on
+	•	Analysis 3 — A high correlation between two events means they tend to happen together — could indicate a shared root cause
+	•	Analysis 4 — If Event A count is much higher in the Hot bucket than Cold or Mild, heat is likely amplifying that event type
