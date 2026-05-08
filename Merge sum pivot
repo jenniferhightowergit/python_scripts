@@ -1,0 +1,28 @@
+import pandas as pd
+
+# ---- Step 1: Merge on meter_num to pair each NCM event with all events for that meter ----
+merged = ncm_df.merge(events_df, on='meter_num', how='left')
+
+# ---- Step 2: Filter to only events that fall in the 30-day window before the NCM ----
+merged['days_before'] = (merged['ncm_event_date'] - merged['event_date']).dt.days
+merged = merged[(merged['days_before'] >= 0) & (merged['days_before'] <= 30)]
+
+# ---- Step 3: Count occurrences per meter + NCM event + event type ----
+counts = (
+    merged
+    .groupby(['meter_num', 'ncm_event_date', 'event_type'])
+    .size()
+    .reset_index(name='event_count')
+)
+
+# ---- Step 4: Pivot event types into columns ----
+result = counts.pivot_table(
+    index=['meter_num', 'ncm_event_date'],
+    columns='event_type',
+    values='event_count',
+    aggfunc='sum',
+    fill_value=0      # meters with no occurrences of that event type get 0, not NaN
+).reset_index()
+
+# Optional: flatten the column names if pivot added a multi-level header
+result.columns.name = None
