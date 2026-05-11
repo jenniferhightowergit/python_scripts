@@ -1,0 +1,59 @@
+# ---- Step 1: Merge on meter_num ----
+merged = ncm_df.merge(events_df, on='meter_num', how='left')
+
+# ---- Step 2: Filter to 30-day window ----
+merged['days_before'] = (merged['ncm_event_date'] - merged['event_date']).dt.days
+merged = merged[(merged['days_before'] >= 0) & (merged['days_before'] <= 30)]
+
+# ---- Step 2b: Capture timing BEFORE you pivot (days_before is lost after pivot) ----
+timing_summary = (
+    merged
+    .groupby('event_type')
+    .agg(
+        avg_days_before=('days_before', 'mean'),
+        median_days_before=('days_before', 'median'),
+        pct_of_ncm_events=('meter_num', 'nunique')  # how many unique meters had this event
+    )
+    .reset_index()
+)
+
+# Calculate pct as proportion of total NCM events
+total_ncm = ncm_df['meter_num'].nunique()
+timing_summary['pct_of_ncm_events'] = (timing_summary['pct_of_ncm_events'] / total_ncm * 100).round(1)
+timing_summary['avg_days_before'] = timing_summary['avg_days_before'].round(1)
+timing_summary['median_days_before'] = timing_summary['median_days_before'].round(1)
+
+# Sort by avg_days_before so early warnings float to the top
+timing_summary = timing_summary.sort_values('avg_days_before', ascending=False)
+
+# Add a plain language label
+timing_summary['signal_type'] = pd.cut(
+    timing_summary['avg_days_before'],
+    bins=[0, 7, 20, 30],
+    labels=['Last Minute (0-7 days)', 'Mid Window (8-20 days)', 'Early Warning (21-30 days)']
+)
+
+print("=== Timing Summary: Early Warning vs Last Minute ===")
+print(timing_summary)
+
+# ---- Step 3: Count occurrences (unchanged) ----
+counts = (
+    merged
+    .groupby(['meter_num', 'ncm_event_date', 'event_type'])
+    .size()
+    .reset_index(name='event_count')
+)
+
+# ---- Step 4: Pivot (unchanged) ----
+result = counts.pivot_table(
+    index=['meter_num', 'ncm_event_date'],
+    columns='event_type',
+    values='event_count',
+    aggfunc='sum',
+    fill_value=0
+).reset_index()
+
+result.columns.name = None
+
+
+
