@@ -1,0 +1,219 @@
+
+"""
+AMS Meter Comment Pre-Processing for NLP -- spaCy version.
+
+Why this exists
+---------------
+Iterative cleaning pipeline for free-text comments on AMS meter records.
+Designed to feed a DataFrame with columns ["id", "comment"] through a
+configurable scrubber so the most informative vocabulary surfaces first.
+
+Pipeline (per comment, via spaCy)
+---------------------------------
+1. Normalize raw text using booger.json (variant -> canonical term swaps).
+2. Run normalized text through spaCy (tokenize + tag + lemmatize).
+3. Drop punctuation, whitespace, digits, and spaCy's built-in stopwords.
+4. Drop tokens whose POS tag is in `drop_pos`.
+5. Use the lemma of survivors.
+6. Drop tokens shorter than `min_len`.
+7. Drop PERMANENT_REMOVE and TEMP_REMOVE lists.
+
+Setup
+-----
+    pip install spacy
+    python -m spacy download en_core_web_sm
+"""
+
+import warnings
+import json
+import matplotlib
+matplotlib.use("Agg")   # must be before pyplot import -- prevents kernel crash
+
+from collections import Counter
+import pandas as pd
+import matplotlib.pyplot as plt
+import spacy
+
+warnings.filterwarnings("ignore")
+
+
+# ---------------------------------------------------------------------------
+# Load spaCy model once.
+# ---------------------------------------------------------------------------
+SPACY_MODEL = "en_core_web_sm"
+
+def _load_model(name=SPACY_MODEL):
+    try:
+        return spacy.load(name, disable=["ner", "parser"])
+    except OSError:
+        raise OSError(
+            f"spaCy model '{name}' isn't installed. Run:\n"
+            f"    python -m spacy download {name}\n"
+        )
+
+NLP = _load_model()
+
+
+# ---------------------------------------------------------------------------
+# JSON normalizer
+# ---------------------------------------------------------------------------
+
+def load_normalizer(json_path):
+    """
+    Loads a normalization JSON file and flips it into a flat lookup dict.
+
+    JSON format expected:
+        {"canonical term": ["variant1", "variant2"], ...}
+
+    Result:
+        {"variant1": "canonical term", "variant2": "canonical term", ...}
+
+    This way a single dict.get() lookup replaces any variant with its
+    canonical form before spaCy ever sees the text.
+    """
+    with open(json_path, "r") as f:
+        raw = json.load(f)
+    lookup = {}
+    for canonical, variants in raw.items():
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, str):
+                    lookup[variant.lower().strip()] = canonical.lower().strip()
+        elif isinstance(variants, str):
+            # handles accidental single-string values instead of a list
+            lookup[variants.lower().strip()] = canonical.lower().strip()
+    return lookup
+
+
+# ---------------------------------------------------------------------------
+# Point this at your actual file. Use r"..." on Windows for backslashes.
+# ---------------------------------------------------------------------------
+NORMALIZER = load_normalizer("booger.json")
+
+
+def _normalize_text(text, normalizer):
+    """
+    Swap variant phrases for their canonical form before spaCy sees the text.
+    Iterates over every row in the comments column via clean_dataframe.
+    """
+    if not isinstance(text, str):
+        return text
+    text_lower = text.lower()
+    for variant, canonical in normalizer.items():
+        text_lower = text_lower.replace(variant, canonical)
+    return text_lower
+
+
+# ---------------------------------------------------------------------------
+# Custom word lists -- edit these as you iterate
+# ---------------------------------------------------------------------------
+PERMANENT_REMOVE = {
+    # "thank", "please", "asap",
+}
+
+TEMP_REMOVE = {
+    # "meter", "outage", "reading", "install",
+}
+
+
+# ---------------------------------------------------------------------------
+# POS classes to drop
+# ---------------------------------------------------------------------------
+DROP_POS_DEFAULT = {"ADJ", "VERB", "ADV", "AUX"}
+DROP_POS_INC_NOUN = DROP_POS_DEFAULT | {"NOUN", "PROPN"}
+
+
+# ---------------------------------------------------------------------------
+# Core cleaning logic
+# ---------------------------------------------------------------------------
+
+def _filter_doc(doc, drop_pos, permanent_remove, temp_remove, min_len):
+    out = []
+    for tok in doc:
+        if tok.is_punct or tok.is_space:    continue
+        if tok.like_num or tok.is_digit:    continue
+        if tok.is_stop:                     continue
+        if tok.pos_ in drop_pos:            continue
+        lemma = tok.lemma_.lower().strip()
+        if len(lemma) < min_len:            continue
+        if not lemma.isalpha():             continue
+        if lemma in permanent_remove:       continue
+        if lemma in temp_remove:            continue
+        out.append(lemma)
+    return out
+
+
+def clean_comment(
+    text,
+    drop_pos=DROP_POS_DEFAULT,
+    permanent_remove=None,
+    temp_remove=None,
+    min_len=3,
+):
+    """Clean one comment string into a list of surviving lemmas."""
+    if permanent_remove is None: permanent_remove = PERMANENT_REMOVE
+    if temp_remove is None:      temp_remove = TEMP_REMOVE
+    if not isinstance(text, str) or not text.strip():
+        return []
+    text = _normalize_text(text, NORMALIZER)   # normalize before spaCy
+    return _filter_doc(NLP(text), drop_pos, permanent_remove, temp_remove, min_len)
+
+
+def clean_dataframe(
+    df,
+    text_col="comment",
+    id_col="id",
+    drop_nouns=False,
+    permanent_remove=None,
+    temp_remove=None,
+    min_len=3,
+):
+    """
+    Iterates through every row of the comments column, normalizes each
+    comment using NORMALIZER (booger.json), then runs spaCy cleaning.
+    Returns a copy of the df with a new `tokens` column.
+
+    drop_nouns=True also strips nouns/proper nouns.
+    """
+    drop_pos = DROP_POS_INC_NOUN if drop_nouns else DROP_POS_DEFAULT
+    if permanent_remove is None: permanent_remove = PERMANENT_REMOVE
+    if temp_remove is None:      temp_remove = TEMP_REMOVE
+
+    texts = df[text_col].fillna("").astype(str).tolist()
+    rows = []
+    for text in texts:
+        text = _normalize_text(text, NORMALIZER)   # normalize each row first
+        doc = NLP(text)                            # then pass to spaCy
+        rows.append(_filter_doc(doc, drop_pos, permanent_remove, temp_remove, min_len))
+
+    out = df.copy()
+    out["tokens"] = rows
+    return out[[id_col, text_col, "tokens"]]
+
+
+# ---------------------------------------------------------------------------
+# Frequency reporting
+# ---------------------------------------------------------------------------
+
+def top_words(cleaned_df, n=30, token_col="tokens"):
+    """Return (Counter, DataFrame[word, count]) of the top-n tokens corpus-wide."""
+    counter = Counter()
+    for toks in cleaned_df[token_col]:
+        counter.update(toks)
+    return counter, pd.DataFrame(counter.most_common(n), columns=["word", "count"])
+
+
+def plot_top_words(top_df, title="Top words in AMS meter comments"):
+    """Text bar chart -- no GUI backend required, safe in Jupyter on Windows."""
+    print(f"\n{title}")
+    print("-" * 50)
+    max_count = top_df["count"].max()
+    bar_width = 30
+    for _, row in top_df.iterrows():
+        bar = "#" * int((row["count"] / max_count) * bar_width)
+        print(f"{row['word']:20s} {bar} {row['count']}")
+    print()
+
+cleaned = clean_dataframe(df)
+counter, top_df = top_words(cleaned, n=20)
+plot_top_words(top_df, title="Top words -- review pass")
