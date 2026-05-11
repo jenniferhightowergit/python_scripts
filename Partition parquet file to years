@@ -1,0 +1,55 @@
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pathlib import Path
+
+# --- Config ---
+SOURCE_PARQUET = Path("your_data.parquet")   # your existing flat parquet file
+OUTPUT_DIR     = Path("your_data_partitioned") # folder that will hold the partitions
+DATE_COLUMN    = "created_at"                 # your timestamp column
+
+def partition_by_year(source: Path, output_dir: Path, date_col: str) -> None:
+    print(f"Reading {source}...")
+    df = pd.read_parquet(source)
+
+    # Make sure the date column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    # Add a year column — pyarrow will use this to build the folder structure
+    df["year"] = df[date_col].dt.year
+
+    row_count = len(df)
+    years     = sorted(df["year"].unique())
+    print(f"  → {row_count:,} total rows spanning years: {years}")
+
+    # Write partitioned dataset
+    output_dir.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pandas(df)
+
+    pq.write_to_dataset(
+        table,
+        root_path=str(output_dir),
+        partition_cols=["year"],
+        existing_data_behavior="overwrite_or_ignore",  # safe to re-run
+    )
+
+    print(f"\nDone! Partition structure written to: {output_dir}/")
+    print("  Folder layout:")
+    for year in years:
+        part_path = output_dir / f"year={year}"
+        files     = list(part_path.glob("*.parquet"))
+        print(f"    {part_path.name}/  ({len(files)} file(s))")
+
+def main():
+    if not SOURCE_PARQUET.exists():
+        raise FileNotFoundError(f"Source file not found: {SOURCE_PARQUET}")
+
+    partition_by_year(SOURCE_PARQUET, OUTPUT_DIR, DATE_COLUMN)
+
+    print(f"\nVerifying — reading back partitioned dataset...")
+    df_check = pd.read_parquet(OUTPUT_DIR)
+    print(f"  → {len(df_check):,} rows recovered across all partitions")
+
+if __name__ == "__main__":
+    main()
