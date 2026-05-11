@@ -59,4 +59,28 @@ def replace_acronyms(comment):
 
 
 
+def _normalize_text(text, normalizer):
+    """Swap variants for canonical terms before spaCy sees the text."""
+    text_lower = text.lower()
+    for variant, canonical in normalizer.items():
+        text_lower = text_lower.replace(variant, canonical)
+    return text_lower
+
+
+
+
+def clean_comment(text, ...):
+    if not isinstance(text, str) or not text.strip():
+        return []
+    text = _normalize_text(text, NORMALIZER)   # <-- add this line
+    return _filter_doc(NLP(text), drop_pos, permanent_remove, temp_remove, min_len)
+
+
+
+for text in texts:
+    text = _normalize_text(text, NORMALIZER)   # <-- add this line
+    doc = NLP(text)
+    rows.append(_filter_doc(doc, drop_pos, permanent_remove, temp_remove, min_len))
+
+
 
