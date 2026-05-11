@@ -1,0 +1,53 @@
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# --- Config ---
+DB_CONNECTION = "postgresql+psycopg2://user:password@host:port/dbname"
+PARQUET_PATH   = Path("your_data.parquet")
+DATE_COLUMN    = "created_at"   # your timestamp column name
+TABLE_NAME     = "your_table"
+
+def get_last_30_days(engine) -> pd.DataFrame:
+    """Pull only the past 30 days from the database."""
+    cutoff = datetime.now() - timedelta(days=30)
+    query  = text(f"""
+        SELECT *
+        FROM {TABLE_NAME}
+        WHERE {DATE_COLUMN} >= :cutoff
+    """)
+    with engine.connect() as conn:
+        return pd.read_sql(query, conn, params={"cutoff": cutoff})
+
+def append_to_parquet(new_df: pd.DataFrame, path: Path) -> None:
+    """
+    Append new rows to an existing parquet file.
+    Creates the file if it doesn't exist yet.
+    Deduplicates on the date column so re-runs don't create duplicates.
+    """
+    if path.exists():
+        existing_df = pd.read_parquet(path)
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+
+        # Drop duplicates — adjust the subset key to whatever uniquely IDs your rows
+        combined_df.drop_duplicates(subset=[DATE_COLUMN], keep="last", inplace=True)
+    else:
+        combined_df = new_df
+
+    combined_df.to_parquet(path, index=False)
+    print(f"Saved {len(combined_df):,} total rows to {path}")
+
+def main():
+    engine = create_engine(DB_CONNECTION)
+
+    print("Fetching last 30 days...")
+    new_data = get_last_30_days(engine)
+    print(f"  → {len(new_data):,} rows retrieved")
+
+    append_to_parquet(new_data, PARQUET_PATH)
+
+if __name__ == "__main__":
+    main()
