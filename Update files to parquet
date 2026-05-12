@@ -1,0 +1,89 @@
+from pathlib import Path
+from datetime import datetime, timedelta
+import pandas as pd
+
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+source_folder = Path(r"\\your\shared\drive\folder")
+parquet_path = Path(r"\\your\shared\drive\output\non_com_snapshots.parquet")
+
+file_pattern = "*.xlsx"
+
+# --------------------------------------------------
+# Look back 7 days based on file modified datetime
+# --------------------------------------------------
+lookback_days = 7
+cutoff_date = datetime.now() - timedelta(days=lookback_days)
+
+recent_files = [
+    f for f in source_folder.glob(file_pattern)
+    if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff_date
+]
+
+print(f"Recent files found: {len(recent_files)}")
+
+# --------------------------------------------------
+# Read existing parquet if it exists
+# --------------------------------------------------
+if parquet_path.exists():
+    existing_df = pd.read_parquet(parquet_path)
+else:
+    existing_df = pd.DataFrame()
+
+# --------------------------------------------------
+# Build processed file list
+# --------------------------------------------------
+if not existing_df.empty and "source_file" in existing_df.columns:
+    processed_files = set(existing_df["source_file"].dropna().astype(str))
+else:
+    processed_files = set()
+
+# --------------------------------------------------
+# Function to extract file date from filename
+# Example assumes last 8 characters are YYYYMMDD
+# --------------------------------------------------
+def get_file_date(file_path):
+    date_text = file_path.stem[-8:]
+    return pd.to_datetime(date_text, format="%Y%m%d", errors="coerce")
+
+# --------------------------------------------------
+# Process only files not already in parquet
+# --------------------------------------------------
+new_dfs = []
+
+for file in recent_files:
+    source_file = file.name
+    modified_datetime = datetime.fromtimestamp(file.stat().st_mtime)
+
+    if source_file in processed_files:
+        print(f"Skipping already processed file: {source_file}")
+        continue
+
+    print(f"Processing new file: {source_file}")
+
+    df = pd.read_excel(file, engine="openpyxl")
+
+    df["source_file"] = source_file
+    df["file_date"] = get_file_date(file)
+    df["modified_datetime"] = modified_datetime
+
+    new_dfs.append(df)
+
+# --------------------------------------------------
+# Append new data to existing parquet
+# --------------------------------------------------
+if new_dfs:
+    new_data = pd.concat(new_dfs, ignore_index=True)
+
+    if existing_df.empty:
+        final_df = new_data
+    else:
+        final_df = pd.concat([existing_df, new_data], ignore_index=True)
+
+    final_df.to_parquet(parquet_path, engine="pyarrow", index=False)
+
+    print(f"Added {len(new_data):,} new rows.")
+    print(f"Updated parquet: {parquet_path}")
+else:
+    print("No new files to add.")
