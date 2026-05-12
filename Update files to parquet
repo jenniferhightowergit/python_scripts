@@ -6,25 +6,10 @@ import pandas as pd
 # Paths
 # --------------------------------------------------
 source_folder = Path(r"\\your\shared\drive\folder")
-parquet_path = Path(r"\\your\shared\drive\output\non_com_snapshots.parquet")
-
-file_pattern = "*.xlsx"
+parquet_path = Path(r"\\your\shared\drive\non_com.parquet")
 
 # --------------------------------------------------
-# Look back 7 days based on file modified datetime
-# --------------------------------------------------
-lookback_days = 7
-cutoff_date = datetime.now() - timedelta(days=lookback_days)
-
-recent_files = [
-    f for f in source_folder.glob(file_pattern)
-    if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff_date
-]
-
-print(f"Recent files found: {len(recent_files)}")
-
-# --------------------------------------------------
-# Read existing parquet if it exists
+# Load existing parquet
 # --------------------------------------------------
 if parquet_path.exists():
     existing_df = pd.read_parquet(parquet_path)
@@ -32,58 +17,119 @@ else:
     existing_df = pd.DataFrame()
 
 # --------------------------------------------------
-# Build processed file list
+# Make comparison columns datetime
 # --------------------------------------------------
-if not existing_df.empty and "source_file" in existing_df.columns:
-    processed_files = set(existing_df["source_file"].dropna().astype(str))
-else:
-    processed_files = set()
+if not existing_df.empty:
+
+    existing_df["file_date"] = pd.to_datetime(
+        existing_df["file_date"],
+        errors="coerce"
+    )
+
+    existing_df["modified_datetime"] = pd.to_datetime(
+        existing_df["modified_datetime"],
+        errors="coerce"
+    )
 
 # --------------------------------------------------
-# Function to extract file date from filename
-# Example assumes last 8 characters are YYYYMMDD
+# Build set of existing keys
+# Faster than dataframe filtering repeatedly
 # --------------------------------------------------
-def get_file_date(file_path):
-    date_text = file_path.stem[-8:]
-    return pd.to_datetime(date_text, format="%Y%m%d", errors="coerce")
+existing_keys = set()
+
+if not existing_df.empty:
+
+    existing_keys = set(
+        zip(
+            existing_df["file_date"],
+            existing_df["modified_datetime"]
+        )
+    )
 
 # --------------------------------------------------
-# Process only files not already in parquet
+# Only check files modified in last 7 days
+# --------------------------------------------------
+cutoff = datetime.now() - timedelta(days=7)
+
+files = [
+    f for f in source_folder.glob("*.xlsx")
+    if datetime.fromtimestamp(f.stat().st_mtime) >= cutoff
+]
+
+# --------------------------------------------------
+# Function to get file_date
+# Assumes YYYYMMDD at end of filename
+# --------------------------------------------------
+def get_file_date(file):
+
+    date_text = file.stem[-8:]
+
+    return pd.to_datetime(
+        date_text,
+        format="%Y%m%d",
+        errors="coerce"
+    )
+
+# --------------------------------------------------
+# Process files
 # --------------------------------------------------
 new_dfs = []
 
-for file in recent_files:
-    source_file = file.name
-    modified_datetime = datetime.fromtimestamp(file.stat().st_mtime)
+for file in files:
 
-    if source_file in processed_files:
-        print(f"Skipping already processed file: {source_file}")
+    source_file = file.name
+
+    file_date = get_file_date(file)
+
+    modified_datetime = pd.to_datetime(
+        datetime.fromtimestamp(file.stat().st_mtime)
+    )
+
+    # Skip invalid file dates
+    if pd.isna(file_date):
+
+        print(f"Skipping invalid file date: {source_file}")
         continue
 
-    print(f"Processing new file: {source_file}")
+    # Build comparison key
+    current_key = (file_date, modified_datetime)
+
+    # Skip if already exists
+    if current_key in existing_keys:
+
+        print(f"Already loaded: {source_file}")
+        continue
+
+    print(f"Loading new file: {source_file}")
 
     df = pd.read_excel(file, engine="openpyxl")
 
     df["source_file"] = source_file
-    df["file_date"] = get_file_date(file)
+    df["file_date"] = file_date
     df["modified_datetime"] = modified_datetime
 
     new_dfs.append(df)
 
 # --------------------------------------------------
-# Append new data to existing parquet
+# Append new data
 # --------------------------------------------------
 if new_dfs:
+
     new_data = pd.concat(new_dfs, ignore_index=True)
 
-    if existing_df.empty:
-        final_df = new_data
-    else:
-        final_df = pd.concat([existing_df, new_data], ignore_index=True)
+    final_df = pd.concat(
+        [existing_df, new_data],
+        ignore_index=True
+    )
 
-    final_df.to_parquet(parquet_path, engine="pyarrow", index=False)
+    final_df.to_parquet(
+        parquet_path,
+        engine="pyarrow",
+        index=False
+    )
 
-    print(f"Added {len(new_data):,} new rows.")
-    print(f"Updated parquet: {parquet_path}")
+    print(f"Added {len(new_data):,} rows.")
+
 else:
-    print("No new files to add.")
+
+    print("No new files found.")
