@@ -1,0 +1,128 @@
+import pandas as pd
+import re
+from collections import Counter
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# 1. Example dataframe
+# -----------------------------
+df = pd.DataFrame({
+    "id": [1, 2, 3],
+    "comment": [
+        "Completed by MDM",
+        "Completed by MDMS",
+        "MDM completed the order"
+    ]
+})
+
+
+# -----------------------------
+# 2. Normalization dictionary
+# -----------------------------
+NORMALIZE_MAP = {
+    r"\bMDM\b": "MDMS",
+    r"\bDNU\b": "DO NOT USE"
+}
+
+
+# -----------------------------
+# 3. Clean one comment
+# -----------------------------
+def clean_text(text, normalize_map=NORMALIZE_MAP):
+    if pd.isna(text):
+        return ""
+
+    text = str(text).upper()
+
+    # Replace weird non-breaking spaces
+    text = text.replace("\u00A0", " ")
+
+    # Apply normalization rules
+    for pattern, replacement in normalize_map.items():
+        text = re.sub(pattern, replacement, text)
+
+    # Remove punctuation, but keep letters/numbers/spaces
+    text = re.sub(r"[^A-Z0-9\s]", " ", text)
+
+    # Collapse extra spaces
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+# -----------------------------
+# 4. Tokenize cleaned comment
+# -----------------------------
+def tokenize_text(text):
+    if pd.isna(text):
+        return []
+
+    text = str(text)
+
+    # Basic tokenization = split cleaned text into words
+    tokens = text.split()
+
+    return tokens
+
+
+# -----------------------------
+# 5. Clean full dataframe
+# -----------------------------
+def clean_dataframe(
+    df,
+    comment_col="comment",
+    cleaned_col="cleaned_comments",
+    token_col="tokens"
+):
+    cleaned = df.copy()
+
+    # Clean original comment into cleaned comment column
+    cleaned[cleaned_col] = cleaned[comment_col].apply(clean_text)
+
+    # IMPORTANT:
+    # Tokenize FROM cleaned_comments, not original comment
+    cleaned[token_col] = cleaned[cleaned_col].apply(tokenize_text)
+
+    return cleaned
+
+
+# -----------------------------
+# 6. Top words function
+# -----------------------------
+def top_words(df, token_col="tokens", n=20):
+    all_words = [
+        word
+        for tokens in df[token_col].dropna()
+        for word in tokens
+    ]
+
+    counter = Counter(all_words)
+
+    top_df = pd.DataFrame(
+        counter.most_common(n),
+        columns=["word", "count"]
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(top_df["word"], top_df["count"])
+    plt.xticks(rotation=45, ha="right")
+    plt.title(f"Top {n} Words")
+    plt.xlabel("Word")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+    return top_df
+
+
+# -----------------------------
+# 7. Run it
+# -----------------------------
+cleaned = clean_dataframe(df, comment_col="comment")
+
+print(cleaned[["comment", "cleaned_comments", "tokens"]])
+
+top_df = top_words(cleaned, token_col="tokens", n=20)
+
+print(top_df)
