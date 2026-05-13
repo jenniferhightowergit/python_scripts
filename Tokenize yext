@@ -126,3 +126,42 @@ print(cleaned[["comment", "cleaned_comments", "tokens"]])
 top_df = top_words(cleaned, token_col="tokens", n=20)
 
 print(top_df)
+
+
+
+
+
+from collections import Counter
+import pandas as pd
+import matplotlib.pyplot as plt
+import ast
+
+def top_words(df, token_col="tokens", n=20):
+    counter = Counter()
+
+    for tokens in df[token_col].dropna():
+        
+        # If tokens accidentally got saved as a string like "['A', 'B']"
+        if isinstance(tokens, str):
+            try:
+                tokens = ast.literal_eval(tokens)
+            except:
+                tokens = tokens.split()
+
+        # Only update if it is actually iterable
+        if isinstance(tokens, (list, tuple, set)):
+            counter.update(tokens)
+
+    top_df = pd.DataFrame(
+        counter.most_common(n),
+        columns=["word", "count"]
+    )
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(top_df["word"], top_df["count"])
+    plt.xticks(rotation=45, ha="right")
+    plt.title(f"Top {n} Words")
+    plt.tight_layout()
+    plt.show()
+
+    return top_df
