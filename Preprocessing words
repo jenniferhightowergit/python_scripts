@@ -83,4 +83,27 @@ for text in texts:
     rows.append(_filter_doc(doc, drop_pos, permanent_remove, temp_remove, min_len))
 
 
+import re
+import pandas as pd
+
+keys = sorted(flat_normalization.keys(), key=len, reverse=True)
+
+pattern = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b",
+    flags=re.IGNORECASE
+)
+
+def normalize_fast(text):
+    if pd.isna(text):
+        return text
+
+    text = str(text).lower()
+
+    return pattern.sub(
+        lambda match: flat_normalization[match.group(0).lower()],
+        text
+    )
+
+df["comments_clean"] = df["comments"].map(normalize_fast)
+
 
