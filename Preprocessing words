@@ -372,3 +372,164 @@ df["clean_comment"] = df["comment"].str.replace(pattern, "[REDACTED]", regex=Tru
 
 
 
+
+
+
+
+import re
+import pandas as pd
+
+# =========================================================
+# BUILD FLAT NORMALIZATION MAP
+# =========================================================
+
+def build_flat_normalization(grouped_normalization):
+    """
+    Converts:
+        {
+            "METER_CHANGE": ["meter change", "mtr change"],
+            "FOUND_OFF": ["found off", "fnd off"]
+        }
+
+    Into:
+        {
+            "METER CHANGE": "METER_CHANGE",
+            "MTR CHANGE": "METER_CHANGE",
+            "FOUND OFF": "FOUND_OFF",
+            "FND OFF": "FOUND_OFF"
+        }
+    """
+
+    flat = {}
+
+    for good_word, bad_words in grouped_normalization.items():
+
+        # normalize target token
+        normalized_good = (
+            good_word.strip()
+            .upper()
+            .replace(" ", "_")
+        )
+
+        for bad_word in bad_words:
+
+            cleaned_bad = bad_word.strip().upper()
+
+            flat[cleaned_bad] = normalized_good
+
+    return flat
+
+
+# =========================================================
+# BUILD REGEX PATTERN
+# =========================================================
+
+def build_normalization_pattern(flat_normalization):
+
+    # Sort longest phrases first
+    keys = sorted(
+        flat_normalization.keys(),
+        key=len,
+        reverse=True
+    )
+
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b",
+        flags=re.IGNORECASE
+    )
+
+    return pattern
+
+
+# =========================================================
+# NORMALIZE COMMENTS
+# =========================================================
+
+def normalize_comment(
+    text,
+    flat_normalization,
+    pattern,
+    permanent_remove=None,
+    temp_remove=None
+):
+
+    if pd.isna(text):
+        return ""
+
+    text = str(text).upper()
+
+    # ---------------------------------------------
+    # APPLY NORMALIZATION REPLACEMENTS
+    # ---------------------------------------------
+
+    text = pattern.sub(
+        lambda m: flat_normalization[m.group(0).upper()],
+        text
+    )
+
+    # ---------------------------------------------
+    # REMOVE PERMANENT WORDS
+    # ---------------------------------------------
+
+    if permanent_remove:
+
+        for word in permanent_remove:
+
+            word = word.strip().upper()
+
+            text = re.sub(
+                r"\b" + re.escape(word) + r"\b",
+                " ",
+                text
+            )
+
+    # ---------------------------------------------
+    # REMOVE TEMP WORDS
+    # ---------------------------------------------
+
+    if temp_remove:
+
+        for word in temp_remove:
+
+            word = word.strip().upper()
+
+            text = re.sub(
+                r"\b" + re.escape(word) + r"\b",
+                " ",
+                text
+            )
+
+    # ---------------------------------------------
+    # REMOVE EXTRA SPACES
+    # ---------------------------------------------
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+# =========================================================
+# TOKENIZE COMMENT
+# =========================================================
+
+def tokenize_comment(text):
+    """
+    Preserves:
+        METER_CHANGE
+        SELF-EDIT
+        UIX9
+    """
+
+    if pd.isna(text):
+        return []
+
+    tokens = re.findall(
+        r"[A-Z0-9]+(?:[_-][A-Z0-9]+)*",
+        text.upper()
+    )
+
+    return tokens
+
+
+
+
