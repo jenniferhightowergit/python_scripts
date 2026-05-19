@@ -270,12 +270,77 @@ df["tokens"] = df["comments_clean"].map(tokenize_comment)
 
 test = "my meter had a non com meter change"
 
+
 clean = normalize_comment(test)
 tokens = tokenize_comment(clean)
 
 print(clean)
 print(tokens)
 
+
+
+
+
+def build_employee_terms(employee_df):
+    terms = set()
+
+    for col in ["first_name", "last_name", "employee_id"]:
+        if col in employee_df.columns:
+            values = (
+                employee_df[col]
+                .dropna()
+                .astype(str)
+                .str.upper()
+                .str.strip()
+            )
+
+            for value in values:
+                if value:
+                    terms.add(value)
+
+    return terms
+
+
+
+
+
+employee_terms = build_employee_terms(employee_df)
+
+safe_employee_terms = {
+    t for t in employee_terms
+    if len(t) >= 4 or t.isdigit()
+}
+
+risky_employee_terms = {
+    t for t in employee_terms
+    if len(t) < 4 and not t.isdigit()
+}
+
+
+safe_employee_pattern = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in sorted(safe_employee_terms, key=len, reverse=True)) + r")\b",
+    flags=re.IGNORECASE
+)
+
+
+
+
+def redact_employee_data(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text).upper()
+
+    text = safe_employee_pattern.sub("[EMPLOYEE_REDACTED]", text)
+
+    return text
+
+
+
+risky_employee_pattern = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in sorted(risky_employee_terms, key=len, reverse=True)) + r")\b",
+    flags=re.IGNORECASE
+)
 
 
 
