@@ -192,3 +192,61 @@ print(tokens)
 
 
 
+import re
+import pandas as pd
+
+# Example:
+# replacement_dict = {
+#     "meter change": ["mtr change", "meter chg", "meterchange"],
+#     "non com": ["noncom", "non communication", "non-comm"]
+# }
+
+def build_flat_normalization(replacement_dict):
+    flat = {}
+
+    for good_word, bad_words in replacement_dict.items():
+        good_clean = good_word.lower().strip()
+        protected_good = good_clean.replace(" ", "_")
+
+        # include the good phrase itself
+        flat[good_clean] = protected_good
+
+        # include bad variants
+        for bad_word in bad_words:
+            bad_clean = bad_word.lower().strip()
+            flat[bad_clean] = protected_good
+
+    return flat
+
+
+flat_normalization = build_flat_normalization(replacement_dict)
+
+keys = sorted(flat_normalization.keys(), key=len, reverse=True)
+
+pattern = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b",
+    flags=re.IGNORECASE
+)
+
+
+def normalize_comment(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text).lower()
+
+    # Replace ONLY the matched phrase.
+    # Do not add spaces.
+    # Do not strip the whole comment.
+    # Do not collapse whitespace.
+    text = pattern.sub(
+        lambda m: flat_normalization[m.group(0).lower()],
+        text
+    )
+
+    return text
+
+
+df["comments_clean"] = df["comments"].map(normalize_comment)
+
+
