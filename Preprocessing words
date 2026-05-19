@@ -344,6 +344,31 @@ risky_employee_pattern = re.compile(
 
 
 
+import re
+import pandas as pd
+
+def build_employee_pattern(employee_df: pd.DataFrame) -> re.Pattern:
+    # Pull last names and IDs, strip whitespace, drop blanks
+    last_names = employee_df["last_name"].dropna().str.strip().str.upper().tolist()
+    emp_ids    = employee_df["employee_id"].dropna().str.strip().str.upper().tolist()
+    
+    terms = [t for t in set(last_names + emp_ids) if t]
+    
+    # Longest first to avoid partial-match shadowing
+    terms.sort(key=len, reverse=True)
+    
+    return re.compile(
+        r"\b(" + "|".join(re.escape(t) for t in terms) + r")\b",
+        flags=re.IGNORECASE
+    )
+
+pattern = build_employee_pattern(employee_df)
+
+# Apply to a column of comments
+df["clean_comment"] = df["comment"].str.replace(pattern, "[REDACTED]", regex=True)
+
+
+
 
 
 
