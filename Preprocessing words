@@ -104,6 +104,10 @@ def normalize_fast(text):
         text
     )
 
+
+
+
+
 df["comments_clean"] = df["comments"].map(normalize_fast)
 
 
@@ -529,6 +533,113 @@ def tokenize_comment(text):
     )
 
     return tokens
+
+
+
+
+
+
+
+
+
+import re
+import pandas as pd
+
+
+# ==========================================
+# BUSINESS VOCAB
+# ==========================================
+
+business_vocab = {
+    "meter change": [
+        "mtr change",
+        "meter changed",
+        "meter chg"
+    ],
+
+    "found off": [
+        "fnd off",
+        "found meter off"
+    ]
+}
+
+
+# ==========================================
+# BUILD NORMALIZATION MAP
+# ==========================================
+
+normalization_dict = {}
+
+for good_word, bad_words in business_vocab.items():
+
+    # protected version
+    protected_good = good_word.upper().replace(" ", "_")
+
+    # add the good word itself
+    normalization_dict[good_word.upper()] = protected_good
+
+    # add bad variants
+    for bad_word in bad_words:
+
+        normalization_dict[bad_word.upper()] = protected_good
+
+
+# ==========================================
+# BUILD REGEX PATTERN
+# ==========================================
+
+pattern = re.compile(
+    r"\b(" +
+    "|".join(
+        re.escape(k)
+        for k in sorted(
+            normalization_dict.keys(),
+            key=len,
+            reverse=True
+        )
+    ) +
+    r")\b",
+    flags=re.IGNORECASE
+)
+
+
+# ==========================================
+# APPLY NORMALIZATION
+# ==========================================
+
+def normalize_comment(text):
+
+    if pd.isna(text):
+        return ""
+
+    text = str(text).upper()
+
+    text = pattern.sub(
+        lambda m: normalization_dict[m.group(0).upper()],
+        text
+    )
+
+    return text
+
+
+# ==========================================
+# EXAMPLE
+# ==========================================
+
+df = pd.DataFrame({
+    "comment": [
+        "tech performed mtr change",
+        "meter changed at location",
+        "found meter off"
+    ]
+})
+
+
+df["clean_comment"] = df["comment"].apply(
+    normalize_comment
+)
+
+print(df["clean_comment"])
 
 
 
