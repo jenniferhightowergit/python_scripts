@@ -250,3 +250,35 @@ def normalize_comment(text):
 df["comments_clean"] = df["comments"].map(normalize_comment)
 
 
+
+
+
+def tokenize_comment(text):
+    if pd.isna(text):
+        return []
+
+    text = str(text).lower()
+
+    tokens = re.findall(r"[a-zA-Z]+(?:[_-][a-zA-Z]+)*", text)
+
+    return tokens
+
+
+df["tokens"] = df["comments_clean"].map(tokenize_comment)
+
+
+
+test = "my meter had a non com meter change"
+
+clean = normalize_comment(test)
+tokens = tokenize_comment(clean)
+
+print(clean)
+print(tokens)
+
+
+
+
+
+
+
