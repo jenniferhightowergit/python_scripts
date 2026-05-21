@@ -1,0 +1,43 @@
+CREATE TABLE dim_date AS
+
+WITH dates AS (
+
+    SELECT
+        generate_series::DATE AS calendar_date
+    FROM generate_series(
+        DATE '2016-01-01',
+        DATE '2036-12-31',
+        INTERVAL 1 DAY
+    )
+
+)
+
+SELECT
+
+    calendar_date,
+
+    EXTRACT(YEAR FROM calendar_date) AS year_num,
+    EXTRACT(MONTH FROM calendar_date) AS month_num,
+    EXTRACT(DAY FROM calendar_date) AS day_num,
+
+    STRFTIME(calendar_date, '%Y-%m') AS year_month,
+    STRFTIME(calendar_date, '%B') AS month_name,
+    STRFTIME(calendar_date, '%a') AS day_name_short,
+    STRFTIME(calendar_date, '%A') AS day_name,
+
+    -- Monday = 1, Sunday = 7
+    CASE
+        WHEN EXTRACT(ISODOW FROM calendar_date) = 7 THEN 7
+        ELSE EXTRACT(ISODOW FROM calendar_date)
+    END AS day_of_week_num,
+
+    EXTRACT(QUARTER FROM calendar_date) AS quarter_num,
+
+    CASE
+        WHEN EXTRACT(ISODOW FROM calendar_date) IN (6,7)
+            THEN 1
+        ELSE 0
+    END AS weekend_flag
+
+FROM dates
+;
