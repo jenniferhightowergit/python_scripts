@@ -1,0 +1,63 @@
+import pandas as pd
+import numpy as np
+from sklearn.neighbors import BallTree
+
+# location_df:
+# location_id, location_lat, location_lon
+
+# weather_df:
+# weather_date, weather_lat, weather_lon, temp, wind, rain, etc.
+
+# 1. Get unique weather points
+weather_points = (
+    weather_df[["weather_lat", "weather_lon"]]
+    .drop_duplicates()
+    .reset_index(drop=True)
+)
+
+# 2. Convert degrees to radians
+weather_rad = np.radians(weather_points[["weather_lat", "weather_lon"]])
+location_rad = np.radians(location_df[["location_lat", "location_lon"]])
+
+# 3. Build nearest-neighbor tree
+tree = BallTree(weather_rad, metric="haversine")
+
+# 4. Find nearest weather point for each location
+distances, indices = tree.query(location_rad, k=1)
+
+# 5. Convert radians distance to miles
+earth_radius_miles = 3958.8
+
+location_weather_map = location_df.copy()
+location_weather_map["nearest_weather_lat"] = weather_points.iloc[indices.flatten()]["weather_lat"].values
+location_weather_map["nearest_weather_lon"] = weather_points.iloc[indices.flatten()]["weather_lon"].values
+location_weather_map["distance_miles"] = distances.flatten() * earth_radius_miles
+
+
+
+
+meter_with_weather = meter_df.merge(
+    location_daily_weather,
+    left_on=["location_id", "event_date"],
+    right_on=["location_id", "weather_date"],
+    how="left"
+)
+
+
+meter_with_weather = meter_df.merge(
+    location_daily_weather,
+    left_on=["location_id", "event_date"],
+    right_on=["location_id", "weather_date"],
+    how="left"
+)
+
+
+
+location_weather_map["weather_match_quality"] = pd.cut(
+    location_weather_map["distance_miles"],
+    bins=[0, 2, 5, 10, float("inf")],
+    labels=["HIGH", "MEDIUM", "LOW", "VERY LOW"],
+    include_lowest=True
+)
+
+
