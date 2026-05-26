@@ -1,3 +1,54 @@
+
+CREATE OR REPLACE TABLE meter_with_nearest_weather AS
+WITH weather_points AS (
+    SELECT DISTINCT
+        weather_lat,
+        weather_lon
+    FROM weather_df
+),
+
+distance_calc AS (
+    SELECT
+        m.meter_id,
+        m.location_id,
+        m.event_date,
+        m.meter_lat,
+        m.meter_lon,
+
+        w.weather_lat,
+        w.weather_lon,
+
+        ST_Distance_Sphere(
+            ST_Point(m.meter_lon, m.meter_lat),
+            ST_Point(w.weather_lon, w.weather_lat)
+        ) / 1609.34 AS distance_miles
+
+    FROM meter_df m
+    CROSS JOIN weather_points w
+),
+
+nearest_weather AS (
+    SELECT *
+    FROM distance_calc
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY meter_id, event_date
+        ORDER BY distance_miles
+    ) = 1
+)
+
+SELECT
+    n.*,
+    wd.*
+FROM nearest_weather n
+LEFT JOIN weather_df wd
+    ON n.weather_lat = wd.weather_lat
+   AND n.weather_lon = wd.weather_lon
+   AND n.event_date = wd.weather_date;
+
+
+
+
+
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import BallTree
