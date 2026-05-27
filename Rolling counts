@@ -1,0 +1,33 @@
+rolling_cols = [
+    "high_humidity_flag",
+    "outage_count",
+    "voltage_count",
+    # your 49 event columns
+]
+
+windows = [7, 30]
+
+new_features = {}
+
+for col in rolling_cols:
+
+    grouped = df.groupby("meter")[col]
+
+    for window in windows:
+
+        feature_name = f"{col}_{window}d"
+
+        new_features[feature_name] = (
+            grouped.transform(
+                lambda x:
+                x.shift(1)
+                 .rolling(window, min_periods=1)
+                 .sum()
+            )
+        )
+
+# add all columns at once
+df = pd.concat(
+    [df, pd.DataFrame(new_features)],
+    axis=1
+)
