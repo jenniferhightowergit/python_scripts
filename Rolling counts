@@ -31,3 +31,64 @@ df = pd.concat(
     [df, pd.DataFrame(new_features)],
     axis=1
 )
+
+
+
+import pandas as pd
+
+df = daily_event_df.copy()
+
+meter_col = "meter_id"
+date_col = "event_date"
+target_col = "ncm_flag"
+
+event_cols = [
+    "outage_count",
+    "power_restore_count",
+    "voltage_sag_count",
+    "tamper_count",
+    # add your pivoted event columns here
+]
+
+df[date_col] = pd.to_datetime(df[date_col])
+df = df.sort_values([meter_col, date_col])
+
+# Find next NCM date per meter
+df["next_ncm_date"] = df[date_col].where(df[target_col].eq(1))
+df["next_ncm_date"] = df.groupby(meter_col)["next_ncm_date"].bfill()
+
+days_until_ncm = (df["next_ncm_date"] - df[date_col]).dt.days
+in_7d_prior_ncm = days_until_ncm.between(0, 7)
+in_30d_prior_ncm = days_until_ncm.between(0, 30)
+
+new_features = []
+
+for col in event_cols:
+    # rolling sums INCLUDING current day
+    roll_7 = (
+        df.groupby(meter_col)[col]
+          .rolling(window=7, min_periods=1)
+          .sum()
+          .reset_index(level=0, drop=True)
+    )
+
+    roll_30 = (
+        df.groupby(meter_col)[col]
+          .rolling(window=30, min_periods=1)
+          .sum()
+          .reset_index(level=0, drop=True)
+    )
+
+    new_features.append(
+        pd.DataFrame({
+            f"{col}_7d_prior_ncm": roll_7.where(in_7d_prior_ncm, 0),
+            f"{col}_30d_prior_ncm": roll_30.where(in_30d_prior_ncm, 0),
+        }, index=df.index)
+    )
+
+# Add all new columns at once to avoid dataframe fragmentation
+feature_df = pd.concat(new_features, axis=1)
+
+df = pd.concat([df, feature_df], axis=1)
+
+df = df.drop(columns=["next_ncm_date"])
