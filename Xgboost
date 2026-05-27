@@ -1,0 +1,168 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score
+from xgboost import XGBClassifier
+
+# =========================
+# 1. COPY DATAFRAME
+# =========================
+
+df = daily_event_df.copy()
+
+# Target: 1 if NCM occurs on that meter/day, else 0
+target_col = "ncm_flag"
+
+# =========================
+# 2. DEFINE COLUMNS
+# =========================
+
+id_cols = [
+    "meter_id",
+    "location_id",
+    "event_date"
+]
+
+# Columns you want treated as categories
+category_cols = [
+    "hardware_type",
+    "manufacturer",
+    "purchase_year_bucket",
+    "age_bucket",
+    "weather_zone"
+]
+
+# Numeric model features
+numeric_cols = [
+    "hardware_age_days",
+    "days_since_deploy",
+    "outage_count_7d",
+    "outage_count_30d",
+    "event_count_7d",
+    "event_count_30d",
+    "meter_change_count_30d",
+    "ncm_count_30d",
+    "temp_high",
+    "humidity_avg",
+    "wind_speed_max"
+]
+
+# Keep only columns that actually exist
+category_cols = [c for c in category_cols if c in df.columns]
+numeric_cols = [c for c in numeric_cols if c in df.columns]
+
+# =========================
+# 3. BASIC CLEANUP
+# =========================
+
+df["event_date"] = pd.to_datetime(df["event_date"])
+
+for col in category_cols:
+    df[col] = df[col].astype("category")
+
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+df[numeric_cols] = df[numeric_cols].fillna(0)
+
+# =========================
+# 4. CREATE DUMMY VARIABLES
+# =========================
+
+X = df[numeric_cols + category_cols].copy()
+
+X = pd.get_dummies(
+    X,
+    columns=category_cols,
+    dummy_na=True,
+    drop_first=False
+)
+
+y = df[target_col].astype(int)
+
+# =========================
+# 5. TRAIN / TEST SPLIT
+# =========================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
+
+# =========================
+# 6. TRAIN XGBOOST MODEL
+# =========================
+
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    random_state=42,
+    n_jobs=-1
+)
+
+model.fit(X_train, y_train)
+
+# =========================
+# 7. EVALUATE
+# =========================
+
+test_probs = model.predict_proba(X_test)[:, 1]
+test_preds = (test_probs >= 0.5).astype(int)
+
+print("ROC AUC:", roc_auc_score(y_test, test_probs))
+print(classification_report(y_test, test_preds))
+
+# =========================
+# 8. SCORE DAILY EVENT DATA
+# =========================
+
+score_df = daily_event_df.copy()
+
+score_df["event_date"] = pd.to_datetime(score_df["event_date"])
+
+for col in category_cols:
+    score_df[col] = score_df[col].astype("category")
+
+for col in numeric_cols:
+    score_df[col] = pd.to_numeric(score_df[col], errors="coerce")
+
+score_df[numeric_cols] = score_df[numeric_cols].fillna(0)
+
+X_score = score_df[numeric_cols + category_cols].copy()
+
+X_score = pd.get_dummies(
+    X_score,
+    columns=category_cols,
+    dummy_na=True,
+    drop_first=False
+)
+
+# Very important: make scoring columns match training columns
+X_score = X_score.reindex(columns=X_train.columns, fill_value=0)
+
+score_df["ncm_prediction_score"] = model.predict_proba(X_score)[:, 1]
+
+# Optional risk bucket
+score_df["ncm_risk_bucket"] = pd.cut(
+    score_df["ncm_prediction_score"],
+    bins=[0, 0.25, 0.50, 0.75, 1.0],
+    labels=["Low", "Medium", "High", "Very High"],
+    include_lowest=True
+)
+
+# Final scored output
+scored_daily_events = score_df[
+    id_cols + ["ncm_prediction_score", "ncm_risk_bucket"]
+]
+
+print(scored_daily_events.head())
+
+
+
