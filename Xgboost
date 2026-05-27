@@ -166,3 +166,34 @@ print(scored_daily_events.head())
 
 
 
+
+
+score_df = daily_event_df.copy()
+
+score_df["event_date"] = pd.to_datetime(score_df["event_date"])
+
+for col in numeric_cols:
+    score_df[col] = pd.to_numeric(score_df[col], errors="coerce")
+
+score_df[numeric_cols] = score_df[numeric_cols].fillna(0)
+
+for col in xgb_category_cols:
+    score_df[col] = score_df[col].astype("string").fillna("UNKNOWN").astype("category")
+
+X_score = score_df[numeric_cols + dummy_cols + xgb_category_cols].copy()
+
+X_score = pd.get_dummies(
+    X_score,
+    columns=dummy_cols,
+    dummy_na=True,
+    drop_first=False
+)
+
+# Match training columns
+X_score = X_score.reindex(columns=X.columns, fill_value=0)
+
+score_df["ncm_prediction_score"] = model.predict_proba(X_score)[:, 1]
+
+
+
+
