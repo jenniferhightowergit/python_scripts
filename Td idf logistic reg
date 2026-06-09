@@ -186,6 +186,62 @@ for i, category in enumerate(label_cols):
 
 
 
+
+
+
+
+
+import pandas as pd
+
+file_path = "meter_comment_training_data.xlsx"
+
+df = pd.read_excel(file_path)
+
+comment_col = "CLEANED_COMMENTS"
+
+label_cols = [
+    "METER_CHANGE",
+    "NON_COMMUNICATING",
+    "ACCESS_ISSUE",
+    "TAMPERING",
+    "CUSTOMER_OWNED",
+    "HARDWARE_FAILURE"
+]
+
+# clean column names
+df.columns = df.columns.str.strip()
+
+# keep original row number for tracing back to Excel
+df = df.reset_index().rename(columns={"index": "source_row"})
+
+# inspect labels BEFORE fillna / astype
+for col in label_cols:
+    print("\n", col)
+    print(df[col].value_counts(dropna=False))
+
+# find rows where comment text says NON_COMM but label is not 1
+check = df[
+    df[comment_col].astype(str).str.contains("NON_COMM", case=False, na=False)
+    & (df["NON_COMMUNICATING"] != 1)
+]
+
+print("Rows with NON_COMM text but label not 1:", len(check))
+
+check[
+    ["source_row", comment_col, "NON_COMMUNICATING"]
+].to_excel("debug_non_comm_label_mismatch.xlsx", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
 First off: this is a huge win. 🎉
 
 You went from “I don’t understand how training data works” to actually training a multi-label text classifier and getting evaluation metrics. That’s real machine learning.
