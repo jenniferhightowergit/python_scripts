@@ -478,4 +478,58 @@ That’s actually a really encouraging first pass because the model architecture
 
 
 
+confusion matrix checks::
+
+check false positives
+
+category = "NON_COMMUNICATING"
+
+false_positives = results[
+    (results[f"actual_{category}"] == 0) &
+    (results[f"pred_{category}"] == 1)
+].copy()
+
+false_positives = false_positives.sort_values(
+    by=f"score_{category}",
+    ascending=False
+)
+
+false_positives.to_excel(
+    "false_positives_non_communicating.xlsx",
+    index=False
+)
+
+false_positives.head(50)
+
+
+
+false negatives
+
+false_negatives = results[
+    (results[f"actual_{category}"] == 1) &
+    (results[f"pred_{category}"] == 0)
+].copy()
+
+false_negatives = false_negatives.sort_values(
+    by=f"score_{category}",
+    ascending=False
+)
+
+false_negatives.to_excel(
+    "false_negatives_non_communicating.xlsx",
+    index=False
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
 
