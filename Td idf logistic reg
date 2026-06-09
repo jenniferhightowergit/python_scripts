@@ -182,3 +182,300 @@ for i, category in enumerate(label_cols):
         f"FP={fp} "
         f"FN={fn}"
     )
+
+
+
+
+First off: this is a huge win. 🎉
+
+You went from “I don’t understand how training data works” to actually training a multi-label text classifier and getting evaluation metrics. That’s real machine learning.
+
+Now let’s interpret what happened.
+
+⸻
+
+Markdown Explanation for Your Notebook
+
+Methodology
+
+TF-IDF (Term Frequency – Inverse Document Frequency)
+
+TF-IDF converts text comments into numeric features that can be used by a machine learning model.
+
+The process assigns higher importance to words that:
+
+* Occur frequently within a comment (Term Frequency)
+* Occur infrequently across all comments (Inverse Document Frequency)
+
+Example:
+
+Comment:
+NO COMM METER EXCHANGED
+TF-IDF Features:
+NO_COMM      0.91
+EXCHANGED    0.85
+METER        0.04
+
+Common words that appear in many comments receive lower weights, while words that are distinctive to specific comment types receive higher weights.
+
+The result is a numerical representation of each comment called a feature vector.
+
+⸻
+
+Logistic Regression
+
+Logistic Regression is a supervised machine learning classification algorithm.
+
+The model learns relationships between TF-IDF features and manually assigned categories.
+
+For example, it may learn that:
+
+NO_COMM
+NO_READ
+COMM_FAILURE
+
+are strongly associated with:
+
+NON_COMMUNICATING
+
+while:
+
+EXCHANGE
+INSTALL
+REMOVE
+
+are associated with:
+
+METER_CHANGE
+
+The model outputs a probability for each category.
+
+Example:
+
+Comment:
+NO COMM METER EXCHANGED
+Predicted Probabilities:
+METER_CHANGE      0.94
+NON_COMMUNICATING 0.89
+ACCESS_ISSUE      0.01
+
+Categories whose probability exceeds the selected threshold (currently 0.50) are assigned to the comment.
+
+⸻
+
+Interpreting Your Results
+
+Let’s look at the big clue:
+
+Category	Precision	Recall	Support
+NON_COMMUNICATING	0.03	1.00	24
+
+This category is screaming at us.
+
+⸻
+
+What Recall = 1.00 Means
+
+It found every actual NON_COMMUNICATING comment.
+
+False Negatives = almost none
+
+Great.
+
+⸻
+
+What Precision = 0.03 Means
+
+This is terrible.
+
+It means:
+
+When the model predicts NON_COMMUNICATING, it’s only correct 3% of the time.
+
+Example:
+
+Model predicts:
+100 comments are NON_COMMUNICATING
+Reality:
+Only 3 actually are.
+97 are false alarms.
+
+⸻
+
+Why This Happened
+
+Look at support:
+
+NON_COMMUNICATING = 24
+
+Only 24 examples existed in your test set.
+
+Compare that to:
+
+METER_CHANGE = 982
+TAMPERING = 645
+
+Your classes are extremely imbalanced.
+
+The model is basically saying:
+
+“I’m not sure what NON_COMMUNICATING looks like, so I’ll overpredict it.”
+
+⸻
+
+Access Issue
+
+Precision = 1.00
+Recall = 0.67
+Support = 3
+
+Looks amazing…
+
+Except support is:
+
+3
+
+Three records.
+
+That’s statistically meaningless.
+
+One record changes the score dramatically.
+
+⸻
+
+What I’d Improve First
+
+1. Balance the Categories
+
+This is the biggest issue.
+
+Current:
+
+METER_CHANGE       982
+NON_COMMUNICATING   24
+ACCESS_ISSUE         3
+
+Ideally:
+
+METER_CHANGE       300
+NON_COMMUNICATING  300
+ACCESS_ISSUE       300
+
+or at least much closer.
+
+Machine learning hates huge class imbalance.
+
+⸻
+
+2. Review False Positives
+
+Open:
+
+results.to_excel(...)
+
+Filter:
+
+actual_NON_COMMUNICATING = 0
+pred_NON_COMMUNICATING = 1
+
+Look at 20-50 examples.
+
+You’ll probably discover:
+
+COMM
+RADIO
+NETWORK
+COLLECTOR
+
+appearing in other categories.
+
+This will tell you exactly why the model is confused.
+
+⸻
+
+3. Look at Important Features
+
+This is my favorite next step.
+
+After training:
+
+clf = model.named_steps["clf"]
+tfidf = model.named_steps["tfidf"]
+feature_names = tfidf.get_feature_names_out()
+
+For each category:
+
+estimator = clf.estimators_[0]
+
+you can inspect the highest weighted words.
+
+You might discover:
+
+NON_COMMUNICATING
+NO_COMM
+NO_READ
+COMM_FAILURE
+NETWORK
+
+or maybe some weird surprises.
+
+This gives explainability.
+
+⸻
+
+4. Tune the Threshold
+
+You’re currently using:
+
+threshold = 0.50
+
+For NON_COMMUNICATING you may want:
+
+threshold = 0.80
+
+This often dramatically improves precision.
+
+Example:
+
+0.50 threshold
+Precision = 0.03
+0.80 threshold
+Precision = 0.60
+
+while sacrificing some recall.
+
+⸻
+
+What Excites Me Most
+
+Your model is already identifying:
+
+METER_CHANGE
+TAMPERING
+CUSTOMER_OWNED
+HARDWARE_FAILURE
+
+with excellent scores.
+
+The biggest issue isn’t TF-IDF or Logistic Regression.
+
+It’s your training data distribution.
+
+Looking at those support values, I’d bet money that if you add:
+
+100-200 more examples
+
+for:
+
+NON_COMMUNICATING
+ACCESS_ISSUE
+
+you’ll see the biggest improvement of anything you could do right now.
+
+That’s actually a really encouraging first pass because the model architecture is working; the data just needs to catch up.
+
+
+
+
+
+
