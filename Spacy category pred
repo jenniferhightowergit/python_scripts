@@ -27,3 +27,53 @@ for i, row in df.iterrows():
     best_cat, score, _ = classify_comment(row["comment_column"])
     df.at[i, "predicted_category"] = best_cat
     df.at[i, "confidence"] = score
+
+
+import re
+import pandas as pd
+
+categories = {
+    "METER_CHANGE": ["meter change", "meter_change", "exchange", "like for like", 
+                     "meter removed", "meter install", "meter exch", "replaced"],
+    "NCM":          ["no comm", "ncm", "no read", "comm failure", "not responding",
+                     "no communication", "offline"],
+    "TAMPERING":    ["tamper", "bypass", "jumper", "seal broken", "unauthorized"],
+    "ACCESS_ISSUE": ["no access", "locked gate", "dog", "unable to access", "blocked"],
+}
+
+def classify_comment_keywords(comment, threshold=1):
+    comment_lower = comment.lower()
+    matched = {}
+    
+    for category, keywords in categories.items():
+        hits = [kw for kw in keywords if kw.lower() in comment_lower]
+        if len(hits) >= threshold:
+            # confidence = proportion of keywords that matched
+            score = round(len(hits) / len(keywords), 3)
+            matched[category] = {"score": score, "matched_keywords": hits}
+    
+    if not matched:
+        return ["OTHER"], {}, []
+    
+    sorted_cats = sorted(matched, key=lambda c: matched[c]["score"], reverse=True)
+    return sorted_cats, matched, []
+
+# Apply to dataframe
+for i, row in df.iterrows():
+    categories_found, details, _ = classify_comment_keywords(row["comment_column"])
+    
+    if categories_found == ["OTHER"]:
+        df.at[i, "predicted_categories"] = "OTHER"
+        df.at[i, "confidence_scores"]    = ""
+        df.at[i, "matched_keywords"]     = ""
+    else:
+        df.at[i, "predicted_categories"] = "|".join(categories_found)
+        df.at[i, "confidence_scores"]    = "|".join(
+            [f"{c}({details[c]['score']})" for c in categories_found])
+        df.at[i, "matched_keywords"]     = "|".join(
+            [f"{c}:{details[c]['matched_keywords']}" for c in categories_found])
+
+    df.at[i, "category_count"] = len(categories_found)
+    df.at[i, "top_category"]   = categories_found[0]
+
+
