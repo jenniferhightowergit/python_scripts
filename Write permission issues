@@ -1,0 +1,33 @@
+import os, sys
+
+path = os.path.abspath("data.parquet")
+folder = os.path.dirname(path)
+
+print("Full path:", path)
+print("OS:", sys.platform)
+
+# 1. Does the folder itself allow writes?
+print("Folder writable:", os.access(folder, os.W_OK))
+
+# 2. Does the file itself allow writes (if it exists)?
+print("File exists:", os.path.exists(path))
+if os.path.exists(path):
+    print("File writable:", os.access(path, os.W_OK))
+
+# 3. Can you create a brand new file in that same folder?
+test_path = os.path.join(folder, "_writetest.tmp")
+try:
+    with open(test_path, "w") as f:
+        f.write("test")
+    os.remove(test_path)
+    print("Can create new files in folder: YES")
+except Exception as e:
+    print("Can create new files in folder: NO ->", e)
+
+# 4. Can you open the EXISTING file for writing (without truncating)?
+try:
+    with open(path, "r+b"):
+        pass
+    print("Can open existing file for write: YES")
+except Exception as e:
+    print("Can open existing file for write: NO ->", e)
