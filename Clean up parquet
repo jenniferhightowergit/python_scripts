@@ -24,6 +24,15 @@ datetime_cols = [
     "file_modified_time"
 ]
 
+float_cols = [
+    "LATITUDE",
+    "LONGITUDE"
+]
+
+numeric_cols = [
+    "NUMBER_OF_DAYS"
+]
+
 for col in string_cols:
     if col in data_final.columns:
         data_final[col] = (
@@ -47,6 +56,26 @@ data_final.to_parquet(
     compression="snappy",
     index=False
 )
+
+for col in float_cols:
+    if col in data_final.columns:
+        data_final[col] = pd.to_numeric(
+            data_final[col]
+                .astype("string")
+                .str.strip()
+                .str.replace(",", "", regex=False),
+            errors="coerce"
+        )
+
+for col in numeric_cols:
+    if col in data_final.columns:
+        data_final[col] = pd.to_numeric(
+            data_final[col]
+                .astype("string")
+                .str.strip()
+                .str.replace(",", "", regex=False),
+            errors="coerce"
+        ).astype("Int64")
 
 
 print(data_final.dtypes)
