@@ -1,0 +1,55 @@
+# after reading your parquet
+data_final = pd.read_parquet(parquet_path)
+
+print(data_final.dtypes)
+print(data_final.head())
+
+
+string_cols = [
+    "RTE_CELL_H",
+    "PREM_H",
+    "WR ID",
+    "SERV_ADDR_L1_S",
+    "TOWN_N",
+    "PREM_SERV_ZIP_S",
+    "MTR_INSTL_D",
+    "file_date"
+]
+
+date_cols = [
+    "LAST_BILLABLE_READ"
+]
+
+datetime_cols = [
+    "file_modified_time"
+]
+
+for col in string_cols:
+    if col in data_final.columns:
+        data_final[col] = (
+            data_final[col]
+            .astype("string")
+            .str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+        )
+
+for col in date_cols:
+    if col in data_final.columns:
+        data_final[col] = pd.to_datetime(data_final[col], errors="coerce").dt.date
+
+for col in datetime_cols:
+    if col in data_final.columns:
+        data_final[col] = pd.to_datetime(data_final[col], errors="coerce")
+
+data_final.to_parquet(
+    parquet_path,
+    engine="pyarrow",
+    compression="snappy",
+    index=False
+)
+
+
+print(data_final.dtypes)
+print(data_final[["file_date", "file_modified_time"]].drop_duplicates().head(20))
+
+
