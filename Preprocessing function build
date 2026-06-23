@@ -1,0 +1,59 @@
+class CommentNormalizer:
+    
+    def __init__(self):
+        print("Setting up normalizer...")
+
+        # this is where expensive setup goes ONCE
+        self.employee_pattern = None
+        self.flat_spelling = flat_spelling
+        self.normalization_dict = normalization_dict
+        self.normalization_pattern = pattern
+
+        print("Normalizer ready.")
+
+
+    def run(self, df, frid_col, comment_col, instructions_col):
+        df = df[[frid_col, comment_col, instructions_col]].copy()
+
+        df["cleaned_comment"] = (
+            df[comment_col]
+            .astype("string")
+            .str.strip()
+            .str.upper()
+        )
+
+        df["cleaned_instructions"] = (
+            df[instructions_col]
+            .astype("string")
+            .str.strip()
+            .str.upper()
+        )
+
+        for col in ["cleaned_comment", "cleaned_instructions"]:
+            df[col] = df[col].map(first_cleanup)
+            df[col] = df[col].map(replace_voltage_indicators)
+            df[col] = df[col].map(replace_meter_numbers)
+            df[col] = df[col].map(replace_meter_seals)
+            df[col] = df[col].map(lambda x: apply_spelling(x, self.flat_spelling))
+            df[col] = df[col].map(remove_junk)
+
+        return df
+
+
+
+
+normalizer = CommentNormalizer()
+
+
+cleaned_df = normalizer.run(
+    sample_df,
+    frid_col="fr_id",
+    comment_col="wr_comment",
+    instructions_col="instructions"
+)
+
+cleaned_df.head()
+
+
+
+
