@@ -1,0 +1,27 @@
+# 2. only add rows not already in the parquet
+existing_keys = pd.read_parquet(
+    parquet_path,
+    columns=["MR_MDVC_NUMBER", "file_date", "modified_datetime"]
+).drop_duplicates()
+
+data_to_add = data_final.merge(
+    existing_keys,
+    on=["MR_MDVC_NUMBER", "file_date", "modified_datetime"],
+    how="left",
+    indicator=True
+)
+
+data_to_add = data_to_add[data_to_add["_merge"] == "left_only"].drop(columns="_merge")
+
+
+existing = pd.read_parquet(parquet_path)
+
+df_alltime = pd.concat([existing, data_to_add], ignore_index=True)
+
+df_alltime = df_alltime.drop_duplicates(
+    subset=["MR_MDVC_NUMBER", "file_date", "modified_datetime"],
+    keep="last"
+)
+
+df_alltime.to_parquet(parquet_path, engine="pyarrow", index=False)
+
