@@ -1,0 +1,58 @@
+WITH base AS (
+    SELECT
+        wr_id,
+        UPPER(COALESCE(wr_comment, '') || ' ' || COALESCE(comments, '')) AS comment_text,
+        instructions
+    FROM mc_df
+),
+
+labeled AS (
+    SELECT
+        wr_id,
+        comment_text AS comments,
+        instructions,
+
+        CASE WHEN comment_text LIKE '%NON%COMM%'
+               OR comment_text LIKE '%NON%COM%'
+               OR comment_text LIKE '%NOT COMMUNICATING%'
+               OR comment_text LIKE '%NO COMM%'
+               OR comment_text LIKE '%NO COM%'
+               OR comment_text LIKE '%NO READ%'
+               OR comment_text LIKE '%NO READS%'
+               OR comment_text LIKE '%NOT REPORTING%'
+               OR comment_text LIKE '%STOPPED REPORTING%'
+               OR comment_text LIKE '%MISSING READ%'
+               OR comment_text LIKE '%MIDNIGHT READS ARE NOT BEING RECEIVED%'
+        THEN 1 ELSE 0 END AS NON_COMMUNICATING,
+
+        CASE WHEN comment_text LIKE '%NETWORK%'
+               OR comment_text LIKE '%OUTAGE%'
+               OR comment_text LIKE '%COLLECTOR DOWN%'
+               OR comment_text LIKE '%COLLECTOR OFFLINE%'
+        THEN 1 ELSE 0 END AS NETWORK_ISSUE
+
+        -- add the rest of your CASE columns here
+
+    FROM base
+),
+
+keyword_sample AS (
+    SELECT *
+    FROM labeled
+    WHERE NON_COMMUNICATING = 1
+       OR NETWORK_ISSUE = 1
+       OR DAMAGED_METER = 1
+       OR HARDWARE_FAILURE = 1
+       OR VEGETATION = 1
+       OR TOPOGRAPHY_ISSUE = 1
+       OR TAMPERING = 1
+       OR VANDALISM = 1
+       OR ELECTRICAL_DISTRIBUTION_ISSUE = 1
+       OR CONSTRUCTION = 1
+       OR ACCESS_ISSUES = 1
+)
+
+SELECT *
+FROM keyword_sample
+ORDER BY random()
+LIMIT 300000;
