@@ -1,0 +1,34 @@
+parquet_path = r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\MDMS_daily_estimating.parquet"
+
+existing = pd.read_parquet(parquet_path)
+
+# make sure dates match types
+existing["file_date"] = pd.to_datetime(existing["file_date"])
+estimating_calc["file_date"] = pd.to_datetime(estimating_calc["file_date"])
+
+existing["modified_datetime"] = pd.to_datetime(existing["modified_datetime"])
+estimating_calc["modified_datetime"] = pd.to_datetime(estimating_calc["modified_datetime"])
+
+# remove the bad old versions of rows that are now corrected
+fixed_keys = estimating_calc[["MR_MDVC_NUMBER", "file_date", "modified_datetime"]].drop_duplicates()
+
+existing_keep = existing.merge(
+    fixed_keys,
+    on=["MR_MDVC_NUMBER", "file_date", "modified_datetime"],
+    how="left",
+    indicator=True
+)
+
+existing_keep = existing_keep[existing_keep["_merge"] == "left_only"].drop(columns="_merge")
+
+# add corrected rows back
+df_alltime = pd.concat([existing_keep, estimating_calc], ignore_index=True)
+
+df_alltime.to_parquet(parquet_path, engine="pyarrow", index=False)
+
+
+check = pd.read_parquet(parquet_path)
+
+check.columns.tolist()
+check.isna().sum().sort_values(ascending=False).head(30)
+
