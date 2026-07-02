@@ -1,0 +1,36 @@
+import duckdb
+
+conn = duckdb.connect()
+conn.execute("SET memory_limit='4GB'")
+conn.execute("SET threads=2")
+conn.execute("SET preserve_insertion_order=false")
+conn.execute("PRAGMA max_temp_directory_size='20GiB'")
+
+# Get the full list of distinct meters once
+meters = conn.execute("SELECT DISTINCT MR_MDVC_NUMBER FROM data_final").fetchdf()['MR_MDVC_NUMBER'].tolist()
+
+batch_size = 5000  # tune based on how it performs — start conservative, increase if it's fast and stable
+first_batch = True
+
+for i in range(0, len(meters), batch_size):
+    batch_meters = meters[i:i + batch_size]
+    meter_list = "', '".join(batch_meters)  # adjust quoting if MR_MDVC_NUMBER isn't a string
+
+    conn.execute(f"""
+        CREATE OR REPLACE TABLE estimating_base_batch AS
+        SELECT * FROM data_final WHERE MR_MDVC_NUMBER IN ('{meter_list}')
+    """)
+
+    # ⬇️ your existing estimating_events_with_gap SQL, unchanged, but built FROM estimating_base_batch
+    # ⬇️ your existing estimating_features SQL, unchanged, but built FROM estimating_base_batch and joining estimating_events_with_gap
+
+    batch_df = conn.execute("SELECT * FROM estimating_features").fetchdf()
+
+    if first_batch:
+        batch_df.to_parquet('estimating_features_output.parquet', index=False)
+        first_batch = False
+    else:
+        # append: read what's there, concat, rewrite — or better, write per-batch files
+        batch_df.to_parquet(f'estimating_features_batch_{i}.parquet', index=False)
+
+    print(f"Batch {i}-{i+batch_size} done: {len(batch_meters)} meters")
