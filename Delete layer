@@ -1,0 +1,67 @@
+batch_size = 5000
+
+conn.execute("DROP TABLE IF EXISTS estimating_features_all")
+
+first_batch = True
+
+for i in range(0, len(meters), batch_size):
+    batch_meters = meters[i:i + batch_size]
+
+    meter_list = "', '".join([str(m).strip().upper() for m in batch_meters])
+
+    conn.execute(f"""
+        CREATE OR REPLACE TABLE estimating_features_batch AS
+        SELECT
+            a.MR_MDVC_NUMBER,
+            a.file_date,
+            LAST_GOOD_READ_DATE,
+            a.source_file,
+            a.modified_datetime,
+            a.ESI_LOC,
+            a.ESTIMATING,
+
+            COUNT(*) FILTER (
+                WHERE e.ESTIMATING = 1
+                  AND e.file_date BETWEEN a.file_date - INTERVAL 30 DAY AND a.file_date
+            ) AS hit_1_count_30d,
+
+            COUNT(*) FILTER (
+                WHERE e.ESTIMATING = 1
+                  AND e.file_date BETWEEN a.file_date - INTERVAL 60 DAY AND a.file_date
+            ) AS hit_1_count_60d,
+
+            COUNT(*) FILTER (
+                WHERE e.ESTIMATING = 1
+                  AND e.file_date BETWEEN a.file_date - INTERVAL 90 DAY AND a.file_date
+            ) AS hit_1_count_90d
+
+        FROM data_final a
+        LEFT JOIN data_final e
+            ON UPPER(TRIM(CAST(a.MR_MDVC_NUMBER AS VARCHAR))) =
+               UPPER(TRIM(CAST(e.MR_MDVC_NUMBER AS VARCHAR)))
+
+        WHERE UPPER(TRIM(CAST(a.MR_MDVC_NUMBER AS VARCHAR))) IN ('{meter_list}')
+
+        GROUP BY
+            a.MR_MDVC_NUMBER,
+            a.file_date,
+            LAST_GOOD_READ_DATE,
+            a.source_file,
+            a.modified_datetime,
+            a.ESI_LOC,
+            a.ESTIMATING
+    """)
+
+    if first_batch:
+        conn.execute("""
+            CREATE TABLE estimating_features_all AS
+            SELECT * FROM estimating_features_batch
+        """)
+        first_batch = False
+    else:
+        conn.execute("""
+            INSERT INTO estimating_features_all
+            SELECT * FROM estimating_features_batch
+        """)
+
+    print(f"Batch {i}-{i + batch_size} done: {len(batch_meters)} meters")
