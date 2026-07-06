@@ -1,67 +1,26 @@
-batch_size = 5000
+from datetime import datetime
+from pathlib import Path
 
-conn.execute("DROP TABLE IF EXISTS estimating_features_all")
+# only keep new wr_ids that are NOT already in existing
+new_only = new_rows[
+    ~new_rows["wr_id"].isin(existing["wr_id"])
+].copy()
 
-first_batch = True
+print("New rows cleaned:", len(new_rows))
+print("Actually new wr_ids:", len(new_only))
 
-for i in range(0, len(meters), batch_size):
-    batch_meters = meters[i:i + batch_size]
+# save only if there is anything new
+if len(new_only) > 0:
+    output_dir = Path(
+        r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders"
+    )
 
-    meter_list = "', '".join([str(m).strip().upper() for m in batch_meters])
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    conn.execute(f"""
-        CREATE OR REPLACE TABLE estimating_features_batch AS
-        SELECT
-            a.MR_MDVC_NUMBER,
-            a.file_date,
-            LAST_GOOD_READ_DATE,
-            a.source_file,
-            a.modified_datetime,
-            a.ESI_LOC,
-            a.ESTIMATING,
+    output_file = output_dir / f"cleaned_comments_incremental_{run_stamp}.parquet"
 
-            COUNT(*) FILTER (
-                WHERE e.ESTIMATING = 1
-                  AND e.file_date BETWEEN a.file_date - INTERVAL 30 DAY AND a.file_date
-            ) AS hit_1_count_30d,
+    new_only.to_parquet(output_file, index=False)
 
-            COUNT(*) FILTER (
-                WHERE e.ESTIMATING = 1
-                  AND e.file_date BETWEEN a.file_date - INTERVAL 60 DAY AND a.file_date
-            ) AS hit_1_count_60d,
-
-            COUNT(*) FILTER (
-                WHERE e.ESTIMATING = 1
-                  AND e.file_date BETWEEN a.file_date - INTERVAL 90 DAY AND a.file_date
-            ) AS hit_1_count_90d
-
-        FROM data_final a
-        LEFT JOIN data_final e
-            ON UPPER(TRIM(CAST(a.MR_MDVC_NUMBER AS VARCHAR))) =
-               UPPER(TRIM(CAST(e.MR_MDVC_NUMBER AS VARCHAR)))
-
-        WHERE UPPER(TRIM(CAST(a.MR_MDVC_NUMBER AS VARCHAR))) IN ('{meter_list}')
-
-        GROUP BY
-            a.MR_MDVC_NUMBER,
-            a.file_date,
-            LAST_GOOD_READ_DATE,
-            a.source_file,
-            a.modified_datetime,
-            a.ESI_LOC,
-            a.ESTIMATING
-    """)
-
-    if first_batch:
-        conn.execute("""
-            CREATE TABLE estimating_features_all AS
-            SELECT * FROM estimating_features_batch
-        """)
-        first_batch = False
-    else:
-        conn.execute("""
-            INSERT INTO estimating_features_all
-            SELECT * FROM estimating_features_batch
-        """)
-
-    print(f"Batch {i}-{i + batch_size} done: {len(batch_meters)} meters")
+    print(f"Saved {len(new_only):,} rows to {output_file.name}")
+else:
+    print("No new wr_ids to append.")
