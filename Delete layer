@@ -1,46 +1,22 @@
-import joblib
-import pandas as pd
-
-model_path = r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\Models\comment_event_classifier.pkl"
-
-model = joblib.load(model_path)
-
-label_cols = [
-    "NON_COMMUNICATING",
-    "DAMAGED_METER",
-    "HARDWARE_FAILURE",
-    "VEGETATION",
-    "NETWORK_ISSUE",
-    "TOPOGRAPHY_ISSUE",
-    "TAMPERING",
-    "VANDALISM",
-    "ELECTRICAL_DISTRIBUTION_ISSUE",
-    "CONSTRUCTION",
-    "ACCESS_ISSUES"
-]
-
-threshold = 0.70
-
-X_new = cleaned_comments["cleaned_comment"].fillna("").astype(str)
-
-probs = model.predict_proba(X_new)
-preds = (probs >= threshold).astype(int)
-
-pred_df = pd.DataFrame(
-    preds,
-    columns=label_cols,
-    index=cleaned_comments.index
+current_file = Path(
+    r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders.parquet"
 )
 
-score_df = pd.DataFrame(
-    probs,
-    columns=[f"{c}_score" for c in label_cols],
-    index=cleaned_comments.index
+temp_file = Path(
+    r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders_TEMP.parquet"
 )
 
-comment_events = pd.concat(
-    [cleaned_comments, pred_df, score_df],
-    axis=1
-)
+existing = pd.read_parquet(current_file)
 
-comment_events.head()
+new_only = new_rows_scored[
+    ~new_rows_scored["wr_id"].isin(existing["wr_id"])
+].copy()
+
+updated = pd.concat([existing, new_only], ignore_index=True)
+
+updated.to_parquet(temp_file, index=False)
+
+current_file.unlink()
+temp_file.rename(current_file)
+
+print(f"Added {len(new_only):,} new rows")
