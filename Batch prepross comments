@@ -1,0 +1,47 @@
+import pandas as pd
+import duckdb
+from pathlib import Path
+
+out_dir = Path(r"S:\Users\YourName\Documents\Tableau Input\comment_event_processing\cleaned_comments_parquet")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+batch_size = 50_000
+
+conn = duckdb.connect()
+
+total_rows = conn.execute("""
+    SELECT COUNT(*) 
+    FROM completed_work_orders
+""").fetchone()[0]
+
+for offset in range(0, total_rows, batch_size):
+    print(f"Processing rows {offset:,} to {offset + batch_size:,}")
+
+    batch_df = conn.execute(f"""
+        SELECT
+            wr_id,
+            meterno,
+            est_loc,
+            worked_date,
+            wr_comment,
+            comments,
+            instructions
+        FROM completed_work_orders
+        ORDER BY wr_id
+        LIMIT {batch_size}
+        OFFSET {offset}
+    """).fetchdf()
+
+    clean_batch = normalize_comments(
+        df=batch_df,
+        frid_col="wr_id",
+        comment_col="combined_comment",
+        date_col="worked_date"
+    )
+
+    clean_batch.to_parquet(
+        out_dir / f"cleaned_comments_part_{offset // batch_size:05d}.parquet",
+        index=False
+    )
+
+    del batch_df, clean_batch
