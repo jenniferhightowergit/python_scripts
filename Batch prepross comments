@@ -1,47 +1,64 @@
-import pandas as pd
 import duckdb
 from pathlib import Path
-
-out_dir = Path(r"S:\Users\YourName\Documents\Tableau Input\comment_event_processing\cleaned_comments_parquet")
-out_dir.mkdir(parents=True, exist_ok=True)
-
-batch_size = 50_000
+import gc
 
 conn = duckdb.connect()
 
+conn.register("comments_source", mc_df)  # or your DuckDB table/view
+
+output_dir = Path(r"S:\Users\UIX9\Documents\Tableau Input\comment_event_processing\cleaned_comments_parquet")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+batch_size = 50_000
+
 total_rows = conn.execute("""
-    SELECT COUNT(*) 
-    FROM completed_work_orders
+    SELECT COUNT(*)
+    FROM comments_source
 """).fetchone()[0]
 
 for offset in range(0, total_rows, batch_size):
-    print(f"Processing rows {offset:,} to {offset + batch_size:,}")
+
+    part_num = offset // batch_size
+    output_file = output_dir / f"cleaned_comments_part_{part_num:05d}.parquet"
+
+    if output_file.exists():
+        print(f"Skipping {output_file.name}")
+        continue
 
     batch_df = conn.execute(f"""
         SELECT
-            wr_id,
+            wr_id AS fr_id,
+            COALESCE(wr_comment, '') || ' ' || COALESCE(comments, '') AS wr_comment,
+            COALESCE(instructions, '') AS instructions,
             meterno,
             est_loc,
-            worked_date,
-            wr_comment,
-            comments,
-            instructions
-        FROM completed_work_orders
+            worked_date
+        FROM comments_source
         ORDER BY wr_id
         LIMIT {batch_size}
         OFFSET {offset}
     """).fetchdf()
 
-    clean_batch = normalize_comments(
-        df=batch_df,
-        frid_col="wr_id",
-        comment_col="combined_comment",
-        date_col="worked_date"
+    print(f"Processing batch {part_num}: {len(batch_df):,} rows")
+
+    # This is the key part:
+    df = batch_df.copy()
+
+    # Your notebook expects df to exist
+    %run r"C:\Users\UIX9\Documents\GitLab Repos\testing\Preprocessing_v6.ipynb"
+
+    # Assuming the notebook creates cleaned_df
+    cleaned_df = cleaned_df.merge(
+        batch_df[["fr_id", "meterno", "est_loc", "worked_date"]].drop_duplicates("fr_id"),
+        on="fr_id",
+        how="left"
     )
 
-    clean_batch.to_parquet(
-        out_dir / f"cleaned_comments_part_{offset // batch_size:05d}.parquet",
-        index=False
-    )
+    cleaned_df.to_parquet(output_file, index=False)
 
-    del batch_df, clean_batch
+    print(f"Saved {output_file.name}")
+
+    del batch_df, df, cleaned_df
+    gc.collect()
+
+print("Done")
