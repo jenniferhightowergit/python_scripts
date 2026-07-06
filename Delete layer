@@ -1,26 +1,46 @@
-from datetime import datetime
-from pathlib import Path
+import joblib
+import pandas as pd
 
-# only keep new wr_ids that are NOT already in existing
-new_only = new_rows[
-    ~new_rows["wr_id"].isin(existing["wr_id"])
-].copy()
+model_path = r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\Models\comment_event_classifier.pkl"
 
-print("New rows cleaned:", len(new_rows))
-print("Actually new wr_ids:", len(new_only))
+model = joblib.load(model_path)
 
-# save only if there is anything new
-if len(new_only) > 0:
-    output_dir = Path(
-        r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders"
-    )
+label_cols = [
+    "NON_COMMUNICATING",
+    "DAMAGED_METER",
+    "HARDWARE_FAILURE",
+    "VEGETATION",
+    "NETWORK_ISSUE",
+    "TOPOGRAPHY_ISSUE",
+    "TAMPERING",
+    "VANDALISM",
+    "ELECTRICAL_DISTRIBUTION_ISSUE",
+    "CONSTRUCTION",
+    "ACCESS_ISSUES"
+]
 
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+threshold = 0.70
 
-    output_file = output_dir / f"cleaned_comments_incremental_{run_stamp}.parquet"
+X_new = cleaned_comments["cleaned_comment"].fillna("").astype(str)
 
-    new_only.to_parquet(output_file, index=False)
+probs = model.predict_proba(X_new)
+preds = (probs >= threshold).astype(int)
 
-    print(f"Saved {len(new_only):,} rows to {output_file.name}")
-else:
-    print("No new wr_ids to append.")
+pred_df = pd.DataFrame(
+    preds,
+    columns=label_cols,
+    index=cleaned_comments.index
+)
+
+score_df = pd.DataFrame(
+    probs,
+    columns=[f"{c}_score" for c in label_cols],
+    index=cleaned_comments.index
+)
+
+comment_events = pd.concat(
+    [cleaned_comments, pred_df, score_df],
+    axis=1
+)
+
+comment_events.head()
