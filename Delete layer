@@ -20,3 +20,24 @@ current_file.unlink()
 temp_file.rename(current_file)
 
 print(f"Added {len(new_only):,} new rows")
+
+
+if len(new_only) > 0:
+
+    updated = pd.concat([existing, new_only], ignore_index=True)
+
+    # Write to a temporary file first
+
+    updated.to_parquet(temp_file, index=False)
+
+    # Replace the old parquet
+
+    current_file.unlink()
+
+    temp_file.rename(current_file)
+
+    print(f"Added {len(new_only):,} new rows.")
+
+else:
+
+    print("No new wr_ids to append.")
