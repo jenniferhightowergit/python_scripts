@@ -1,18 +1,44 @@
-# 1. Train model
-output = classifier.train(...)
+if len(label_cols) == 1:
+    y_prob = cross_val_predict(
+        clone(model),
+        X,
+        y,
+        cv=kfold,
+        method="predict_proba"
+    )[:, 1].reshape(-1, 1)
 
-model = output["model"]
-results = output["results"]
-report = output["report"]
+else:
+    y_prob = cross_val_predict(
+        clone(model),
+        X,
+        y,
+        cv=kfold,
+        method="predict_proba"
+    )
 
-# 2. Validate same model
-validation_output = validator.validate(
-    model=model,
-    df=df1,
-    comment_col="cleaned_comment",
-    instructions_col="cleaned_instructions",
-    label_cols=label_cols,
-    threshold=0.70,
-    cv=5,
-    show_plots=True
-)
+
+
+if len(label_cols) == 1:
+    y_pred = (y_prob[:, 0] >= threshold).astype(int)
+
+    report = classification_report(
+        y,
+        y_pred,
+        target_names=[f"NOT_{label_cols[0]}", label_cols[0]],
+        output_dict=True,
+        zero_division=0
+    )
+
+else:
+    y_pred = (y_prob >= threshold).astype(int)
+
+    report = classification_report(
+        y,
+        y_pred,
+        target_names=label_cols,
+        output_dict=True,
+        zero_division=0
+    )
+
+
+
