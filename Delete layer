@@ -8,7 +8,6 @@ def train_comment_classifier(
     random_state=42
 ):
     import pandas as pd
-    import numpy as np
 
     from sklearn.model_selection import train_test_split
     from sklearn.pipeline import Pipeline
@@ -19,7 +18,6 @@ def train_comment_classifier(
 
     df = df.copy()
 
-    # combine comment + instructions into one training text field
     df["model_text"] = (
         df[comment_col].fillna("").astype(str)
         + " "
@@ -57,12 +55,20 @@ def train_comment_classifier(
     y_prob = model.predict_proba(X_test)
     y_pred = (y_prob >= threshold).astype(int)
 
-    print(classification_report(
-        y_test,
-        y_pred,
-        target_names=label_cols,
-        zero_division=0
-    ))
+    if len(label_cols) == 1:
+        report = classification_report(
+            y_test.values.ravel(),
+            y_pred.ravel(),
+            target_names=[f"NOT_{label_cols[0]}", label_cols[0]]
+        )
+    else:
+        report = classification_report(
+            y_test,
+            y_pred,
+            target_names=label_cols
+        )
+
+    print(report)
 
     results = pd.DataFrame({
         "model_text": X_test.values
@@ -74,43 +80,3 @@ def train_comment_classifier(
         results[f"score_{col}"] = y_prob[:, i].round(3)
 
     return model, results
-
-
-label_cols = [
-    "NON_COMMUNICATING",
-    "DAMAGED_METER",
-    "HARDWARE_FAILURE",
-    "VEGETATION",
-    "NETWORK_ISSUE",
-    "TOPOGRAPHY_ISSUE",
-    "TAMPERING",
-    "VANDALISM",
-    "ELECTRICAL_DISTRIBUTION_ISSUE",
-    "CONSTRUCTION",
-    "ACCESS_ISSUES"
-]
-
-model, results = train_comment_classifier(
-    df=to_train,
-    comment_col="cleaned_comment",
-    instructions_col="cleaned_instructions",
-    label_cols=label_cols,
-    threshold=0.70
-)
-
-
-model_hardware, results_hardware = train_comment_classifier(
-    df=to_train,
-    comment_col="cleaned_comment",
-    instructions_col="cleaned_instructions",
-    label_cols=["HARDWARE_FAILURE"],
-    threshold=0.70
-)
-
-
-import joblib
-
-joblib.dump(
-    model_hardware,
-    r"\\eucprdnas01\u_support\jen_hightower\ML_Models\hardware_failure_model.pkl"
-)
