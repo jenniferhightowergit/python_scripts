@@ -1,43 +1,76 @@
-current_file = Path(
-    r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders.parquet"
-)
+def train_comment_classifier(
+    df,
+    comment_col,
+    instructions_col,
+    label_cols,
+    threshold=0.70,
+    test_size=0.20,
+    random_state=42
+):
+    import pandas as pd
+    import numpy as np
 
-temp_file = Path(
-    r"\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFakeDW\Staging\parquet\comments_workOrders_TEMP.parquet"
-)
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.multiclass import OneVsRestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import classification_report
 
-existing = pd.read_parquet(current_file)
+    df = df.copy()
 
-new_only = new_rows_scored[
-    ~new_rows_scored["wr_id"].isin(existing["wr_id"])
-].copy()
+    # combine comment + instructions into one training text field
+    df["model_text"] = (
+        df[comment_col].fillna("").astype(str)
+        + " "
+        + df[instructions_col].fillna("").astype(str)
+    )
 
-updated = pd.concat([existing, new_only], ignore_index=True)
+    df = df.dropna(subset=["model_text"])
 
-updated.to_parquet(temp_file, index=False)
+    X = df["model_text"]
+    y = df[label_cols].fillna(0).astype(int)
 
-current_file.unlink()
-temp_file.rename(current_file)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=random_state
+    )
 
-print(f"Added {len(new_only):,} new rows")
+    model = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 3),
+            min_df=2,
+            max_df=0.90
+        )),
+        ("clf", OneVsRestClassifier(
+            LogisticRegression(
+                max_iter=1000,
+                class_weight="balanced"
+            )
+        ))
+    ])
 
+    model.fit(X_train, y_train)
 
-if len(new_only) > 0:
+    y_prob = model.predict_proba(X_test)
+    y_pred = (y_prob >= threshold).astype(int)
 
-    updated = pd.concat([existing, new_only], ignore_index=True)
+    print(classification_report(
+        y_test,
+        y_pred,
+        target_names=label_cols,
+        zero_division=0
+    ))
 
-    # Write to a temporary file first
+    results = pd.DataFrame({
+        "model_text": X_test.values
+    })
 
-    updated.to_parquet(temp_file, index=False)
+    for i, col in enumerate(label_cols):
+        results[f"actual_{col}"] = y_test[col].values
+        results[f"pred_{col}"] = y_pred[:, i]
+        results[f"score_{col}"] = y_prob[:, i].round(3)
 
-    # Replace the old parquet
-
-    current_file.unlink()
-
-    temp_file.rename(current_file)
-
-    print(f"Added {len(new_only):,} new rows.")
-
-else:
-
-    print("No new wr_ids to append.")
+    return model, results
