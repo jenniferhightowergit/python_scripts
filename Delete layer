@@ -1,19 +1,18 @@
-if save_outputs:
-    model_path = output_path / f"{model_name}.pkl"
-    results_path = output_path / f"{model_name}_test_results.csv"
-    report_path = output_path / f"{model_name}_classification_report.txt"
+# 1. Train model
+output = classifier.train(...)
 
-    joblib.dump(model, model_path)
-    results.to_csv(results_path, index=False)
+model = output["model"]
+results = output["results"]
+report = output["report"]
 
-    with open(report_path, "w") as f:
-        f.write(report)
-
-    saved_files = {
-        "model_path": str(model_path),
-        "results_path": str(results_path),
-        "report_path": str(report_path)
-    }
-
-
-
+# 2. Validate same model
+validation_output = validator.validate(
+    model=model,
+    df=df1,
+    comment_col="cleaned_comment",
+    instructions_col="cleaned_instructions",
+    label_cols=label_cols,
+    threshold=0.70,
+    cv=5,
+    show_plots=True
+)
