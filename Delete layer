@@ -1,56 +1,13 @@
-
 if len(label_cols) == 1:
-    y = df[label_cols[0]].fillna(0).astype(int)
-else:
-    y = df[label_cols].fillna(0).astype(int)
-
-
-for i, col in enumerate(label_cols):
-    if len(label_cols) == 1:
-        results[f"actual_{col}"] = y_test.values
-    else:
-        results[f"actual_{col}"] = y_test[col].values
-
-    results[f"pred_{col}"] = y_pred[:, i]
-    results[f"score_{col}"] = y_prob[:, i].round(3)
-
-
-
-
-if len(label_cols) == 1:
-    y_prob = cross_val_predict(
-        clone(model),
-        X,
-        y,
-        cv=kfold,
-        method="predict_proba"
-    )[:, 1].reshape(-1, 1)
-
-else:
-    y_prob = cross_val_predict(
-        clone(model),
-        X,
-        y,
-        cv=kfold,
-        method="predict_proba"
-    )
-
-
-
-if len(label_cols) == 1:
-    y_pred = (y_prob[:, 0] >= threshold).astype(int)
-
     report = classification_report(
         y,
-        y_pred,
+        y_pred.ravel(),
+        labels=[0, 1],
         target_names=[f"NOT_{label_cols[0]}", label_cols[0]],
         output_dict=True,
         zero_division=0
     )
-
 else:
-    y_pred = (y_prob >= threshold).astype(int)
-
     report = classification_report(
         y,
         y_pred,
@@ -58,6 +15,3 @@ else:
         output_dict=True,
         zero_division=0
     )
-
-
-
