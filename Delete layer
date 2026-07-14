@@ -1,308 +1,93 @@
-BATCH_SIZE = 10_000
+from pathlib import Path
+import duckdb
 
-last_meter = None
-batch_number = 0
+# -------------------------------------------------
+# Output location
+# -------------------------------------------------
 
-total_selected_meters = 0
-total_returned_rows = 0
+output_folder = Path(
+    r"\\YOUR\SHARE\NCM_CURATED"
+)
 
-batch_times = []
-all_results = []
+output_folder.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
-overall_start = time.perf_counter()
+parquet_path = output_folder / "ncm_daily_curated.parquet"
+
+final_data.to_parquet(
+    parquet_path,
+    index=False
+)
+
+print(f"Saved Parquet:")
+print(parquet_path)
+print(f"Rows: {len(final_data):,}")
 
 
 
 
-meter_selection_query = text("""
-    SELECT meterno
-    FROM
-    (
-        SELECT DISTINCT
-            TRIM(s.SERIAL_NBR)
-            || TRIM(UPPER(s.MFG_CD)) AS meterno
+duckdb_path = output_folder / "ncm_curated.duckdb"
 
-        FROM RPTUSER.CM_ALL_TOWN_VW s
+conn = duckdb.connect(str(duckdb_path))
 
-        WHERE s.SERIAL_NBR IS NOT NULL
-          AND s.MFG_CD IS NOT NULL
+conn.register(
+    "final_data_df",
+    final_data
+)
 
-          AND (
-              :last_meter IS NULL
-              OR (
-                  TRIM(s.SERIAL_NBR)
-                  || TRIM(UPPER(s.MFG_CD))
-              ) > :last_meter
-          )
+conn.execute("""
 
-        ORDER BY meterno
-    )
+CREATE OR REPLACE TABLE ncm_daily AS
 
-    WHERE ROWNUM <= :batch_size
+SELECT *
+FROM final_data_df
+
 """)
 
+conn.unregister("final_data_df")
 
+conn.close()
 
-with ods_alchemy_engine.connect() as sql_connection:
+print(f"Saved DuckDB:")
+print(duckdb_path)
 
-    while True:
 
-        batch_number += 1
-        batch_start_time = time.perf_counter()
 
-        print("\n" + "=" * 70)
-        print(f"Finding active meters for batch {batch_number:,}...")
-        print(
-            "Starting after meter: "
-            f"{last_meter if last_meter is not None else '[beginning]'}"
-        )
-        print("=" * 70)
+import duckdb
 
-        # ----------------------------------------------------------
-        # STEP 1: Oracle selects the next 10,000 distinct meters
-        # ----------------------------------------------------------
-
-        batch_meter_df = pd.read_sql_query(
-            meter_selection_query,
-            sql_connection,
-            params={
-                "last_meter": last_meter,
-                "batch_size": BATCH_SIZE
-            }
-        )
-
-        batch_meter_df.columns = (
-            batch_meter_df.columns
-            .str.strip()
-            .str.lower()
-        )
-
-        # No rows means all meters have been processed
-        if batch_meter_df.empty:
-
-            print("\nNo more active meters were found.")
-
-            # Remove the unused final batch number
-            batch_number -= 1
-
-            break
-
-        batch_first_meter = str(
-            batch_meter_df["meterno"].iloc[0]
-        )
-
-        batch_last_meter = str(
-            batch_meter_df["meterno"].iloc[-1]
-        )
-
-        meters_in_batch = len(batch_meter_df)
-
-        print(f"Batch number: {batch_number:,}")
-        print(f"Meters selected: {meters_in_batch:,}")
-        print(f"First meter: {batch_first_meter}")
-        print(f"Last meter:  {batch_last_meter}")
-
-        # ----------------------------------------------------------
-        # STEP 2: Retrieve the full active-meter rows
-        # ----------------------------------------------------------
-
-        active_meter_query = text("""
-            WITH batch_meters AS
-            (
-                SELECT meterno
-                FROM
-                (
-                    SELECT DISTINCT
-                        TRIM(s1.SERIAL_NBR)
-                        || TRIM(UPPER(s1.MFG_CD)) AS meterno
-
-                    FROM RPTUSER.CM_ALL_TOWN_VW s1
-
-                    WHERE s1.SERIAL_NBR IS NOT NULL
-                      AND s1.MFG_CD IS NOT NULL
-
-                      AND (
-                          :last_meter IS NULL
-                          OR (
-                              TRIM(s1.SERIAL_NBR)
-                              || TRIM(UPPER(s1.MFG_CD))
-                          ) > :last_meter
-                      )
-
-                    ORDER BY meterno
-                )
-
-                WHERE ROWNUM <= :batch_size
-            )
-
-            SELECT
-                TRIM(s.SERIAL_NBR)
-                || TRIM(UPPER(s.MFG_CD)) AS meterno,
-
-                s.*
-
-            FROM RPTUSER.CM_ALL_TOWN_VW s
-
-            JOIN batch_meters bm
-                ON (
-                    TRIM(s.SERIAL_NBR)
-                    || TRIM(UPPER(s.MFG_CD))
-                ) = bm.meterno
-
-            WHERE s.SERIAL_NBR IS NOT NULL
-              AND s.MFG_CD IS NOT NULL
-        """)
-
-        try:
-
-            batch_result = pd.read_sql_query(
-                active_meter_query,
-                sql_connection,
-                params={
-                    "last_meter": last_meter,
-                    "batch_size": BATCH_SIZE
-                }
-            )
-
-        except Exception as error:
-
-            print("\n" + "!" * 70)
-            print(f"Batch {batch_number:,} failed.")
-            print(f"Starting marker: {last_meter}")
-            print(f"First selected meter: {batch_first_meter}")
-            print(f"Last selected meter:  {batch_last_meter}")
-            print("!" * 70)
-
-            raise error
-
-        # Normalize column names
-        batch_result.columns = (
-            batch_result.columns
-            .str.strip()
-            .str.lower()
-        )
-
-        # Track which query batch produced each row
-        batch_result["query_batch_number"] = batch_number
-
-        # Convert to modern pandas dtypes
-        batch_result = batch_result.convert_dtypes()
-
-        # Save this batch in memory
-        all_results.append(batch_result)
-
-        # ----------------------------------------------------------
-        # STEP 3: Update progress
-        # ----------------------------------------------------------
-
-        total_selected_meters += meters_in_batch
-        total_returned_rows += len(batch_result)
-
-        batch_elapsed = (
-            time.perf_counter() - batch_start_time
-        )
-
-        batch_times.append(batch_elapsed)
-
-        average_batch_seconds = (
-            sum(batch_times) / len(batch_times)
-        )
-
-        print("\nBatch finished successfully.")
-        print(f"Batch number: {batch_number:,}")
-
-        print(
-            f"Meters selected this batch: "
-            f"{meters_in_batch:,}"
-        )
-
-        print(
-            f"Rows returned this batch: "
-            f"{len(batch_result):,}"
-        )
-
-        print(
-            f"Total meters selected so far: "
-            f"{total_selected_meters:,}"
-        )
-
-        print(
-            f"Total rows returned so far: "
-            f"{total_returned_rows:,}"
-        )
-
-        print(
-            f"Batch runtime: "
-            f"{batch_elapsed / 60:,.2f} minutes"
-        )
-
-        print(
-            f"Average batch runtime: "
-            f"{average_batch_seconds / 60:,.2f} minutes"
-        )
-
-        # Advance using the selected meter list,
-        # not the returned results.
-        last_meter = batch_last_meter
-
-        print(f"Next batch starts after: {last_meter}")
-
-        # This small control dataframe is no longer needed
-        del batch_meter_df
-
-
-
-
-if all_results:
-
-    active_meters = pd.concat(
-        all_results,
-        ignore_index=True
-    )
-
-    active_meters = active_meters.convert_dtypes()
-
-else:
-
-    active_meters = pd.DataFrame()
-
-
-
-
-overall_elapsed = (
-    time.perf_counter() - overall_start
+conn = duckdb.connect(
+    r"\\YOUR\SHARE\NCM_CURATED\ncm_curated.duckdb"
 )
 
-print("\n" + "=" * 70)
-print("ACTIVE METER QUERY COMPLETE")
-print("=" * 70)
+df = conn.execute("""
 
-print(f"Completed batches: {batch_number:,}")
+SELECT *
+FROM ncm_daily
 
-print(
-    f"Total meters selected: "
-    f"{total_selected_meters:,}"
+""").fetchdf()
+
+conn.close()
+
+df.head()
+
+
+
+
+import duckdb
+
+today = duckdb.sql("""
+
+SELECT *
+
+FROM read_parquet(
+    '\\\\YOUR\\SHARE\\NCM_CURATED\\ncm_daily_curated.parquet'
 )
 
-print(
-    f"Total rows returned: "
-    f"{total_returned_rows:,}"
-)
+WHERE file_date = '07142026'
 
-print(
-    f"Total runtime: "
-    f"{overall_elapsed / 60:,.2f} minutes"
-)
-
-print(
-    f"Total runtime: "
-    f"{overall_elapsed / 3600:,.2f} hours"
-)
-
-print("Final dataframe: active_meters")
-print(f"Final shape: {active_meters.shape}")
+""").df()
 
 
-
-active_meters.head()
 
