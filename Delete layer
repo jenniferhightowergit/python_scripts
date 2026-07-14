@@ -1,140 +1,289 @@
-from pathlib import Path
+"""
+Rewritten batch script.
+Combines:
+  - The batching loop / progress tracking from your AllMeters_dailyrun.ipynb
+  - The join logic (hw CTE + asset meterno build + ede/t1/hw joins) from your
+    original working HardWareData_All.ipynb script
 
+IMPORTANT: I could not see 100% of your original SELECT column list or every
+WHERE clause in the screenshots. Please diff this against your notebook
+before running on the full 7.8M-meter set. Run on ONE batch first (set
+BATCH_SIZE small, e.g. 500) and confirm rows come back before doing a full run.
+"""
+
+import time
+import keyring
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
+# ------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------
+BATCH_SIZE = 10_000
 
-PARQUET_PATH = Path(
-    r"\\eucprdnas01\u_support\jen_hightower"
-    r"\parquet_files\JensFakeDW\Staging"
-    r"\parquet\hw_asset.parquet"
-)
+last_meter = None
+batch_number = 0
+total_selected_meters = 0
+total_returned_rows = 0
 
+batch_times = []
+all_results = []
 
-if PARQUET_PATH.exists():
+overall_start = time.perf_counter()
 
-    existing_hw = pd.read_parquet(
-        PARQUET_PATH
+# ------------------------------------------------------------------
+# CONNECTIONS
+# ------------------------------------------------------------------
+conn_string = keyring.get_password('edw_sqlalchemy', 'connection_string')
+edw_alchemy_engine = create_engine(conn_string)
+
+conn_string = keyring.get_password('ods_sqlalchemy', 'connection_string')
+ods_alchemy_engine = create_engine(conn_string)
+
+# ------------------------------------------------------------------
+# METER SELECTION QUERY (drives pagination — unchanged pattern)
+# ------------------------------------------------------------------
+meter_selection_query = text("""
+    SELECT meterno
+    FROM
+    (
+        SELECT DISTINCT
+            ede.METERNO AS meterno
+        FROM CENTRALSERVICES.MV_EDE_EXTRACT ede
+        WHERE ede.HARDWARE_MODEL NOT IN ('NORESOURCEKEY')
+          AND (:last_meter is null or ede.METERNO > :last_meter)
+        ORDER BY ede.METERNO
     )
-
-else:
-
-    existing_hw = pd.DataFrame(
-        columns=[
-            "meterno",
-            "date_deployed"
-        ]
-    )
-
-
-existing_hw.columns = (
-    existing_hw.columns
-    .str.strip()
-    .str.lower()
-)
-
-
-existing_hw["meterno"] = (
-    existing_hw["meterno"]
-    .astype("string")
-    .str.strip()
-    .str.upper()
-)
-
-existing_hw["date_deployed"] = pd.to_datetime(
-    existing_hw["date_deployed"],
-    errors="coerce"
-).dt.normalize()
-
-
-hardware_key_query = text("""
-    SELECT DISTINCT
-        TRIM(UPPER(ede.METERNO)) AS meterno,
-        TRUNC(ede.DATE_DEPLOYED) AS date_deployed
-
-    FROM CENTRALSERVICES.MV_EDE_EXTRACT ede
-
-    WHERE ede.HARDWARE_MODEL NOT IN (
-        'NORESOURCEKEY'
-    )
-
-      AND ede.METERNO IS NOT NULL
-      AND ede.DATE_DEPLOYED IS NOT NULL
+    WHERE ROWNUM <= :batch_size
 """)
+
+# ------------------------------------------------------------------
+# MAIN BATCH LOOP
+# ------------------------------------------------------------------
 with edw_alchemy_engine.connect() as sql_connection:
 
-    oracle_keys = pd.read_sql_query(
-        hardware_key_query,
-        sql_connection
-    )
+    while True:
+
+        batch_number += 1
+        batch_start_time = time.perf_counter()
+
+        print("\n" + "=" * 70)
+        print(f"Finding meters for batch {batch_number:,}...")
+        print(f"Starting after meter: {last_meter or '[beginning]'}")
+        print("=" * 70)
+
+        # ----------------------------------------------------------
+        # STEP 1: Oracle selects the next BATCH_SIZE meters
+        # ----------------------------------------------------------
+        batch_meter_df = pd.read_sql_query(
+            meter_selection_query,
+            sql_connection,
+            params={
+                "last_meter": last_meter,
+                "batch_size": BATCH_SIZE,
+            }
+        )
+
+        batch_meter_df.columns = (
+            batch_meter_df.columns
+            .str.strip()
+            .str.lower()
+        )
+
+        if batch_meter_df.empty:
+            print("\nNo more meters were found.")
+            break
+
+        batch_first_meter = str(batch_meter_df["meterno"].iloc[0])
+        batch_last_meter = str(batch_meter_df["meterno"].iloc[-1])
+        meters_in_batch = len(batch_meter_df)
+
+        print(f"Batch: {batch_number:,}")
+        print(f"Meters selected: {meters_in_batch:,}")
+        print(f"First meter: {batch_first_meter}")
+        print(f"Last meter:  {batch_last_meter}")
+
+        # ----------------------------------------------------------
+        # STEP 2: Run the full hardware/asset query for this batch
+        # Uses the ORIGINAL working join logic (hw CTE + t1 + ede)
+        # ----------------------------------------------------------
+        query = text("""
+            WITH batch_meters AS
+            (
+                SELECT meterno
+                FROM
+                (
+                    SELECT DISTINCT
+                        ede_batch.METERNO AS meterno
+                    FROM CENTRALSERVICES.MV_EDE_EXTRACT ede_batch
+                    WHERE ede_batch.HARDWARE_MODEL NOT IN ('NORESOURCEKEY')
+                      AND (:last_meter is null or ede_batch.METERNO > :last_meter)
+                    ORDER BY ede_batch.METERNO
+                )
+                WHERE ROWNUM <= :batch_size
+            ),
+
+            hw AS
+            (
+                SELECT DISTINCT
+                    a.assetnum,
+                    reg.ALNVALUE       AS RegisterType,
+                    rev.ALNVALUE       AS RevisionID,
+                    FORMNO.ALNVALUE    AS FORMNO,
+                    FRMWAREV.ALNVALUE  AS FRMWAREV,
+                    SFTWAREV.ALNVALUE  AS SFTWAREV,
+                    METRFWVR.ALNVALUE  AS METRFWVR,
+                    METRFWDT.ALNVALUE  AS METRFWDT,
+                    HANTYPE.ALNVALUE   AS HANTYPE,
+                    HANCTYPE.ALNVALUE  AS HANCTYPE,
+                    HANFW.ALNVALUE     AS HANFW
+
+                FROM MXRADS.VW_ASSETSPEC a
+
+                JOIN (SELECT b.ALNVALUE, b.assetnum FROM MXRADS.VW_ASSETSPEC b WHERE b.assetattrid='REGTYPE') reg
+                    ON a.assetnum = reg.assetnum
+                JOIN (SELECT c.ALNVALUE, c.assetnum FROM MXRADS.VW_ASSETSPEC c WHERE c.assetattrid='REV') rev
+                    ON a.assetnum = rev.assetnum
+                JOIN (SELECT d.ALNVALUE, d.assetnum FROM MXRADS.VW_ASSETSPEC d WHERE d.assetattrid='FORMNO') FORMNO
+                    ON a.assetnum = FORMNO.assetnum
+                JOIN (SELECT e.ALNVALUE, e.assetnum FROM MXRADS.VW_ASSETSPEC e WHERE e.assetattrid='FRMWAREV') FRMWAREV
+                    ON a.assetnum = FRMWAREV.assetnum
+                JOIN (SELECT f.ALNVALUE, f.assetnum FROM MXRADS.VW_ASSETSPEC f WHERE f.assetattrid='SFTWAREV') SFTWAREV
+                    ON a.assetnum = SFTWAREV.assetnum
+                JOIN (SELECT g.ALNVALUE, g.assetnum FROM MXRADS.VW_ASSETSPEC g WHERE g.assetattrid='METRFWVR') METRFWVR
+                    ON a.assetnum = METRFWVR.assetnum
+                JOIN (SELECT h.ALNVALUE, h.assetnum FROM MXRADS.VW_ASSETSPEC h WHERE h.assetattrid='METRFWDT') METRFWDT
+                    ON a.assetnum = METRFWDT.assetnum
+                JOIN (SELECT i.ALNVALUE, i.assetnum FROM MXRADS.VW_ASSETSPEC i WHERE i.assetattrid='HANTYPE') HANTYPE
+                    ON a.assetnum = HANTYPE.assetnum
+                JOIN (SELECT j.ALNVALUE, j.assetnum FROM MXRADS.VW_ASSETSPEC j WHERE j.assetattrid='HANCTYPE') HANCTYPE
+                    ON a.assetnum = HANCTYPE.assetnum
+                JOIN (SELECT k.ALNVALUE, k.assetnum FROM MXRADS.VW_ASSETSPEC k WHERE k.assetattrid='HANFWV') HANFW
+                    ON a.assetnum = HANFW.assetnum
+
+                WHERE 1=1
+            ),
+
+            asset_data AS
+            (
+                SELECT
+                    DISTINCT
+                    assetnum,
+                    CG_PURCHASEDATE,
+                    MANUFACTURER,
+                    TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) AS meterno
+                FROM MXRADS.VW_ASSET a
+                WHERE a.MANUFACTURER NOT IN ('VI','VM','PR','TD','DUMMY')
+            )
+
+            SELECT DISTINCT
+                ede.METERNO         AS meterno,
+                ede.HARDWARE_MODEL,
+                CAST(trim(ede.COLLECTOR) AS varchar2(1000)) AS COLLECTOR,
+                ede.FIRMWARE_VERSION,
+                ede.KH,
+                ede.DATE_DEPLOYED,
+                ede.LASTBILLABLEREAD,
+                ede.LATTITUDE,
+                ede.LONGITUDE,
+                CAST(trim(ede.ADDRESS) AS varchar2(1000)) AS ADDRESS,
+                CAST(trim(ede.CITY) AS varchar2(1000)) AS CITY,
+                CAST(trim(ede.STATE) AS varchar2(1000)) AS STATE,
+                CAST(trim(ede.ZIP) AS varchar2(1000)) AS ZIP,
+                t1.CG_PURCHASEDATE,
+                ede.INSTALLATION_DATE,
+                hw.RegisterType,
+                hw.RevisionID,
+                hw.FORMNO,
+                hw.FRMWAREV,
+                hw.SFTWAREV,
+                hw.METRFWVR,
+                hw.METRFWDT,
+                hw.HANTYPE,
+                hw.HANCTYPE,
+                hw.HANFW
+
+            FROM batch_meters bm
+            JOIN CENTRALSERVICES.MV_EDE_EXTRACT ede
+                ON TRIM(ede.METERNO) = bm.meterno
+            JOIN asset_data t1
+                ON TRIM(ede.METERNO) = t1.meterno
+            JOIN hw
+                ON hw.assetnum = t1.assetnum
+
+            WHERE ede.HARDWARE_MODEL NOT IN ('NORESOURCEKEY')
+        """)
+
+        try:
+            batch_result = pd.read_sql_query(
+                query,
+                sql_connection,
+                params={
+                    "last_meter": last_meter,
+                    "batch_size": BATCH_SIZE
+                }
+            )
+
+        except Exception as error:
+            print("\n" + "!" * 70)
+            print(f"Batch {batch_number:,} failed.")
+            print(f"Starting marker: {last_meter}")
+            print(f"Selected first meter: {batch_first_meter}")
+            print(f"Selected last meter:  {batch_last_meter}")
+            print("!" * 70)
+            raise error
+
+        # Normalize result column names
+        batch_result.columns = (
+            batch_result.columns
+            .str.strip()
+            .str.lower()
+        )
+
+        batch_result["query_batch_number"] = batch_number
+        all_results.append(batch_result)
+
+        # ----------------------------------------------------------
+        # STEP 3: Update progress
+        # ----------------------------------------------------------
+        total_selected_meters += meters_in_batch
+        total_returned_rows += len(batch_result)
+
+        batch_elapsed = time.perf_counter() - batch_start_time
+        batch_times.append(batch_elapsed)
+        average_batch_seconds = sum(batch_times) / len(batch_times)
+
+        print("\nBatch finished successfully.")
+        print(f"Batch number: {batch_number:,}")
+        print(f"Meters selected this batch: {meters_in_batch:,}")
+        print(f"Rows returned this batch: {len(batch_result):,}")
+        print(f"Total meters selected so far: {total_selected_meters:,}")
+        print(f"Total rows returned so far: {total_returned_rows:,}")
+        print(f"Batch runtime: {batch_elapsed / 60:,.2f} minutes")
+        print(f"Average batch runtime: {average_batch_seconds / 60:,.2f} minutes")
+
+        # Critical: advance using Oracle's selected meter list,
+        # not the query result, because joins can remove meters.
+        last_meter = batch_last_meter
+        print(f"Next batch starts after meter: {last_meter}")
 
 
-with edw_alchemy_engine.connect() as sql_connection:
+if all_results:
+    hw_assets = pd.concat(all_results, ignore_index=True)
+else:
+    hw_assets = pd.DataFrame()
 
-    oracle_keys = pd.read_sql_query(
-        hardware_key_query,
-        sql_connection
-    )
+overall_elapsed = time.perf_counter() - overall_start
+completed_batches = len(batch_times)
 
+print("\n" + "=" * 70)
+print("ORACLE HARDWARE QUERY COMPLETE")
+print("=" * 70)
+print(f"Completed batches: {completed_batches:,}")
+print(f"Total meters selected: {total_selected_meters:,}")
+print(f"Total rows returned: {len(hw_assets):,}")
+print(f"Total runtime: {overall_elapsed / 60:,.2f} minutes")
+print(f"Total runtime: {overall_elapsed / 3600:,.2f} hours")
+print(f"Final shape: {hw_assets.shape}")
 
-
-existing_keys = (
-    existing_hw[
-        [
-            "meterno",
-            "date_deployed"
-        ]
-    ]
-    .dropna()
-    .drop_duplicates()
-)
-
-
-new_deployment_keys = (
-    oracle_keys
-    .merge(
-        existing_keys,
-        on=[
-            "meterno",
-            "date_deployed"
-        ],
-        how="left",
-        indicator=True,
-        validate="one_to_one"
-    )
-    .loc[
-        lambda df: df["_merge"] == "left_only",
-        [
-            "meterno",
-            "date_deployed"
-        ]
-    ]
-    .reset_index(drop=True)
-)
-
-
-
-print(
-    f"Existing deployment keys: "
-    f"{len(existing_keys):,}"
-)
-
-print(
-    f"Current Oracle keys: "
-    f"{len(oracle_keys):,}"
-)
-
-print(
-    f"New deployment keys to retrieve: "
-    f"{len(new_deployment_keys):,}"
-)
-
-
-if new_deployment_keys.empty:
-
-    print(
-        "No new meter deployments were found. "
-        "The hardware Parquet is already current."
-    )
-
-
+hw_assets.head()
