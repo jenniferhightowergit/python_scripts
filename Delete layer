@@ -1,93 +1,140 @@
 from pathlib import Path
-import duckdb
 
-# -------------------------------------------------
-# Output location
-# -------------------------------------------------
+import pandas as pd
+from sqlalchemy import text
 
-output_folder = Path(
-    r"\\YOUR\SHARE\NCM_CURATED"
+
+PARQUET_PATH = Path(
+    r"\\eucprdnas01\u_support\jen_hightower"
+    r"\parquet_files\JensFakeDW\Staging"
+    r"\parquet\hw_asset.parquet"
 )
 
-output_folder.mkdir(
-    parents=True,
-    exist_ok=True
+
+if PARQUET_PATH.exists():
+
+    existing_hw = pd.read_parquet(
+        PARQUET_PATH
+    )
+
+else:
+
+    existing_hw = pd.DataFrame(
+        columns=[
+            "meterno",
+            "date_deployed"
+        ]
+    )
+
+
+existing_hw.columns = (
+    existing_hw.columns
+    .str.strip()
+    .str.lower()
 )
 
-parquet_path = output_folder / "ncm_daily_curated.parquet"
 
-final_data.to_parquet(
-    parquet_path,
-    index=False
+existing_hw["meterno"] = (
+    existing_hw["meterno"]
+    .astype("string")
+    .str.strip()
+    .str.upper()
 )
 
-print(f"Saved Parquet:")
-print(parquet_path)
-print(f"Rows: {len(final_data):,}")
+existing_hw["date_deployed"] = pd.to_datetime(
+    existing_hw["date_deployed"],
+    errors="coerce"
+).dt.normalize()
 
 
+hardware_key_query = text("""
+    SELECT DISTINCT
+        TRIM(UPPER(ede.METERNO)) AS meterno,
+        TRUNC(ede.DATE_DEPLOYED) AS date_deployed
 
+    FROM CENTRALSERVICES.MV_EDE_EXTRACT ede
 
-duckdb_path = output_folder / "ncm_curated.duckdb"
+    WHERE ede.HARDWARE_MODEL NOT IN (
+        'NORESOURCEKEY'
+    )
 
-conn = duckdb.connect(str(duckdb_path))
-
-conn.register(
-    "final_data_df",
-    final_data
-)
-
-conn.execute("""
-
-CREATE OR REPLACE TABLE ncm_daily AS
-
-SELECT *
-FROM final_data_df
-
+      AND ede.METERNO IS NOT NULL
+      AND ede.DATE_DEPLOYED IS NOT NULL
 """)
+with edw_alchemy_engine.connect() as sql_connection:
 
-conn.unregister("final_data_df")
-
-conn.close()
-
-print(f"Saved DuckDB:")
-print(duckdb_path)
-
+    oracle_keys = pd.read_sql_query(
+        hardware_key_query,
+        sql_connection
+    )
 
 
-import duckdb
+with edw_alchemy_engine.connect() as sql_connection:
 
-conn = duckdb.connect(
-    r"\\YOUR\SHARE\NCM_CURATED\ncm_curated.duckdb"
+    oracle_keys = pd.read_sql_query(
+        hardware_key_query,
+        sql_connection
+    )
+
+
+
+existing_keys = (
+    existing_hw[
+        [
+            "meterno",
+            "date_deployed"
+        ]
+    ]
+    .dropna()
+    .drop_duplicates()
 )
 
-df = conn.execute("""
 
-SELECT *
-FROM ncm_daily
-
-""").fetchdf()
-
-conn.close()
-
-df.head()
-
-
-
-
-import duckdb
-
-today = duckdb.sql("""
-
-SELECT *
-
-FROM read_parquet(
-    '\\\\YOUR\\SHARE\\NCM_CURATED\\ncm_daily_curated.parquet'
+new_deployment_keys = (
+    oracle_keys
+    .merge(
+        existing_keys,
+        on=[
+            "meterno",
+            "date_deployed"
+        ],
+        how="left",
+        indicator=True,
+        validate="one_to_one"
+    )
+    .loc[
+        lambda df: df["_merge"] == "left_only",
+        [
+            "meterno",
+            "date_deployed"
+        ]
+    ]
+    .reset_index(drop=True)
 )
 
-WHERE file_date = '07142026'
 
-""").df()
 
+print(
+    f"Existing deployment keys: "
+    f"{len(existing_keys):,}"
+)
+
+print(
+    f"Current Oracle keys: "
+    f"{len(oracle_keys):,}"
+)
+
+print(
+    f"New deployment keys to retrieve: "
+    f"{len(new_deployment_keys):,}"
+)
+
+
+if new_deployment_keys.empty:
+
+    print(
+        "No new meter deployments were found. "
+        "The hardware Parquet is already current."
+    )
 
 
