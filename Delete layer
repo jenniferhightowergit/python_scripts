@@ -1,162 +1,39 @@
 import duckdb
-import pandas as pd
-from pathlib import Path
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-PARQUET_PATH = Path(
-    r"\\your\path\estimating_backup.parquet"
+source_path = (
+    r"\\server\share\folder"
+    r"\estimating.parquet"
+    r"\**\*.parquet"
 )
 
-METER_COLUMN = "MR_MDVC_NUMBER"
-DATE_COLUMN = "file_date"
-
-# Your newly imported and calculated DataFrame:
-new_data = estimating_calc.copy()
-
-
-# ============================================================
-# PREPARE NEW DATA
-# ============================================================
-
-new_data[DATE_COLUMN] = pd.to_datetime(
-    new_data[DATE_COLUMN],
-    errors="raise"
-).dt.date
-
-new_data[METER_COLUMN] = (
-    new_data[METER_COLUMN]
-    .astype("string")
-    .str.strip()
+output_path = (
+    r"\\server\share\folder"
+    r"\estimating_partitioned.parquet"
 )
-
-
-# ============================================================
-# VALIDATE THE NEW DATA
-# ============================================================
-
-null_meter_count = new_data[METER_COLUMN].isna().sum()
-null_date_count = new_data[DATE_COLUMN].isna().sum()
-
-print("New rows:", len(new_data))
-print("Null meters:", null_meter_count)
-print("Null dates:", null_date_count)
-
-if null_meter_count > 0:
-    raise ValueError(
-        f"New data contains {null_meter_count:,} null meter numbers."
-    )
-
-if null_date_count > 0:
-    raise ValueError(
-        f"New data contains {null_date_count:,} null file dates."
-    )
-
-
-# Check for duplicate meter-date keys in the new data.
-duplicate_new_keys = new_data.duplicated(
-    subset=[
-        METER_COLUMN,
-        DATE_COLUMN
-    ],
-    keep=False
-)
-
-print(
-    "Duplicate new meter-date rows:",
-    duplicate_new_keys.sum()
-)
-
-if duplicate_new_keys.any():
-    print(
-        new_data.loc[
-            duplicate_new_keys,
-            [
-                METER_COLUMN,
-                DATE_COLUMN
-            ]
-        ]
-        .sort_values(
-            [
-                METER_COLUMN,
-                DATE_COLUMN
-            ]
-        )
-        .head(50)
-    )
-
-    raise ValueError(
-        "The new data contains duplicate meter-date keys. "
-        "Resolve these before performing the upsert."
-    )
-
-
-# ============================================================
-# REGISTER THE NEW DATA
-# ============================================================
 
 conn = duckdb.connect()
 
-conn.register(
-    "new_data",
-    new_data
-)
-
-parquet_path_sql = PARQUET_PATH.as_posix()
-
-
-# ============================================================
-# CREATE UPDATED VIEW
-# ============================================================
-
-conn.execute(f"""
-    CREATE OR REPLACE TEMP VIEW updated_estimating_data AS
-
-    WITH new_keys AS
-    (
-        SELECT DISTINCT
-            CAST({METER_COLUMN} AS VARCHAR)
-                AS meter_key,
-
-            CAST({DATE_COLUMN} AS DATE)
-                AS date_key
-
-        FROM new_data
-    ),
-
-    old_rows_to_keep AS
-    (
-        SELECT
-            old_data.*
-
-        FROM read_parquet(
-            '{parquet_path_sql}',
-            union_by_name = true
-        ) AS old_data
-
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-
-            FROM new_keys
-
-            WHERE
-                CAST(old_data.{METER_COLUMN} AS VARCHAR)
-                    = new_keys.meter_key
-
-                AND CAST(old_data.{DATE_COLUMN} AS DATE)
-                    = new_keys.date_key
+conn.execute("""
+COPY
+(
+    SELECT
+        * REPLACE (
+            CAST(file_date AS DATE) AS file_date
         )
+    FROM read_parquet(
+        ?,
+        union_by_name = true
     )
+)
+TO ?
+(
+    FORMAT PARQUET,
+    PARTITION_BY (file_date),
+    COMPRESSION ZSTD,
+    OVERWRITE_OR_IGNORE false
+)
+""", [source_path, output_path])
 
-    SELECT *
-    FROM old_rows_to_keep
+conn.close()
 
-    UNION ALL BY NAME
-
-    SELECT *
-    FROM new_data
-""")
+print("Done.")
