@@ -1,31 +1,69 @@
-from pathlib import Path
+import pandas as pd
 import duckdb
+from pathlib import Path
 
-# Existing parquet dataset
-input_path = Path(
-    r"\\your\estimating.parquet"
+estimating_calc["file_date"] = pd.to_datetime(
+    estimating_calc["file_date"],
+    errors="raise"
+).dt.date
+
+print("New rows:", len(estimating_calc))
+print("Dates being replaced:")
+
+print(
+    estimating_calc["file_date"]
+    .value_counts()
+    .sort_index()
 )
 
-# New cleaned dataset
-output_path = Path(
-    r"\\your\estimating_cleaned.parquet"
+
+
+existing_parquet_path = Path(
+    r"\\eucprdnase01\u_support\jen_hightower\parquet_files\estimating_backup.parquet"
 )
 
-duckdb.sql(f"""
-COPY (
-    SELECT *
-    FROM read_parquet(
-        '{input_path.as_posix()}/**/*.parquet',
-        union_by_name = true
+updated_parquet_path = Path(
+    r"\\eucprdnase01\u_support\jen_hightower\parquet_files\estimating_updated.parquet"
+)
+
+
+conn = duckdb.connect()
+
+conn.register(
+    "new_estimating_data",
+    estimating_calc
+)
+
+existing_path_sql = existing_parquet_path.as_posix()
+
+conn.execute(f"""
+    CREATE OR REPLACE TEMP VIEW estimating_replacement AS
+
+    WITH replacement_dates AS
+    (
+        SELECT DISTINCT
+            CAST(file_date AS DATE) AS file_date
+        FROM new_estimating_data
     )
-    WHERE file_date < DATE '2026-06-02'
-)
-TO '{output_path.as_posix()}'
-(
-    FORMAT PARQUET,
-    PARTITION_BY (file_date)
-);
+
+    SELECT old_data.*
+    FROM read_parquet(
+        '{existing_path_sql}',
+        union_by_name = true
+    ) AS old_data
+
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM replacement_dates AS new_dates
+        WHERE CAST(old_data.file_date AS DATE)
+              = new_dates.file_date
+    )
+
+    UNION ALL BY NAME
+
+    SELECT *
+    FROM new_estimating_data
 """)
 
-print("Done!")
-print(f"Cleaned data written to:\n{output_path}")
+
