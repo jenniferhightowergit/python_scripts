@@ -13,26 +13,48 @@ output_path = (
 
 conn = duckdb.connect()
 
-conn.execute("""
-COPY
-(
-    SELECT
-        * REPLACE (
-            CAST(file_date AS DATE) AS file_date
-        )
-    FROM read_parquet(
-        ?,
-        union_by_name = true
+# Get the dates first.
+dates = conn.execute(f"""
+SELECT DISTINCT CAST(file_date AS DATE) AS file_date
+FROM read_parquet(
+    '{source_path}',
+    union_by_name = true
+)
+WHERE file_date IS NOT NULL
+ORDER BY file_date
+""").fetchall()
+
+print(f"Dates found: {len(dates):,}")
+
+for batch_number, (file_date,) in enumerate(dates, start=1):
+
+    print(
+        f"Starting {batch_number:,}/{len(dates):,}: "
+        f"{file_date}"
     )
-)
-TO ?
-(
-    FORMAT PARQUET,
-    PARTITION_BY (file_date),
-    COMPRESSION ZSTD,
-    OVERWRITE_OR_IGNORE false
-)
-""", [source_path, output_path])
+
+    conn.execute(f"""
+    COPY (
+        SELECT *
+        FROM read_parquet(
+            '{source_path}',
+            union_by_name = true
+        )
+        WHERE CAST(file_date AS DATE) = DATE '{file_date}'
+    )
+    TO '{output_path}'
+    (
+        FORMAT PARQUET,
+        PARTITION_BY (file_date),
+        COMPRESSION ZSTD,
+        APPEND
+    )
+    """)
+
+    print(
+        f"Finished {batch_number:,}/{len(dates):,}: "
+        f"{file_date}"
+    )
 
 conn.close()
 
