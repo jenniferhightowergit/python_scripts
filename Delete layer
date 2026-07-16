@@ -1,24 +1,172 @@
-SELECT
-    e.*,
+import duckdb
+import pandas as pd
+import time
+import math
 
-    MAX(c.HARDWARE_FAILURE_score)               AS HARDWARE_FAILURE_score_30d,
-    MAX(c.NETWORK_ISSUE_score)                  AS NETWORK_ISSUE_score_30d,
-    MAX(c.DAMAGED_METER_score)                  AS DAMAGED_METER_score_30d,
-    MAX(c.TOPOGRAPHY_ISSUE_score)               AS TOPOGRAPHY_ISSUE_score_30d,
-    MAX(c.TAMPERING_score)                      AS TAMPERING_score_30d,
-    MAX(c.VANDALISM_score)                      AS VANDALISM_score_30d,
-    MAX(c.ELECTRICAL_DISTRIBUTION_ISSUE_score)  AS ELECTRICAL_DISTRIBUTION_ISSUE_score_30d
+BATCH_SIZE = 10_000
 
-FROM events e
+# Keep only the location fields needed for the join.
+location_lookup = (
+    df_location[
+        [
+            "esi_loc",
+            "latitude",
+            "longitude"
+        ]
+    ]
+    .dropna(subset=["esi_loc"])
+    .drop_duplicates(subset=["esi_loc"])
+    .copy()
+)
 
-LEFT JOIN comments c
-ON
-    c.comment_date >= e.event_date - INTERVAL 30 DAY
-AND c.comment_date < e.event_date
+# Make sure the join keys use the same clean string format.
+location_lookup["esi_loc"] = (
+    location_lookup["esi_loc"]
+    .astype("string")
+    .str.strip()
+)
 
-AND ST_Distance_Sphere(
-        ST_Point(e.longitude, e.latitude),
-        ST_Point(c.longitude, c.latitude)
-    ) <= 60.96
+comments["esi_loc"] = (
+    comments["esi_loc"]
+    .astype("string")
+    .str.strip()
+)
 
-GROUP BY ALL;
+esi_locs = location_lookup["esi_loc"].tolist()
+
+total_esi_locs = len(esi_locs)
+total_batches = math.ceil(
+    total_esi_locs / BATCH_SIZE
+)
+
+all_results = []
+batch_times = []
+
+total_locations_processed = 0
+total_rows_returned = 0
+
+overall_start = time.perf_counter()
+
+conn = duckdb.connect()
+
+# Register the full comments dataframe once.
+conn.register(
+    "comments_df",
+    comments
+)
+
+for batch_number, start_row in enumerate(
+    range(
+        0,
+        total_esi_locs,
+        BATCH_SIZE
+    ),
+    start=1
+):
+    batch_start = time.perf_counter()
+
+    end_row = min(
+        start_row + BATCH_SIZE,
+        total_esi_locs
+    )
+
+    location_batch = location_lookup.iloc[
+        start_row:end_row
+    ].copy()
+
+    # Replace the registered batch each loop.
+    try:
+        conn.unregister("location_batch")
+    except Exception:
+        pass
+
+    conn.register(
+        "location_batch",
+        location_batch
+    )
+
+    batch_result = conn.execute("""
+        SELECT
+            c.*,
+            l.latitude,
+            l.longitude
+        FROM comments_df AS c
+        INNER JOIN location_batch AS l
+            ON c.esi_loc = l.esi_loc
+    """).fetchdf()
+
+    all_results.append(
+        batch_result
+    )
+
+    batch_seconds = (
+        time.perf_counter()
+        - batch_start
+    )
+
+    batch_times.append(
+        batch_seconds
+    )
+
+    locations_in_batch = len(
+        location_batch
+    )
+
+    rows_in_batch = len(
+        batch_result
+    )
+
+    total_locations_processed += (
+        locations_in_batch
+    )
+
+    total_rows_returned += (
+        rows_in_batch
+    )
+
+    average_batch_seconds = (
+        sum(batch_times)
+        / len(batch_times)
+    )
+
+    print(
+        f"Batch {batch_number:,} "
+        f"of {total_batches:,} | "
+        f"ESI locations this batch: "
+        f"{locations_in_batch:,} | "
+        f"Total locations processed: "
+        f"{total_locations_processed:,} "
+        f"of {total_esi_locs:,} | "
+        f"Rows returned this batch: "
+        f"{rows_in_batch:,} | "
+        f"Total rows returned: "
+        f"{total_rows_returned:,} | "
+        f"Batch time: "
+        f"{batch_seconds / 60:.2f} min | "
+        f"Average: "
+        f"{average_batch_seconds / 60:.2f} min"
+    )
+
+# Combine every batch into one dataframe.
+comments_lat = pd.concat(
+    all_results,
+    ignore_index=True
+)
+
+overall_seconds = (
+    time.perf_counter()
+    - overall_start
+)
+
+print()
+print("Finished")
+print(
+    f"Final rows: "
+    f"{len(comments_lat):,}"
+)
+print(
+    f"Total runtime: "
+    f"{overall_seconds / 60:.2f} minutes"
+)
+
+conn.close()
