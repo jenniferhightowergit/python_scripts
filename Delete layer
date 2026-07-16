@@ -1,61 +1,10 @@
-import duckdb
-
-source_path = (
-    r"\\server\share\folder"
-    r"\estimating.parquet"
-    r"\**\*.parquet"
-)
-
-output_path = (
-    r"\\server\share\folder"
-    r"\estimating_partitioned.parquet"
-)
-
-conn = duckdb.connect()
-
-# Get the dates first.
-dates = conn.execute(f"""
-SELECT DISTINCT CAST(file_date AS DATE) AS file_date
-FROM read_parquet(
-    '{source_path}',
-    union_by_name = true
-)
-WHERE file_date IS NOT NULL
-ORDER BY file_date
-""").fetchall()
-
-print(f"Dates found: {len(dates):,}")
-
-for batch_number, (file_date,) in enumerate(dates, start=1):
-
-    print(
-        f"Starting {batch_number:,}/{len(dates):,}: "
-        f"{file_date}"
-    )
-
-    conn.execute(f"""
-    COPY (
-        SELECT *
-        FROM read_parquet(
-            '{source_path}',
-            union_by_name = true
-        )
-        WHERE CAST(file_date AS DATE) = DATE '{file_date}'
-    )
-    TO '{output_path}'
-    (
-        FORMAT PARQUET,
-        PARTITION_BY (file_date),
-        COMPRESSION ZSTD,
-        APPEND
-    )
-    """)
-
-    print(
-        f"Finished {batch_number:,}/{len(dates):,}: "
-        f"{file_date}"
-    )
-
-conn.close()
-
-print("Done.")
+join lateral (
+    select
+        e.meter_removal_date
+    from exp_dates e
+    where e.meter_removal_date between
+          coalesce(b."INSTALLATION_DATE", date '2001-01-01')
+          and coalesce(b."meter_removal_date", date '3001-01-01')
+    order by random()
+    limit 1
+) c on true
