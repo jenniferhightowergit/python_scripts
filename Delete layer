@@ -1,10 +1,12 @@
-join lateral (
-    select
-        e.meter_removal_date
-    from exp_dates e
-    where e.meter_removal_date between
-          coalesce(b."INSTALLATION_DATE", date '2001-01-01')
-          and coalesce(b."meter_removal_date", date '3001-01-01')
-    order by random()
-    limit 1
-) c on true
+comments_with_work_orders = conn.execute(r"""
+    SELECT
+        a.*,
+        b.* EXCLUDE (wr_id)
+    FROM comments a
+
+    INNER JOIN read_parquet(
+        '\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFiles\Staging\parquet\completed_work_orders.parquet\wr_workedyear=2025\**\*.parquet',
+        union_by_name = true
+    ) b
+        ON CAST(a.wr_id AS VARCHAR) = CAST(b.wr_id AS VARCHAR)
+""").df()
