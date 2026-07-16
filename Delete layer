@@ -1,172 +1,58 @@
-import duckdb
-import pandas as pd
+import subprocess
 import time
-import math
 
-BATCH_SIZE = 10_000
+MAX_RETRIES = 3
 
-# Keep only the location fields needed for the join.
-location_lookup = (
-    df_location[
-        [
-            "esi_loc",
-            "latitude",
-            "longitude"
-        ]
-    ]
-    .dropna(subset=["esi_loc"])
-    .drop_duplicates(subset=["esi_loc"])
-    .copy()
-)
+for job in jobs:
 
-# Make sure the join keys use the same clean string format.
-location_lookup["esi_loc"] = (
-    location_lookup["esi_loc"]
-    .astype("string")
-    .str.strip()
-)
+    success = False
 
-comments["esi_loc"] = (
-    comments["esi_loc"]
-    .astype("string")
-    .str.strip()
-)
+    for attempt in range(1, MAX_RETRIES + 1):
 
-esi_locs = location_lookup["esi_loc"].tolist()
+        print(f"\nRunning {job}")
+        print(f"Attempt {attempt}/{MAX_RETRIES}")
 
-total_esi_locs = len(esi_locs)
-total_batches = math.ceil(
-    total_esi_locs / BATCH_SIZE
-)
+        result = subprocess.run(
+            ["python", job],
+            capture_output=True,
+            text=True
+        )
 
-all_results = []
-batch_times = []
+        print(result.stdout)
 
-total_locations_processed = 0
-total_rows_returned = 0
+        if result.returncode == 0:
+            print("SUCCESS")
+            success = True
+            break
 
-overall_start = time.perf_counter()
+        print(result.stderr)
 
-conn = duckdb.connect()
+        if attempt < MAX_RETRIES:
+            print("Retrying in 30 seconds...")
+            time.sleep(30)
 
-# Register the full comments dataframe once.
-conn.register(
-    "comments_df",
-    comments
-)
+    if not success:
+        print(f"FAILED after {MAX_RETRIES} attempts: {job}")
+        # Continue on to the next script instead of stopping.
 
-for batch_number, start_row in enumerate(
-    range(
-        0,
-        total_esi_locs,
-        BATCH_SIZE
-    ),
-    start=1
-):
-    batch_start = time.perf_counter()
+print("Refresh complete.")
 
-    end_row = min(
-        start_row + BATCH_SIZE,
-        total_esi_locs
-    )
 
-    location_batch = location_lookup.iloc[
-        start_row:end_row
-    ].copy()
+failed_jobs = []
 
-    # Replace the registered batch each loop.
-    try:
-        conn.unregister("location_batch")
-    except Exception:
-        pass
+...
 
-    conn.register(
-        "location_batch",
-        location_batch
-    )
+if not success:
+    failed_jobs.append(job)
 
-    batch_result = conn.execute("""
-        SELECT
-            c.*,
-            l.latitude,
-            l.longitude
-        FROM comments_df AS c
-        INNER JOIN location_batch AS l
-            ON c.esi_loc = l.esi_loc
-    """).fetchdf()
+...
 
-    all_results.append(
-        batch_result
-    )
+print("\n======================")
+print("Refresh complete.")
 
-    batch_seconds = (
-        time.perf_counter()
-        - batch_start
-    )
-
-    batch_times.append(
-        batch_seconds
-    )
-
-    locations_in_batch = len(
-        location_batch
-    )
-
-    rows_in_batch = len(
-        batch_result
-    )
-
-    total_locations_processed += (
-        locations_in_batch
-    )
-
-    total_rows_returned += (
-        rows_in_batch
-    )
-
-    average_batch_seconds = (
-        sum(batch_times)
-        / len(batch_times)
-    )
-
-    print(
-        f"Batch {batch_number:,} "
-        f"of {total_batches:,} | "
-        f"ESI locations this batch: "
-        f"{locations_in_batch:,} | "
-        f"Total locations processed: "
-        f"{total_locations_processed:,} "
-        f"of {total_esi_locs:,} | "
-        f"Rows returned this batch: "
-        f"{rows_in_batch:,} | "
-        f"Total rows returned: "
-        f"{total_rows_returned:,} | "
-        f"Batch time: "
-        f"{batch_seconds / 60:.2f} min | "
-        f"Average: "
-        f"{average_batch_seconds / 60:.2f} min"
-    )
-
-# Combine every batch into one dataframe.
-comments_lat = pd.concat(
-    all_results,
-    ignore_index=True
-)
-
-overall_seconds = (
-    time.perf_counter()
-    - overall_start
-)
-
-print()
-print("Finished")
-print(
-    f"Final rows: "
-    f"{len(comments_lat):,}"
-)
-print(
-    f"Total runtime: "
-    f"{overall_seconds / 60:.2f} minutes"
-)
-
-conn.close()
+if failed_jobs:
+    print("\nFailed jobs:")
+    for job in failed_jobs:
+        print(job)
+else:
+    print("\nAll jobs completed successfully.")
