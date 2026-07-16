@@ -1,21 +1,21 @@
-AND (
-    6371000 * 2 * ASIN(
-        SQRT(
-            POWER(
-                SIN(
-                    RADIANS(c.latitude - e.lat) / 2
-                ),
-                2
-            )
-            +
-            COS(RADIANS(e.lat))
-            * COS(RADIANS(c.latitude))
-            * POWER(
-                SIN(
-                    RADIANS(c.longitude - e.lon) / 2
-                ),
-                2
-            )
-        )
-    )
-) <= 60.96
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import cross_val_score
+
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42
+)
+
+scores = cross_val_score(
+    model,
+    X,
+    y,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1
+)
+
+print(scores)
+print("Mean:", scores.mean())
+print("Std:", scores.std())
