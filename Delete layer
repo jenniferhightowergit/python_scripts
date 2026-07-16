@@ -1,12 +1,24 @@
-comments_with_work_orders = conn.execute(r"""
-    SELECT
-        a.*,
-        b.* EXCLUDE (wr_id)
-    FROM comments a
+SELECT
+    e.*,
 
-    INNER JOIN read_parquet(
-        '\\eucprdnas01\u_support\jen_hightower\parquet_files\JensFiles\Staging\parquet\completed_work_orders.parquet\wr_workedyear=2025\**\*.parquet',
-        union_by_name = true
-    ) b
-        ON CAST(a.wr_id AS VARCHAR) = CAST(b.wr_id AS VARCHAR)
-""").df()
+    MAX(c.HARDWARE_FAILURE_score)               AS HARDWARE_FAILURE_score_30d,
+    MAX(c.NETWORK_ISSUE_score)                  AS NETWORK_ISSUE_score_30d,
+    MAX(c.DAMAGED_METER_score)                  AS DAMAGED_METER_score_30d,
+    MAX(c.TOPOGRAPHY_ISSUE_score)               AS TOPOGRAPHY_ISSUE_score_30d,
+    MAX(c.TAMPERING_score)                      AS TAMPERING_score_30d,
+    MAX(c.VANDALISM_score)                      AS VANDALISM_score_30d,
+    MAX(c.ELECTRICAL_DISTRIBUTION_ISSUE_score)  AS ELECTRICAL_DISTRIBUTION_ISSUE_score_30d
+
+FROM events e
+
+LEFT JOIN comments c
+ON
+    c.comment_date >= e.event_date - INTERVAL 30 DAY
+AND c.comment_date < e.event_date
+
+AND ST_Distance_Sphere(
+        ST_Point(e.longitude, e.latitude),
+        ST_Point(c.longitude, c.latitude)
+    ) <= 60.96
+
+GROUP BY ALL;
