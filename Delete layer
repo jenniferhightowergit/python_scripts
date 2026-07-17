@@ -1,33 +1,51 @@
-IF [MIN_MSLPRESSUREMILLIBARS_30] < 980 THEN "Very Low (<980)"
-ELSEIF [MIN_MSLPRESSUREMILLIBARS_30] < 995 THEN "Low (980-995)"
-ELSEIF [MIN_MSLPRESSUREMILLIBARS_30] < 1010 THEN "Normal (995-1010)"
-ELSEIF [MIN_MSLPRESSUREMILLIBARS_30] < 1025 THEN "High (1010-1025)"
-ELSE "Very High (1025+)"
-END
+import math
+import time
 
+BATCH_SIZE = 10_000
+MAX_ATTEMPTS = 3
 
+total_batches = math.ceil(total_meters / BATCH_SIZE)
 
-IF [MAX_SURFACETEMPERATURE_7] < 50 THEN "<50°F"
-ELSEIF [MAX_SURFACETEMPERATURE_7] < 70 THEN "50-69°F"
-ELSEIF [MAX_SURFACETEMPERATURE_7] < 85 THEN "70-84°F"
-ELSEIF [MAX_SURFACETEMPERATURE_7] < 95 THEN "85-94°F"
-ELSEIF [MAX_SURFACETEMPERATURE_7] < 105 THEN "95-104°F"
-ELSE "105°F+"
-END
+for batch_number, start_row in enumerate(
+    range(1, total_meters + 1, BATCH_SIZE),
+    start=1
+):
+    end_row = min(
+        start_row + BATCH_SIZE - 1,
+        total_meters
+    )
 
+    print(
+        f"\nBatch {batch_number:,} of {total_batches:,} "
+        f"| rows {start_row:,}–{end_row:,}"
+    )
 
-IF [MIN_RELATIVEHUMIDITY_30] < 20 THEN "Very Dry (<20%)"
-ELSEIF [MIN_RELATIVEHUMIDITY_30] < 40 THEN "Dry (20-39%)"
-ELSEIF [MIN_RELATIVEHUMIDITY_30] < 60 THEN "Moderate (40-59%)"
-ELSEIF [MIN_RELATIVEHUMIDITY_30] < 80 THEN "Humid (60-79%)"
-ELSE "Very Humid (80%+)"
-END
+    batch_start_time = time.time()
 
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            build_weather_batch(
+                start_row=start_row,
+                end_row=end_row,
+                create_table=(batch_number == 1)
+            )
 
-IF [MAX_WINDSPEEDMPH_30] < 10 THEN "Calm (<10)"
-ELSEIF [MAX_WINDSPEEDMPH_30] < 20 THEN "10-19 mph"
-ELSEIF [MAX_WINDSPEEDMPH_30] < 30 THEN "20-29 mph"
-ELSEIF [MAX_WINDSPEEDMPH_30] < 40 THEN "30-39 mph"
-ELSE "40+ mph"
-END
+            elapsed = time.time() - batch_start_time
 
+            print(
+                f"Completed batch {batch_number:,} "
+                f"in {elapsed / 60:.2f} minutes"
+            )
+
+            break
+
+        except Exception as error:
+            print(
+                f"Attempt {attempt} failed for "
+                f"batch {batch_number}: {error}"
+            )
+
+            if attempt == MAX_ATTEMPTS:
+                raise
+
+            time.sleep(5)
