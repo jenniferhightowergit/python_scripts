@@ -1,51 +1,54 @@
-import math
-import time
-
 BATCH_SIZE = 10_000
-MAX_ATTEMPTS = 3
+last_meter = None
+batch_number = 0
 
-total_batches = math.ceil(total_meters / BATCH_SIZE)
+while True:
 
-for batch_number, start_row in enumerate(
-    range(1, total_meters + 1, BATCH_SIZE),
-    start=1
-):
-    end_row = min(
-        start_row + BATCH_SIZE - 1,
-        total_meters
-    )
+    batch_number += 1
+    print(f"\nSelecting batch {batch_number}...")
 
-    print(
-        f"\nBatch {batch_number:,} of {total_batches:,} "
-        f"| rows {start_row:,}–{end_row:,}"
-    )
+    # 1. Select the next batch from Oracle
+    with ods_alchemy_engine.connect() as sql_connection:
 
-    batch_start_time = time.time()
+        batch_meters = pd.read_sql(
+            meter_selection_query,
+            sql_connection,
+            params={
+                "last_meter": last_meter,
+                "batch_size": BATCH_SIZE
+            }
+        )
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            build_weather_batch(
-                start_row=start_row,
-                end_row=end_row,
-                create_table=(batch_number == 1)
-            )
+    batch_meters.columns = batch_meters.columns.str.lower()
 
-            elapsed = time.time() - batch_start_time
+    if batch_meters.empty:
+        print("All meters completed.")
+        break
 
-            print(
-                f"Completed batch {batch_number:,} "
-                f"in {elapsed / 60:.2f} minutes"
-            )
+    print(f"Meters selected: {len(batch_meters):,}")
 
-            break
+    # 2. Replace the registered DuckDB view with this batch
+    try:
+        con.unregister("batch_meters")
+    except Exception:
+        pass
 
-        except Exception as error:
-            print(
-                f"Attempt {attempt} failed for "
-                f"batch {batch_number}: {error}"
-            )
+    con.register("batch_meters", batch_meters)
 
-            if attempt == MAX_ATTEMPTS:
-                raise
+    # 3. Run weather SQL for only those meters
+    weather_batch = con.execute("""
+        SELECT
+            w.*
+        FROM weather_events w
+        INNER JOIN batch_meters b
+            ON TRIM(w.meterno) = TRIM(b.meterno)
+    """).df()
 
-            time.sleep(5)
+    print(f"Weather rows returned: {len(weather_batch):,}")
+
+    # 4. Move the bookmark forward
+    last_meter = batch_meters["meterno"].iloc[-1]
+
+    # Temporary test: stop after 2 batches
+    if batch_number == 2:
+        break
