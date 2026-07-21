@@ -1,54 +1,36 @@
-BATCH_SIZE = 10_000
-last_meter = None
-batch_number = 0
+# Run this ONCE, before the while loop
+print("Building meter-to-weather-station lookup (one-time)...")
+lookup_start = time.perf_counter()
 
-while True:
-
-    batch_number += 1
-    print(f"\nSelecting batch {batch_number}...")
-
-    # 1. Select the next batch from Oracle
-    with ods_alchemy_engine.connect() as sql_connection:
-
-        batch_meters = pd.read_sql(
-            meter_selection_query,
-            sql_connection,
-            params={
-                "last_meter": last_meter,
-                "batch_size": BATCH_SIZE
-            }
-        )
-
-    batch_meters.columns = batch_meters.columns.str.lower()
-
-    if batch_meters.empty:
-        print("All meters completed.")
-        break
-
-    print(f"Meters selected: {len(batch_meters):,}")
-
-    # 2. Replace the registered DuckDB view with this batch
-    try:
-        con.unregister("batch_meters")
-    except Exception:
-        pass
-
-    con.register("batch_meters", batch_meters)
-
-    # 3. Run weather SQL for only those meters
-    weather_batch = con.execute("""
+meter_station_lookup = conn.execute("""
+    WITH weather_points AS (
+        SELECT DISTINCT LATITUDE, LONGITUDE
+        FROM weather
+    ),
+    distance_calc AS (
         SELECT
-            w.*
-        FROM weather_events w
-        INNER JOIN batch_meters b
-            ON TRIM(w.meterno) = TRIM(b.meterno)
-    """).df()
+            m.meterno,
+            m.LAT,
+            m.LON,
+            w.LATITUDE AS weather_lat,
+            w.LONGITUDE AS weather_lon,
+            3958.8 * acos(
+                cos(radians(m.LAT)) * cos(radians(w.LATITUDE))
+                * cos(radians(w.LONGITUDE) - radians(m.LON))
+                + sin(radians(m.LAT)) * sin(radians(w.LATITUDE))
+            ) AS distance_miles
+        FROM lifespan_df m
+        CROSS JOIN weather_points w
+    )
+    SELECT meterno, weather_lat, weather_lon
+    FROM distance_calc
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY meterno
+        ORDER BY distance_miles
+    ) = 1
+""").df()
 
-    print(f"Weather rows returned: {len(weather_batch):,}")
+lookup_elapsed = time.perf_counter() - lookup_start
+print(f"Lookup built in {lookup_elapsed/60:.2f} minutes for {len(meter_station_lookup):,} meters")
 
-    # 4. Move the bookmark forward
-    last_meter = batch_meters["meterno"].iloc[-1]
-
-    # Temporary test: stop after 2 batches
-    if batch_number == 2:
-        break
+conn.register("meter_station_lookup", meter_station_lookup)
