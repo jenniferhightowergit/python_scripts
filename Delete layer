@@ -1,36 +1,14 @@
-# Run this ONCE, before the while loop
-print("Building meter-to-weather-station lookup (one-time)...")
-lookup_start = time.perf_counter()
 
-meter_station_lookup = conn.execute("""
-    WITH weather_points AS (
-        SELECT DISTINCT LATITUDE, LONGITUDE
-        FROM weather
-    ),
-    distance_calc AS (
-        SELECT
-            m.meterno,
-            m.LAT,
-            m.LON,
-            w.LATITUDE AS weather_lat,
-            w.LONGITUDE AS weather_lon,
-            3958.8 * acos(
-                cos(radians(m.LAT)) * cos(radians(w.LATITUDE))
-                * cos(radians(w.LONGITUDE) - radians(m.LON))
-                + sin(radians(m.LAT)) * sin(radians(w.LATITUDE))
-            ) AS distance_miles
-        FROM lifespan_df m
-        CROSS JOIN weather_points w
-    )
-    SELECT meterno, weather_lat, weather_lon
-    FROM distance_calc
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY meterno
-        ORDER BY distance_miles
-    ) = 1
-""").df()
-
-lookup_elapsed = time.perf_counter() - lookup_start
-print(f"Lookup built in {lookup_elapsed/60:.2f} minutes for {len(meter_station_lookup):,} meters")
-
-conn.register("meter_station_lookup", meter_station_lookup)
+SELECT *
+FROM meters m
+JOIN comments c
+    ON (
+        6371000 * 2 * ASIN(
+            SQRT(
+                POWER(SIN(RADIANS(c.latitude - m.latitude) / 2), 2) +
+                COS(RADIANS(m.latitude)) *
+                COS(RADIANS(c.latitude)) *
+                POWER(SIN(RADIANS(c.longitude - m.longitude) / 2), 2)
+            )
+        )
+    ) <= 804.672
