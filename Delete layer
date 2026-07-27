@@ -1,204 +1,197 @@
 """
-Daily Excel -> Parquet incremental pipeline.
+parquet_sync.py
 
-Flow:
-1. Scan share drive for .xlsx files modified in the last N days.
-2. Parse the "file date" each spreadsheet represents (from filename or a column).
-3. Compare each file's mtime against what's already recorded in the parquet
-   for that file date.
-4. Drop old rows for any file date that has a newer version incoming.
-5. Append the new/updated data and write back.
+Reusable module: sync a DataFrame of newly-pulled data into an existing
+parquet file, replacing stale rows whenever a newer version of the same
+record (by date_col / key_cols) shows up.
 
-Customize the CONFIG block and the two `extract_*` functions for your
-actual filenames/schema, then the rest should work as-is.
+Usage
+-----
+    from parquet_sync import sync_parquet
+
+    result = sync_parquet(
+        new_df=my_new_data,
+        parquet_path="C:/data/meters.parquet",
+        date_col="file_date",
+        mtime_col="source_mtime",
+    )
+
+If file_date alone isn't a unique-enough key (e.g. multiple meters per
+file_date), pass key_cols:
+
+    result = sync_parquet(
+        new_df=my_new_data,
+        parquet_path="C:/data/meters.parquet",
+        date_col="file_date",
+        mtime_col="source_mtime",
+        key_cols=["file_date", "meter_id"],
+    )
+
+This module does NOT read excel files or touch the share drive — feed it
+whatever DataFrame you've already loaded, tagged with a date column and a
+modified-time column.
 """
 
-import re
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
-# --------------------------------------------------------------------------
-# CONFIG - edit these
-# --------------------------------------------------------------------------
-SHARE_DRIVE_PATH = Path(r"\\network\share\path\to\daily_files")  # UNC path
-PARQUET_PATH = Path(r"C:\local\path\to\output\data.parquet")     # or local mirror
-DAYS_LOOKBACK = 10
-
-# Column in your data that identifies the "file date" this row belongs to
-FILE_DATE_COL = "file_date"
-
-# Internal bookkeeping columns we add - won't collide with real columns
-SOURCE_MTIME_COL = "_source_mtime"
-SOURCE_FILE_COL = "_source_file"
-
-# If the file date is embedded in the filename, e.g. "meter_data_20250715.xlsx"
-FILENAME_DATE_REGEX = re.compile(r"(\d{8})")
-FILENAME_DATE_FORMAT = "%Y%m%d"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
-# --------------------------------------------------------------------------
-# Step 1: find recently modified excel files
-# --------------------------------------------------------------------------
-def get_recent_excel_files(folder: Path, days: int) -> list[Path]:
-    cutoff = datetime.now() - timedelta(days=days)
-    files = []
-    for f in folder.glob("*.xlsx"):
-        try:
-            mtime = datetime.fromtimestamp(f.stat().st_mtime)
-        except OSError as e:
-            log.warning(f"Could not stat {f}: {e}")
-            continue
-        if mtime >= cutoff:
-            files.append(f)
-    log.info(f"Found {len(files)} excel files modified in last {days} days")
-    return files
+class ParquetSyncError(Exception):
+    pass
 
 
-# --------------------------------------------------------------------------
-# Step 2 (helper): figure out the file date + mtime for each file
-# --------------------------------------------------------------------------
-def extract_file_date_from_name(path: Path):
-    """Fallback: pull date from filename. Adjust regex/format above as needed."""
-    m = FILENAME_DATE_REGEX.search(path.stem)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(m.group(1), FILENAME_DATE_FORMAT).date()
-    except ValueError:
-        return None
-
-
-def read_excel_files(files: list[Path]) -> pd.DataFrame:
-    """Read all files, tagging each row with its source file + file mtime.
-    If FILE_DATE_COL isn't already in the spreadsheet, derive it from filename.
+def sync_parquet(
+    new_df: pd.DataFrame,
+    parquet_path: str | Path,
+    date_col: str,
+    mtime_col: str,
+    key_cols: Optional[list[str]] = None,
+    dry_run: bool = False,
+    write: bool = True,
+) -> pd.DataFrame:
     """
-    frames = []
-    for f in files:
-        try:
-            df = pd.read_excel(f)
-        except Exception as e:
-            log.warning(f"Failed to read {f}: {e}")
-            continue
+    Merge new_df into the parquet file at parquet_path, keeping only the
+    newest version of each record key.
 
-        mtime = datetime.fromtimestamp(f.stat().st_mtime)
+    Parameters
+    ----------
+    new_df : DataFrame of newly pulled data. Must contain date_col, mtime_col,
+        and any columns listed in key_cols.
+    parquet_path : path to the parquet file (created if it doesn't exist yet).
+    date_col : column identifying the logical record date each row belongs to
+        (e.g. "file_date"). Always included in the grouping key.
+    mtime_col : column with the modified timestamp of the source for each row
+        (e.g. when the source file was last saved). Used to decide "newest".
+    key_cols : optional extra columns to combine with date_col to form the
+        uniqueness key, if date_col alone can repeat across distinct records
+        (e.g. ["file_date", "meter_id"]). If omitted, key is [date_col].
+    dry_run : if True, compute and return the merged result but never write
+        to disk. Useful for checking what would happen first.
+    write : if False, behaves like dry_run (kept as a separate flag in case
+        you want to log dry_run intent separately from write intent).
 
-        if FILE_DATE_COL not in df.columns:
-            file_date = extract_file_date_from_name(f)
-            if file_date is None:
-                log.warning(f"Could not determine file date for {f}, skipping")
-                continue
-            df[FILE_DATE_COL] = file_date
+    Returns
+    -------
+    The merged DataFrame (same one written to disk, unless dry_run/write=False).
+    """
+    parquet_path = Path(parquet_path)
+    group_cols = key_cols if key_cols else [date_col]
+    required_cols = list(dict.fromkeys(group_cols + [mtime_col]))  # dedupe, preserve order
 
-        df[SOURCE_MTIME_COL] = mtime
-        df[SOURCE_FILE_COL] = f.name
-        frames.append(df)
+    _validate_columns(new_df, required_cols, "new_df")
 
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    existing_df = _load_existing(parquet_path)
+    if not existing_df.empty:
+        _validate_columns(existing_df, required_cols, f"existing parquet at {parquet_path}")
+
+    merged_df, stats = _merge_and_dedupe(existing_df, new_df, group_cols, mtime_col)
+
+    log.info(
+        f"Sync summary — added: {stats['rows_added']}, "
+        f"dropped stale: {stats['rows_dropped']}, "
+        f"keys replaced: {sorted(stats['keys_replaced'])}, "
+        f"keys skipped (existing was newer/equal): {sorted(stats['keys_skipped'])}"
+    )
+
+    if dry_run or not write:
+        log.info("dry_run/write=False — not writing to disk")
+        return merged_df
+
+    _write_parquet(merged_df, parquet_path)
+    return merged_df
 
 
 # --------------------------------------------------------------------------
-# Step 3/4: merge new data in, dropping stale rows for any file_date
-#           that has a newer version now available
+# internals
 # --------------------------------------------------------------------------
-def load_existing_parquet(path: Path) -> pd.DataFrame:
+def _validate_columns(df: pd.DataFrame, cols: list[str], label: str):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ParquetSyncError(f"{label} is missing required column(s): {missing}")
+
+
+def _load_existing(path: Path) -> pd.DataFrame:
     if path.exists():
         df = pd.read_parquet(path)
-        log.info(f"Loaded existing parquet: {len(df)} rows")
+        log.info(f"Loaded existing parquet: {len(df)} rows from {path}")
         return df
-    log.info("No existing parquet found, starting fresh")
+    log.info(f"No existing parquet at {path} — will create new")
     return pd.DataFrame()
 
 
-def merge_and_dedupe(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+def _merge_and_dedupe(
+    existing_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    group_cols: list[str],
+    mtime_col: str,
+) -> tuple[pd.DataFrame, dict]:
+    stats = {"rows_added": 0, "rows_dropped": 0, "keys_replaced": set(), "keys_skipped": set()}
+
     if new_df.empty:
-        log.info("No new data to merge")
-        return existing_df
+        return existing_df, stats
 
     if existing_df.empty:
-        log.info(f"No existing data — using {len(new_df)} new rows as-is")
-        return new_df
+        stats["rows_added"] = len(new_df)
+        stats["keys_replaced"] = set(_key_tuples(new_df, group_cols))
+        return new_df, stats
 
-    # Latest incoming mtime per file_date (in case multiple new files hit the
-    # same file_date in this batch, e.g. same day re-saved twice)
-    incoming_latest = (
-        new_df.groupby(FILE_DATE_COL)[SOURCE_MTIME_COL].max().to_dict()
-    )
+    # newest incoming mtime per key (covers case where the same key shows up
+    # twice in this batch, e.g. re-saved same day)
+    incoming_latest = new_df.groupby(group_cols)[mtime_col].max().to_dict()
+    existing_latest = existing_df.groupby(group_cols)[mtime_col].max().to_dict()
 
-    updated_file_dates = set(incoming_latest.keys())
-
-    # For file_dates we're about to replace, check whether the incoming
-    # version is actually newer than what's already stored. If existing
-    # data is newer (unlikely, but possible w/ clock skew or re-runs),
-    # don't overwrite it.
-    existing_latest = (
-        existing_df.groupby(FILE_DATE_COL)[SOURCE_MTIME_COL].max().to_dict()
-        if SOURCE_MTIME_COL in existing_df.columns
-        else {}
-    )
-
-    file_dates_to_replace = set()
-    for fd in updated_file_dates:
-        old_mtime = existing_latest.get(fd)
-        new_mtime = incoming_latest[fd]
+    keys_to_replace = set()
+    keys_skipped = set()
+    for key, new_mtime in incoming_latest.items():
+        old_mtime = existing_latest.get(key)
         if old_mtime is None or new_mtime > old_mtime:
-            file_dates_to_replace.add(fd)
+            keys_to_replace.add(key)
         else:
-            log.info(
-                f"Skipping file_date {fd}: existing data ({old_mtime}) is same "
-                f"age or newer than incoming ({new_mtime})"
-            )
+            keys_skipped.add(key)
 
-    if not file_dates_to_replace:
-        log.info("No file_dates were actually newer — nothing replaced")
-        return existing_df
+    stats["keys_replaced"] = keys_to_replace
+    stats["keys_skipped"] = keys_skipped
 
-    # Drop old rows for file_dates being replaced
-    kept_existing = existing_df[~existing_df[FILE_DATE_COL].isin(file_dates_to_replace)]
-    dropped_count = len(existing_df) - len(kept_existing)
-    log.info(f"Dropping {dropped_count} stale rows for file_dates: {sorted(file_dates_to_replace)}")
+    if not keys_to_replace:
+        return existing_df, stats
 
-    # Only keep the new rows for file_dates we're actually replacing
-    # (in case new_df also contains file_dates we decided to skip above)
-    new_rows_to_add = new_df[new_df[FILE_DATE_COL].isin(file_dates_to_replace)]
+    existing_keys_series = _key_series(existing_df, group_cols)
+    new_keys_series = _key_series(new_df, group_cols)
 
-    result = pd.concat([kept_existing, new_rows_to_add], ignore_index=True)
-    log.info(f"Added {len(new_rows_to_add)} new rows. Total: {len(result)} rows")
-    return result
+    kept_existing = existing_df[~existing_keys_series.isin(keys_to_replace)]
+    stats["rows_dropped"] = len(existing_df) - len(kept_existing)
+
+    rows_to_add = new_df[new_keys_series.isin(keys_to_replace)]
+    stats["rows_added"] = len(rows_to_add)
+
+    result = pd.concat([kept_existing, rows_to_add], ignore_index=True)
+    return result, stats
 
 
-# --------------------------------------------------------------------------
-# Step 5: write back out
-# --------------------------------------------------------------------------
-def write_parquet(df: pd.DataFrame, path: Path):
+def _key_tuples(df: pd.DataFrame, group_cols: list[str]):
+    if len(group_cols) == 1:
+        return df[group_cols[0]].tolist()
+    return list(df[group_cols].itertuples(index=False, name=None))
+
+
+def _key_series(df: pd.DataFrame, group_cols: list[str]) -> pd.Series:
+    if len(group_cols) == 1:
+        return df[group_cols[0]]
+    return pd.Series(list(df[group_cols].itertuples(index=False, name=None)), index=df.index)
+
+
+def _write_parquet(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp.parquet")
     df.to_parquet(tmp_path, index=False)
-    tmp_path.replace(path)  # atomic-ish swap so a crash mid-write doesn't corrupt the real file
+    tmp_path.replace(path)
     log.info(f"Wrote {len(df)} rows to {path}")
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-def main():
-    recent_files = get_recent_excel_files(SHARE_DRIVE_PATH, DAYS_LOOKBACK)
-    if not recent_files:
-        log.info("Nothing to do — no recently modified files.")
-        return
-
-    new_df = read_excel_files(recent_files)
-    existing_df = load_existing_parquet(PARQUET_PATH)
-    merged_df = merge_and_dedupe(existing_df, new_df)
-    write_parquet(merged_df, PARQUET_PATH)
-
-
-if __name__ == "__main__":
-    main()
