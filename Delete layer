@@ -1,197 +1,29 @@
-"""
-parquet_sync.py
+cat_cols = X_score.select_dtypes(include='category').columns.tolist()
 
-Reusable module: sync a DataFrame of newly-pulled data into an existing
-parquet file, replacing stale rows whenever a newer version of the same
-record (by date_col / key_cols) shows up.
+def isolate_culprit(cols):
+    if len(cols) == 1:
+        return cols[0]
+    mid = len(cols) // 2
+    left, right = cols[:mid], cols[mid:]
 
-Usage
------
-    from parquet_sync import sync_parquet
+    X_try = X_score.copy()
+    # neutralize the "right" half by converting to plain int codes (removes category dtype)
+    for c in right:
+        X_try[c] = X_try[c].cat.codes.astype('int64')
+    try:
+        model.predict_proba(X_try)
+        return isolate_culprit(right)  # left was fine, issue is in right
+    except Exception:
+        return isolate_culprit(left)
 
-    result = sync_parquet(
-        new_df=my_new_data,
-        parquet_path="C:/data/meters.parquet",
-        date_col="file_date",
-        mtime_col="source_mtime",
-    )
-
-If file_date alone isn't a unique-enough key (e.g. multiple meters per
-file_date), pass key_cols:
-
-    result = sync_parquet(
-        new_df=my_new_data,
-        parquet_path="C:/data/meters.parquet",
-        date_col="file_date",
-        mtime_col="source_mtime",
-        key_cols=["file_date", "meter_id"],
-    )
-
-This module does NOT read excel files or touch the share drive — feed it
-whatever DataFrame you've already loaded, tagged with a date column and a
-modified-time column.
-"""
-
-from __future__ import annotations
-
-import logging
-from pathlib import Path
-from typing import Optional
-
-import pandas as pd
-
-log = logging.getLogger(__name__)
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+bad_col = isolate_culprit(cat_cols)
+print(bad_col)
 
 
-class ParquetSyncError(Exception):
-    pass
+from pandas.api.types import CategoricalDtype
 
+training_categories = [...]  # recovered list, in original order
+X_score[bad_col] = X_score[bad_col].astype(
+    CategoricalDtype(categories=training_categories, ordered=False)
+)
 
-def sync_parquet(
-    new_df: pd.DataFrame,
-    parquet_path: str | Path,
-    date_col: str,
-    mtime_col: str,
-    key_cols: Optional[list[str]] = None,
-    dry_run: bool = False,
-    write: bool = True,
-) -> pd.DataFrame:
-    """
-    Merge new_df into the parquet file at parquet_path, keeping only the
-    newest version of each record key.
-
-    Parameters
-    ----------
-    new_df : DataFrame of newly pulled data. Must contain date_col, mtime_col,
-        and any columns listed in key_cols.
-    parquet_path : path to the parquet file (created if it doesn't exist yet).
-    date_col : column identifying the logical record date each row belongs to
-        (e.g. "file_date"). Always included in the grouping key.
-    mtime_col : column with the modified timestamp of the source for each row
-        (e.g. when the source file was last saved). Used to decide "newest".
-    key_cols : optional extra columns to combine with date_col to form the
-        uniqueness key, if date_col alone can repeat across distinct records
-        (e.g. ["file_date", "meter_id"]). If omitted, key is [date_col].
-    dry_run : if True, compute and return the merged result but never write
-        to disk. Useful for checking what would happen first.
-    write : if False, behaves like dry_run (kept as a separate flag in case
-        you want to log dry_run intent separately from write intent).
-
-    Returns
-    -------
-    The merged DataFrame (same one written to disk, unless dry_run/write=False).
-    """
-    parquet_path = Path(parquet_path)
-    group_cols = key_cols if key_cols else [date_col]
-    required_cols = list(dict.fromkeys(group_cols + [mtime_col]))  # dedupe, preserve order
-
-    _validate_columns(new_df, required_cols, "new_df")
-
-    existing_df = _load_existing(parquet_path)
-    if not existing_df.empty:
-        _validate_columns(existing_df, required_cols, f"existing parquet at {parquet_path}")
-
-    merged_df, stats = _merge_and_dedupe(existing_df, new_df, group_cols, mtime_col)
-
-    log.info(
-        f"Sync summary — added: {stats['rows_added']}, "
-        f"dropped stale: {stats['rows_dropped']}, "
-        f"keys replaced: {sorted(stats['keys_replaced'])}, "
-        f"keys skipped (existing was newer/equal): {sorted(stats['keys_skipped'])}"
-    )
-
-    if dry_run or not write:
-        log.info("dry_run/write=False — not writing to disk")
-        return merged_df
-
-    _write_parquet(merged_df, parquet_path)
-    return merged_df
-
-
-# --------------------------------------------------------------------------
-# internals
-# --------------------------------------------------------------------------
-def _validate_columns(df: pd.DataFrame, cols: list[str], label: str):
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ParquetSyncError(f"{label} is missing required column(s): {missing}")
-
-
-def _load_existing(path: Path) -> pd.DataFrame:
-    if path.exists():
-        df = pd.read_parquet(path)
-        log.info(f"Loaded existing parquet: {len(df)} rows from {path}")
-        return df
-    log.info(f"No existing parquet at {path} — will create new")
-    return pd.DataFrame()
-
-
-def _merge_and_dedupe(
-    existing_df: pd.DataFrame,
-    new_df: pd.DataFrame,
-    group_cols: list[str],
-    mtime_col: str,
-) -> tuple[pd.DataFrame, dict]:
-    stats = {"rows_added": 0, "rows_dropped": 0, "keys_replaced": set(), "keys_skipped": set()}
-
-    if new_df.empty:
-        return existing_df, stats
-
-    if existing_df.empty:
-        stats["rows_added"] = len(new_df)
-        stats["keys_replaced"] = set(_key_tuples(new_df, group_cols))
-        return new_df, stats
-
-    # newest incoming mtime per key (covers case where the same key shows up
-    # twice in this batch, e.g. re-saved same day)
-    incoming_latest = new_df.groupby(group_cols)[mtime_col].max().to_dict()
-    existing_latest = existing_df.groupby(group_cols)[mtime_col].max().to_dict()
-
-    keys_to_replace = set()
-    keys_skipped = set()
-    for key, new_mtime in incoming_latest.items():
-        old_mtime = existing_latest.get(key)
-        if old_mtime is None or new_mtime > old_mtime:
-            keys_to_replace.add(key)
-        else:
-            keys_skipped.add(key)
-
-    stats["keys_replaced"] = keys_to_replace
-    stats["keys_skipped"] = keys_skipped
-
-    if not keys_to_replace:
-        return existing_df, stats
-
-    existing_keys_series = _key_series(existing_df, group_cols)
-    new_keys_series = _key_series(new_df, group_cols)
-
-    kept_existing = existing_df[~existing_keys_series.isin(keys_to_replace)]
-    stats["rows_dropped"] = len(existing_df) - len(kept_existing)
-
-    rows_to_add = new_df[new_keys_series.isin(keys_to_replace)]
-    stats["rows_added"] = len(rows_to_add)
-
-    result = pd.concat([kept_existing, rows_to_add], ignore_index=True)
-    return result, stats
-
-
-def _key_tuples(df: pd.DataFrame, group_cols: list[str]):
-    if len(group_cols) == 1:
-        return df[group_cols[0]].tolist()
-    return list(df[group_cols].itertuples(index=False, name=None))
-
-
-def _key_series(df: pd.DataFrame, group_cols: list[str]) -> pd.Series:
-    if len(group_cols) == 1:
-        return df[group_cols[0]]
-    return pd.Series(list(df[group_cols].itertuples(index=False, name=None)), index=df.index)
-
-
-def _write_parquet(df: pd.DataFrame, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(".tmp.parquet")
-    df.to_parquet(tmp_path, index=False)
-    tmp_path.replace(path)
-    log.info(f"Wrote {len(df)} rows to {path}")
