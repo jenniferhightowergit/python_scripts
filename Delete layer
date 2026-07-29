@@ -1,10 +1,10 @@
-feature_cols = model.get_booster().feature_names
-print(feature_cols[69])
+category_cols = list(cat_schema.keys())
 
-
-col = feature_cols[69]
-print("In cat_schema:", col in cat_schema)
-print("df dtype:", df[col].dtype)
-if col in cat_schema:
-    print("Schema categories (first 10):", cat_schema[col][:10])
-    print("Actual df categories (first 10):", df[col].cat.categories[:10] if str(df[col].dtype)=='category' else "not category dtype")
+for col in category_cols:
+    df[col] = (
+        df[col].astype("string")
+        .str.replace("\x00", "", regex=False)
+        .str.strip()
+        .fillna("UNKNOWN")
+        .astype(CategoricalDtype(categories=cat_schema[col]))
+    )
