@@ -1,10 +1,38 @@
-from pandas.api.types import CategoricalDtype
+import pandas as pd
 import joblib
+from pandas.api.types import CategoricalDtype
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score
+from xgboost import XGBClassifier
+
+# ===========================
+# 1. COPY DATAFRAME
+# ===========================
+df = df.copy()  # your source df, e.g. events/sample
+
+# ===========================
+# 2. DEFINE COLUMNS
+# ===========================
+category_cols = ['zip', 'city', 'weather_zone', 'TRANSFORMER', 'TRANSFORMER_PHASE',
+                  'COLLECTOR', 'FEEDER', 'substation', 'mtrvolts', 'regtype', 'formno',
+                  'classamp', 'oncorpgm', 'hw_model', 'form', 'base', 'class',
+                  'firmwareversion', 'dcwversion', 'metrology', 'zigbeefirmwareversion',
+                  'meterpgmcd']
+
+numeric_cols = [ ... ]  # your existing numeric_cols list, unchanged
+
+category_cols = [c for c in category_cols if c in df.columns]
+numeric_cols = [c for c in numeric_cols if c in df.columns]
+
+# ===========================
+# 3. BASIC CLEANUP + SCHEMA CAPTURE
+# ===========================
+df["calendar_date"] = pd.to_datetime(df["meter_removal_date"])
 
 def clean_categoricals(df, category_cols, schema=None, fit=False):
     """
-    fit=True: derive schema from this df and return it (use only in training).
-    fit=False: apply an existing schema (use in scoring).
+    fit=True: derive schema from this df and return it (training only).
+    fit=False: apply an existing schema (scoring only).
     """
     schema = schema or {}
     for col in category_cols:
@@ -21,12 +49,53 @@ def clean_categoricals(df, category_cols, schema=None, fit=False):
             df[col] = df[col].astype(CategoricalDtype(categories=schema[col]))
     return df, schema
 
-# --- In training notebook, right after cleanup ---
 df, cat_schema = clean_categoricals(df, category_cols, fit=True)
-# ... fit model ...
-joblib.dump({'model': model, 'cat_schema': cat_schema}, 'ncm_xgboost_model.pkl')
 
-# --- In scoring notebook ---
-saved = joblib.load('ncm_xgboost_model.pkl')
-model, cat_schema = saved['model'], saved['cat_schema']
-df, _ = clean_categoricals(df, category_cols, schema=cat_schema, fit=False)
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ===========================
+# 4. CREATE FEATURE MATRIX
+# ===========================
+X = df[numeric_cols + category_cols].copy()
+y = df[target_col].astype(int)  # e.g. "ncm_flag"
+
+# ===========================
+# 5. TRAIN / TEST SPLIT
+# ===========================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ===========================
+# 6. TRAIN XGBOOST MODEL
+# ===========================
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    enable_categorical=True,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    random_state=42,
+    n_jobs=-1
+)
+model.fit(X_train, y_train)
+
+# ===========================
+# 7. EVALUATE
+# ===========================
+test_probs = model.predict_proba(X_test)[:, 1]
+test_preds = (test_probs >= 0.5).astype(int)
+print("ROC AUC:", roc_auc_score(y_test, test_probs))
+print(classification_report(y_test, test_preds))
+
+# ===========================
+# 8. SAVE MODEL + SCHEMA TOGETHER
+# ===========================
+joblib.dump(
+    {'model': model, 'cat_schema': cat_schema},
+    r"\\eucprdnas01\u_support\jen_hightower\Hardware Failure (NCM) reporting\Sample in Steps\ncm_xgboost_model.pkl"
+)
