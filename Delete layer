@@ -1,29 +1,32 @@
-cat_cols = X_score.select_dtypes(include='category').columns.tolist()
-
-def isolate_culprit(cols):
-    if len(cols) == 1:
-        return cols[0]
-    mid = len(cols) // 2
-    left, right = cols[:mid], cols[mid:]
-
-    X_try = X_score.copy()
-    # neutralize the "right" half by converting to plain int codes (removes category dtype)
-    for c in right:
-        X_try[c] = X_try[c].cat.codes.astype('int64')
-    try:
-        model.predict_proba(X_try)
-        return isolate_culprit(right)  # left was fine, issue is in right
-    except Exception:
-        return isolate_culprit(left)
-
-bad_col = isolate_culprit(cat_cols)
-print(bad_col)
-
-
 from pandas.api.types import CategoricalDtype
+import joblib
 
-training_categories = [...]  # recovered list, in original order
-X_score[bad_col] = X_score[bad_col].astype(
-    CategoricalDtype(categories=training_categories, ordered=False)
-)
+def clean_categoricals(df, category_cols, schema=None, fit=False):
+    """
+    fit=True: derive schema from this df and return it (use only in training).
+    fit=False: apply an existing schema (use in scoring).
+    """
+    schema = schema or {}
+    for col in category_cols:
+        df[col] = (
+            df[col].astype("string")
+            .str.replace("\x00", "", regex=False)
+            .str.strip()
+            .fillna("UNKNOWN")
+        )
+        if fit:
+            df[col] = df[col].astype("category")
+            schema[col] = df[col].cat.categories.tolist()
+        else:
+            df[col] = df[col].astype(CategoricalDtype(categories=schema[col]))
+    return df, schema
 
+# --- In training notebook, right after cleanup ---
+df, cat_schema = clean_categoricals(df, category_cols, fit=True)
+# ... fit model ...
+joblib.dump({'model': model, 'cat_schema': cat_schema}, 'ncm_xgboost_model.pkl')
+
+# --- In scoring notebook ---
+saved = joblib.load('ncm_xgboost_model.pkl')
+model, cat_schema = saved['model'], saved['cat_schema']
+df, _ = clean_categoricals(df, category_cols, schema=cat_schema, fit=False)
