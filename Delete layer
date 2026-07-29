@@ -1,19 +1,10 @@
-saved = joblib.load(r"\\eucprdnas01\u_support\jen_hightower\Hardware Failure (NCM) reporting\Sample in Steps\ncm_xgboost_model.pkl")
-model = saved['model']          # <-- this line is the fix
-cat_schema = saved['cat_schema']
-
-
 feature_cols = model.get_booster().feature_names
-X_score = df[feature_cols]
-df["ncm_probability"] = model.predict_proba(X_score)[:, 1]
+print(feature_cols[69])
 
 
-model = saved['model']
-cat_schema = saved['cat_schema']
-
-
-print(type(model))  # should say <class 'xgboost.sklearn.XGBClassifier'>, not <class 'dict'>
-
-
-
-
+col = feature_cols[69]
+print("In cat_schema:", col in cat_schema)
+print("df dtype:", df[col].dtype)
+if col in cat_schema:
+    print("Schema categories (first 10):", cat_schema[col][:10])
+    print("Actual df categories (first 10):", df[col].cat.categories[:10] if str(df[col].dtype)=='category' else "not category dtype")
