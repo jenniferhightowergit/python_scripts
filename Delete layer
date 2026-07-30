@@ -1,10 +1,39 @@
-category_cols = list(cat_schema.keys())
+def make_unique_columns(columns):
+    counts = {}
+    new_columns = []
 
-for col in category_cols:
-    df[col] = (
-        df[col].astype("string")
-        .str.replace("\x00", "", regex=False)
-        .str.strip()
-        .fillna("UNKNOWN")
-        .astype(CategoricalDtype(categories=cat_schema[col]))
-    )
+    for col in columns:
+        col = str(col)
+
+        if col not in counts:
+            counts[col] = 0
+            new_columns.append(col)
+        else:
+            counts[col] += 1
+            new_columns.append(f"{col}_{counts[col]}")
+
+    return new_columns
+
+
+df_alltime = hw_assets.convert_dtypes()
+
+# Make duplicate names unique
+df_alltime.columns = make_unique_columns(df_alltime.columns)
+
+# Convert object/string columns to pandas string type
+for col in df_alltime.select_dtypes(include=["object", "string"]).columns:
+    df_alltime[col] = df_alltime[col].astype("string")
+
+output_path = (
+    r"\\eucprdnas01\u_support\jen_hightower"
+    r"\JensFakeDW\Staging\parquet\hw_asset.parquet"
+)
+
+df_alltime.to_parquet(
+    output_path,
+    engine="pyarrow",
+    compression="snappy",
+    index=False
+)
+
+print("Export complete.")
