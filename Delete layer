@@ -1,254 +1,71 @@
-r"""
-comment_classifier.py
+"""
+example_train_comment_model.py
 
-Reusable TF-IDF + Logistic Regression classifier for a SINGLE comment
-category. Train one model per category by instantiating one CommentClassifier
-per label_col and calling .train(df, model_path) in a loop.
-
-Usage (one model per category):
-    label_cols = ["NON_COMMUNICATING", "DAMAGED_METER", "HARDWARE_FAILURE", ...]
-
-    for label in label_cols:
-        clf = CommentClassifier(
-            comment_col="cleaned_comment",
-            label_col=label,
-            threshold=0.70,
-        )
-        report = clf.train(
-            df,
-            model_path=rf"\\eucprdnas01\u_support\jen_hightower\ML_Models\{label}_classifier.pkl",
-        )
-        print(label, "trained")
-        print(report)
-
-Later, to use a saved model:
-    clf = CommentClassifier.load(r"\\eucprdnas01\...\HARDWARE_FAILURE_classifier.pkl")
-    results_df = clf.predict(new_df)
+Minimal example showing how to feed a dataframe into CommentClassifier
+and save the resulting model.
 """
 
-from __future__ import annotations
-
-import json
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-
-import joblib
-import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.feature_extraction.text import TfidfVectorizer
+from comment_classifier import CommentClassifier
 
+# ------------------------------------------------------------------
+# 1. Feed in the dataframe
+# ------------------------------------------------------------------
+# This is whatever dataframe you already have with cleaned comments + label
+# columns -- e.g. loaded from Parquet, Oracle, or your existing to_train object.
+df = pd.read_parquet(r"\\eucprdnas01\u_support\jen_hightower\data\to_train.parquet")
 
-class CommentClassifier:
-    def __init__(
-        self,
-        comment_col: str,
-        label_col: str,
-        threshold: float = 0.5,
-        ngram_range: tuple[int, int] = (1, 3),
-        min_df: int = 2,
-        max_df: float = 0.90,
-        max_iter: int = 1000,
-        class_weight: Optional[str] = "balanced",
-        test_size: float = 0.20,
-        random_state: int = 42,
-    ):
-        self.comment_col = comment_col
-        self.label_col = label_col
-        self.threshold = threshold
-        self.ngram_range = ngram_range
-        self.min_df = min_df
-        self.max_df = max_df
-        self.max_iter = max_iter
-        self.class_weight = class_weight
-        self.test_size = test_size
-        self.random_state = random_state
+# ------------------------------------------------------------------
+# 2a. SINGLE CATEGORY example
+# ------------------------------------------------------------------
+clf = CommentClassifier(
+    comment_col="cleaned_comment",
+    label_col="HARDWARE_FAILURE",     # the one column you're training on
+    threshold=0.70,
+)
 
-        self.model: Optional[Pipeline] = None
-        self.X_train = self.X_test = self.y_train = self.y_test = None
-        self.y_prob_test = self.y_pred_test = None
-        self.metadata: dict = {}
+report = clf.train(
+    df,
+    # this is where you define where the model gets saved
+    model_path=r"\\eucprdnas01\u_support\jen_hightower\ML_Models\HARDWARE_FAILURE_classifier.pkl",
+)
 
-    # ------------------------------------------------------------------
-    # Build
-    # ------------------------------------------------------------------
-    def _build_pipeline(self) -> Pipeline:
-        return Pipeline([
-            ("tfidf", TfidfVectorizer(
-                ngram_range=self.ngram_range,
-                min_df=self.min_df,
-                max_df=self.max_df,
-            )),
-            ("clf", LogisticRegression(
-                max_iter=self.max_iter,
-                class_weight=self.class_weight,
-            )),
-        ])
+print(report)
 
-    # ------------------------------------------------------------------
-    # Fit
-    # ------------------------------------------------------------------
-    def fit(self, df: pd.DataFrame) -> "CommentClassifier":
-        """Clean, split, and train on a dataframe with comment_col + label_col."""
-        working = df.dropna(subset=[self.comment_col]).copy()
+# ------------------------------------------------------------------
+# 2b. LOOP OVER ALL CATEGORIES (one model per category)
+# ------------------------------------------------------------------
+label_cols = [
+    "NON_COMMUNICATING",
+    "DAMAGED_METER",
+    "HARDWARE_FAILURE",
+    "VEGETATION",
+    "NETWORK_ISSUE",
+    "TOPOGRAPHY_ISSUE",
+    "TAMPERING",
+    "VANDALISM",
+    "ELECTRICAL_DISTRIBUTION_ISSUE",
+    "CONSTRUCTION",
+    "ACCESS_ISSUES",
+]
 
-        X = working[self.comment_col].astype(str)
-        y = working[self.label_col].fillna(0).astype(int)
+save_folder = r"\\eucprdnas01\u_support\jen_hightower\ML_Models"
 
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.random_state,
-            stratify=y if y.nunique() > 1 else None,
-        )
+for label in label_cols:
+    clf = CommentClassifier(
+        comment_col="cleaned_comment",
+        label_col=label,
+        threshold=0.70,
+    )
 
-        self.model = self._build_pipeline()
-        self.model.fit(self.X_train, self.y_train)
+    report = clf.train(
+        df,
+        model_path=rf"{save_folder}\{label}_classifier.pkl",
+    )
 
-        # score held-out test set immediately so evaluate()/predict() have data
-        self.y_prob_test = self.model.predict_proba(self.X_test)[:, 1]
-        self.y_pred_test = (self.y_prob_test >= self.threshold).astype(int)
+    print(f"\n=== {label} ===")
+    print(report)
 
-        self.metadata = {
-            "trained_at": datetime.now().isoformat(timespec="seconds"),
-            "comment_col": self.comment_col,
-            "label_col": self.label_col,
-            "threshold": self.threshold,
-            "n_train_rows": len(self.X_train),
-            "n_test_rows": len(self.X_test),
-            "positive_rate_train": round(float(self.y_train.mean()), 4),
-            "vectorizer_vocab_size": len(self.model.named_steps["tfidf"].vocabulary_),
-            "params": {
-                "ngram_range": self.ngram_range,
-                "min_df": self.min_df,
-                "max_df": self.max_df,
-                "max_iter": self.max_iter,
-                "class_weight": self.class_weight,
-                "test_size": self.test_size,
-                "random_state": self.random_state,
-            },
-        }
-        return self
-
-    # ------------------------------------------------------------------
-    # Convenience: fit + save in one call
-    # ------------------------------------------------------------------
-    def train(
-        self,
-        df: pd.DataFrame,
-        model_path: str,
-        metadata_path: Optional[str] = None,
-    ) -> str:
-        r"""
-        Feed in a training dataframe, get a saved model out.
-
-        - df: dataframe containing comment_col + label_col
-        - model_path: full path (including filename) where the .pkl should be written,
-          e.g. rf"\\eucprdnas01\u_support\jen_hightower\ML_Models\{label}_classifier.pkl"
-        - metadata_path: optional; defaults to model_path with .metadata.json instead of .pkl
-
-        Returns the classification report (str) so you can log/print it immediately.
-        """
-        self.fit(df)
-        self.save(model_path, metadata_path=metadata_path)
-        return self.evaluate()
-
-    # ------------------------------------------------------------------
-    # Evaluate
-    # ------------------------------------------------------------------
-    def evaluate(self, as_dict: bool = False):
-        """Classification report on the held-out test split from fit()."""
-        self._check_fitted()
-        return classification_report(
-            self.y_test,
-            self.y_pred_test,
-            target_names=[f"NOT_{self.label_col}", self.label_col],
-            zero_division=0,
-            output_dict=as_dict,
-        )
-
-    # ------------------------------------------------------------------
-    # Predict on new data
-    # ------------------------------------------------------------------
-    def predict(self, df: pd.DataFrame, include_actual: bool = False) -> pd.DataFrame:
-        """
-        Score new comments and return a results dataframe:
-        clean_comment, score, pred (0/1), and actual (if include_actual=True and
-        label_col exists in df).
-        """
-        self._check_fitted()
-        working = df.dropna(subset=[self.comment_col]).copy()
-        X_new = working[self.comment_col].astype(str)
-
-        y_prob = self.model.predict_proba(X_new)[:, 1]
-        y_pred = (y_prob >= self.threshold).astype(int)
-
-        results = pd.DataFrame({"clean_comment": X_new.values})
-        if include_actual and self.label_col in working.columns:
-            results[f"actual_{self.label_col}"] = working[self.label_col].fillna(0).astype(int).values
-        results[f"score_{self.label_col}"] = y_prob.round(3)
-        results[f"pred_{self.label_col}"] = y_pred
-        return results
-
-    def predict_test_results(self, include_actual: bool = True) -> pd.DataFrame:
-        """Same shape as predict(), but built from the held-out test split (post-fit)."""
-        self._check_fitted()
-        results = pd.DataFrame({"clean_comment": self.X_test.values})
-        if include_actual:
-            results[f"actual_{self.label_col}"] = self.y_test.values
-        results[f"score_{self.label_col}"] = self.y_prob_test.round(3)
-        results[f"pred_{self.label_col}"] = self.y_pred_test
-        return results
-
-    # ------------------------------------------------------------------
-    # Explainability: top TF-IDF terms driving this category
-    # ------------------------------------------------------------------
-    def top_terms(self, n_terms: int = 15) -> list[tuple[str, float]]:
-        """Highest-weighted TF-IDF terms pushing toward a positive prediction."""
-        self._check_fitted()
-        vectorizer = self.model.named_steps["tfidf"]
-        clf = self.model.named_steps["clf"]
-        feature_names = np.array(vectorizer.get_feature_names_out())
-
-        coefs = clf.coef_[0]
-        top_idx = np.argsort(coefs)[::-1][:n_terms]
-        return [(feature_names[i], round(float(coefs[i]), 3)) for i in top_idx]
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-    def save(self, model_path: str, metadata_path: Optional[str] = None) -> None:
-        """Save the fitted pipeline (.pkl) and a sidecar metadata .json."""
-        self._check_fitted()
-        joblib.dump(self.model, model_path)
-
-        if metadata_path is None:
-            metadata_path = str(Path(model_path).with_suffix(".metadata.json"))
-        with open(metadata_path, "w") as f:
-            json.dump(self.metadata, f, indent=2)
-
-    @classmethod
-    def load(cls, model_path: str, metadata_path: Optional[str] = None) -> "CommentClassifier":
-        """Load a previously saved pipeline + metadata back into a CommentClassifier."""
-        if metadata_path is None:
-            metadata_path = str(Path(model_path).with_suffix(".metadata.json"))
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        obj = cls(
-            comment_col=metadata["comment_col"],
-            label_col=metadata["label_col"],
-            threshold=metadata["threshold"],
-            **metadata["params"],
-        )
-        obj.model = joblib.load(model_path)
-        obj.metadata = metadata
-        return obj
-
-    # ------------------------------------------------------------------
-    def _check_fitted(self):
-        if self.model is None:
-            raise RuntimeError("Model has not been fit yet. Call .fit(df) or .load(path) first.")
+# Each loop iteration writes two files per category, e.g.:
+#   HARDWARE_FAILURE_classifier.pkl
+#   HARDWARE_FAILURE_classifier.metadata.json
