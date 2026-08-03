@@ -1,4 +1,162 @@
-conn.execute("PRAGMA temp_directory='C:/Temp';")
-conn.execute("PRAGMA memory_limit='2GB';")
+import pandas as pd
+import folium
 
-conn.execute("PRAGMA threads=1;")
+
+def create_count_map(
+    df,
+    latitude="latitude",
+    longitude="longitude",
+    count_column=None,
+    group_column=None,
+    output_file="count_map.html",
+    zoom_start=11,
+    count_unique=False
+):
+    """
+    Create an interactive bubble map where marker size represents a count.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Source dataframe.
+
+    latitude : str
+        Name of latitude column.
+
+    longitude : str
+        Name of longitude column.
+
+    count_column : str
+        Column to count, such as meter_id or serviceLocationId.
+
+    group_column : str, optional
+        Additional category to group by, such as feeder or ZIP code.
+
+    output_file : str
+        Name of HTML output file.
+
+    zoom_start : int
+        Initial map zoom.
+
+    count_unique : bool
+        False = count all non-null rows.
+        True = count unique values in count_column.
+    """
+
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame.")
+
+    required_columns = [latitude, longitude, count_column]
+
+    if group_column is not None:
+        required_columns.append(group_column)
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing columns: {missing_columns}"
+        )
+
+    # Make a clean working copy
+    map_df = df.copy()
+
+    map_df[latitude] = pd.to_numeric(
+        map_df[latitude],
+        errors="coerce"
+    )
+
+    map_df[longitude] = pd.to_numeric(
+        map_df[longitude],
+        errors="coerce"
+    )
+
+    map_df = map_df.dropna(
+        subset=[latitude, longitude]
+    )
+
+    # Columns defining one map location
+    grouping_columns = [latitude, longitude]
+
+    if group_column is not None:
+        grouping_columns.append(group_column)
+
+    # Count either every row or unique values
+    if count_unique:
+        grouped_df = (
+            map_df
+            .groupby(grouping_columns, dropna=False)[count_column]
+            .nunique()
+            .reset_index(name="record_count")
+        )
+    else:
+        grouped_df = (
+            map_df
+            .groupby(grouping_columns, dropna=False)[count_column]
+            .count()
+            .reset_index(name="record_count")
+        )
+
+    # Center the map
+    center = [
+        grouped_df[latitude].mean(),
+        grouped_df[longitude].mean()
+    ]
+
+    m = folium.Map(
+        location=center,
+        zoom_start=zoom_start
+    )
+
+    # Scale bubble sizes so very large counts do not create giant circles
+    max_count = grouped_df["record_count"].max()
+
+    for _, row in grouped_df.iterrows():
+
+        count = int(row["record_count"])
+
+        # Marker radius between approximately 5 and 30
+        if max_count > 0:
+            radius = 5 + ((count / max_count) ** 0.5 * 25)
+        else:
+            radius = 5
+
+        popup_lines = [
+            f"<b>Count:</b> {count:,}"
+        ]
+
+        if group_column is not None:
+            popup_lines.insert(
+                0,
+                f"<b>{group_column}:</b> {row[group_column]}"
+            )
+
+        popup_text = "<br>".join(popup_lines)
+
+        folium.CircleMarker(
+            location=[
+                row[latitude],
+                row[longitude]
+            ],
+            radius=radius,
+            color="blue",
+            weight=1,
+            fill=True,
+            fill_color="blue",
+            fill_opacity=0.65,
+            popup=folium.Popup(
+                popup_text,
+                max_width=300
+            ),
+            tooltip=f"Count: {count:,}"
+        ).add_to(m)
+
+    m.save(output_file)
+
+    print(f"Map saved as: {output_file}")
+    print(f"Locations mapped: {len(grouped_df):,}")
+
+    return m, grouped_df
