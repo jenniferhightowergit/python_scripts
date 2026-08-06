@@ -1,162 +1,74 @@
+"""
+Send a pandas DataFrame as a styled HTML table via Outlook — no SMTP/ports/passwords needed.
+Requires Outlook desktop app to be installed and logged in (Windows only).
+
+Install once:
+    pip install pywin32
+
+Usage:
+    python send_df_outlook.py
+"""
+
 import pandas as pd
-import folium
+import win32com.client as win32
 
 
-def create_count_map(
-    df,
-    latitude="latitude",
-    longitude="longitude",
-    count_column=None,
-    group_column=None,
-    output_file="count_map.html",
-    zoom_start=11,
-    count_unique=False
-):
-    """
-    Create an interactive bubble map where marker size represents a count.
+def df_to_html(df: pd.DataFrame, title: str = "Report") -> str:
+    header_cells = "".join(
+        f'<th style="padding:10px 14px; background-color:#2c3e50; color:#ffffff; '
+        f'text-align:left; font-family:Arial, sans-serif; font-size:13px;">{col}</th>'
+        for col in df.columns
+    )
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Source dataframe.
-
-    latitude : str
-        Name of latitude column.
-
-    longitude : str
-        Name of longitude column.
-
-    count_column : str
-        Column to count, such as meter_id or serviceLocationId.
-
-    group_column : str, optional
-        Additional category to group by, such as feeder or ZIP code.
-
-    output_file : str
-        Name of HTML output file.
-
-    zoom_start : int
-        Initial map zoom.
-
-    count_unique : bool
-        False = count all non-null rows.
-        True = count unique values in count_column.
-    """
-
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("df must be a pandas DataFrame.")
-
-    required_columns = [latitude, longitude, count_column]
-
-    if group_column is not None:
-        required_columns.append(group_column)
-
-    missing_columns = [
-        column for column in required_columns
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"Missing columns: {missing_columns}"
+    rows_html = ""
+    for i, row in df.iterrows():
+        bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+        cells = "".join(
+            f'<td style="padding:8px 14px; border-bottom:1px solid #e0e0e0; '
+            f'font-family:Arial, sans-serif; font-size:13px; color:#333;">{val}</td>'
+            for val in row
         )
+        rows_html += f'<tr style="background-color:{bg};">{cells}</tr>'
 
-    # Make a clean working copy
-    map_df = df.copy()
+    html = f"""
+    <div style="max-width:700px; font-family:Arial, sans-serif;">
+        <h2 style="color:#2c3e50;">{title}</h2>
+        <table style="border-collapse:collapse; width:100%;">
+            <thead><tr>{header_cells}</tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>
+    """
+    return html
 
-    map_df[latitude] = pd.to_numeric(
-        map_df[latitude],
-        errors="coerce"
-    )
 
-    map_df[longitude] = pd.to_numeric(
-        map_df[longitude],
-        errors="coerce"
-    )
+def send_via_outlook(df: pd.DataFrame, to: str, subject: str, title: str = "Report", send_now: bool = False):
+    outlook = win32.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)  # 0 = MailItem
+    mail.To = to
+    mail.Subject = subject
+    mail.HTMLBody = df_to_html(df, title=title)
 
-    map_df = map_df.dropna(
-        subset=[latitude, longitude]
-    )
-
-    # Columns defining one map location
-    grouping_columns = [latitude, longitude]
-
-    if group_column is not None:
-        grouping_columns.append(group_column)
-
-    # Count either every row or unique values
-    if count_unique:
-        grouped_df = (
-            map_df
-            .groupby(grouping_columns, dropna=False)[count_column]
-            .nunique()
-            .reset_index(name="record_count")
-        )
+    if send_now:
+        mail.Send()
+        print("Email sent.")
     else:
-        grouped_df = (
-            map_df
-            .groupby(grouping_columns, dropna=False)[count_column]
-            .count()
-            .reset_index(name="record_count")
-        )
+        mail.Display()  # opens the email as a draft so you can review before sending
+        print("Draft opened in Outlook — review and hit send.")
 
-    # Center the map
-    center = [
-        grouped_df[latitude].mean(),
-        grouped_df[longitude].mean()
-    ]
 
-    m = folium.Map(
-        location=center,
-        zoom_start=zoom_start
+if __name__ == "__main__":
+    # Example DataFrame — replace with your real one
+    df = pd.DataFrame({
+        "Meter ID": ["12345", "67890", "54321"],
+        "Status": ["Communicating", "Non-Communicating", "Communicating"],
+        "Last Read": ["2026-08-05", "2026-08-01", "2026-08-06"],
+    })
+
+    send_via_outlook(
+        df,
+        to="recipient@example.com",
+        subject="Meter Status Report",
+        title="Meter Status Report",
+        send_now=False,  # set True to send immediately instead of opening a draft
     )
-
-    # Scale bubble sizes so very large counts do not create giant circles
-    max_count = grouped_df["record_count"].max()
-
-    for _, row in grouped_df.iterrows():
-
-        count = int(row["record_count"])
-
-        # Marker radius between approximately 5 and 30
-        if max_count > 0:
-            radius = 5 + ((count / max_count) ** 0.5 * 25)
-        else:
-            radius = 5
-
-        popup_lines = [
-            f"<b>Count:</b> {count:,}"
-        ]
-
-        if group_column is not None:
-            popup_lines.insert(
-                0,
-                f"<b>{group_column}:</b> {row[group_column]}"
-            )
-
-        popup_text = "<br>".join(popup_lines)
-
-        folium.CircleMarker(
-            location=[
-                row[latitude],
-                row[longitude]
-            ],
-            radius=radius,
-            color="blue",
-            weight=1,
-            fill=True,
-            fill_color="blue",
-            fill_opacity=0.65,
-            popup=folium.Popup(
-                popup_text,
-                max_width=300
-            ),
-            tooltip=f"Count: {count:,}"
-        ).add_to(m)
-
-    m.save(output_file)
-
-    print(f"Map saved as: {output_file}")
-    print(f"Locations mapped: {len(grouped_df):,}")
-
-    return m, grouped_df
