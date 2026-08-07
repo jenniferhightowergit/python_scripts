@@ -35,10 +35,11 @@ import geopandas as gpd
 #   Mac/Linux:         export CENSUS_API_KEY=your_key_here
 CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "PASTE_YOUR_KEY_HERE")
 
-ACS_YEAR = 2022  # most recent 5-year ACS release at time of writing
+ACS_YEAR = 2024  # vintage 2024 = 2020-2024 ACS 5-year estimates (most recent as of Aug 2026)
 STATE_FIPS = "48"  # Texas
 
-TIGER_URL = f"https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_{STATE_FIPS}_tract.zip"
+# Boundary vintage matched to the ACS data vintage above (both "2024")
+TIGER_URL = f"https://www2.census.gov/geo/tiger/TIGER2024/TRACT/tl_2024_{STATE_FIPS}_tract.zip"
 ACS_URL = (
     f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
     f"?get=NAME,B01003_001E&for=tract:*&in=state:{STATE_FIPS}&key={CENSUS_API_KEY}"
@@ -95,7 +96,7 @@ def fetch_tract_boundaries():
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
         z.extractall(SHAPEFILE_DIR)
 
-    shp_path = os.path.join(SHAPEFILE_DIR, f"tl_2023_{STATE_FIPS}_tract.shp")
+    shp_path = os.path.join(SHAPEFILE_DIR, f"tl_2024_{STATE_FIPS}_tract.shp")
     tracts = gpd.read_file(shp_path)
     return tracts[["GEOID", "ALAND", "AWATER", "INTPTLAT", "INTPTLON", "geometry"]]
 
