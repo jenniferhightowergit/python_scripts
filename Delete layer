@@ -1,74 +1,75 @@
 """
-Send a pandas DataFrame as a styled HTML table via Outlook — no SMTP/ports/passwords needed.
-Requires Outlook desktop app to be installed and logged in (Windows only).
+Sends a small pandas DataFrame as an HTML table in the body of an email.
 
-Install once:
-    pip install pywin32
-
-Usage:
-    python send_df_outlook.py
+Fill in the CONFIG section, then run:
+    python send_fp_report_email.py
 """
 
+import smtplib
 import pandas as pd
-import win32com.client as win32
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# ── CONFIG ────────────────────────────────────────────────────────────────
+SMTP_SERVER   = "smtp.office365.com"   # Oncor is likely O365 — change if you use an internal relay
+SMTP_PORT     = 587
+SENDER_EMAIL  = "your.email@oncor.com"
+SENDER_PASS   = "your_password_or_app_password"   # better: os.environ.get("SMTP_PASSWORD")
+RECIPIENTS    = ["recipient@oncor.com"]            # add more addresses as needed
+SUBJECT       = "FP / NCM Report"
+# ─────────────────────────────────────────────────────────────────────────
 
 
-def df_to_html(df: pd.DataFrame, title: str = "Report") -> str:
-    header_cells = "".join(
-        f'<th style="padding:10px 14px; background-color:#2c3e50; color:#ffffff; '
-        f'text-align:left; font-family:Arial, sans-serif; font-size:13px;">{col}</th>'
-        for col in df.columns
-    )
+def build_html_table(df: pd.DataFrame) -> str:
+    """Convert a dataframe into a simple, clean HTML table for email clients."""
+    table_html = df.to_html(index=False, border=0)
 
-    rows_html = ""
-    for i, row in df.iterrows():
-        bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
-        cells = "".join(
-            f'<td style="padding:8px 14px; border-bottom:1px solid #e0e0e0; '
-            f'font-family:Arial, sans-serif; font-size:13px; color:#333;">{val}</td>'
-            for val in row
-        )
-        rows_html += f'<tr style="background-color:{bg};">{cells}</tr>'
-
-    html = f"""
-    <div style="max-width:700px; font-family:Arial, sans-serif;">
-        <h2 style="color:#2c3e50;">{title}</h2>
-        <table style="border-collapse:collapse; width:100%;">
-            <thead><tr>{header_cells}</tr></thead>
-            <tbody>{rows_html}</tbody>
-        </table>
-    </div>
+    # Basic inline styling so it renders decently in Outlook/Gmail
+    style = """
+    <style>
+        table { border-collapse: collapse; font-family: Arial, sans-serif; font-size: 13px; }
+        th { background-color: #1F4E78; color: white; padding: 8px 12px; text-align: left; }
+        td { padding: 8px 12px; border-bottom: 1px solid #ddd; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+    </style>
     """
-    return html
+
+    body = f"""
+    <html>
+        <head>{style}</head>
+        <body>
+            <p>Hi,</p>
+            <p>Here's the latest FP / NCM count:</p>
+            {table_html}
+            <p>Let me know if you have any questions.</p>
+        </body>
+    </html>
+    """
+    return body
 
 
-def send_via_outlook(df: pd.DataFrame, to: str, subject: str, title: str = "Report", send_now: bool = False):
-    outlook = win32.Dispatch("Outlook.Application")
-    mail = outlook.CreateItem(0)  # 0 = MailItem
-    mail.To = to
-    mail.Subject = subject
-    mail.HTMLBody = df_to_html(df, title=title)
+def send_email(df: pd.DataFrame):
+    html_body = build_html_table(df)
 
-    if send_now:
-        mail.Send()
-        print("Email sent.")
-    else:
-        mail.Display()  # opens the email as a draft so you can review before sending
-        print("Draft opened in Outlook — review and hit send.")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = SUBJECT
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = ", ".join(RECIPIENTS)
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASS)
+        server.sendmail(SENDER_EMAIL, RECIPIENTS, msg.as_string())
+
+    print("Email sent successfully.")
 
 
 if __name__ == "__main__":
-    # Example DataFrame — replace with your real one
-    df = pd.DataFrame({
-        "Meter ID": ["12345", "67890", "54321"],
-        "Status": ["Communicating", "Non-Communicating", "Communicating"],
-        "Last Read": ["2026-08-05", "2026-08-01", "2026-08-06"],
+    # Replace this with your actual FP dataframe (e.g. FP.head(20) from your notebook)
+    FP = pd.DataFrame({
+        "FP": [4226.0],
+        "Mc_After_8_5_2026": [0.0]
     })
 
-    send_via_outlook(
-        df,
-        to="recipient@example.com",
-        subject="Meter Status Report",
-        title="Meter Status Report",
-        send_now=False,  # set True to send immediately instead of opening a draft
-    )
+    send_email(FP)
