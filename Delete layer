@@ -1,49 +1,43 @@
 """
-Sends a small pandas DataFrame as an HTML table in the body of an email.
-
-Fill in the CONFIG section, then run:
-    python send_fp_report_email.py
+Sends (or drafts) the FP / NCM report as an HTML table via your local Outlook
+desktop app — no SMTP login required, since it drives the Outlook client
+you're already signed into (same pattern as Emir's future_date_meters.py).
 """
 
-import smtplib
 import pandas as pd
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import win32com.client as win32
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-SMTP_SERVER   = "smtp.office365.com"   # Oncor is likely O365 — change if you use an internal relay
-SMTP_PORT     = 587
-SENDER_EMAIL  = "your.email@oncor.com"
-SENDER_PASS   = "your_password_or_app_password"   # better: os.environ.get("SMTP_PASSWORD")
-RECIPIENTS    = ["recipient@oncor.com"]            # add more addresses as needed
-SUBJECT       = "FP / NCM Report"
+RECIPIENTS = ["Edmundo.Rodriguez@oncor.com"]   # update as needed
+CC         = []                                 # e.g. ["someone@oncor.com"]
+SUBJECT    = "FP / NCM Report"
+SEND_DIRECTLY = False   # False = leaves it as a draft for you to review/send
+                         # True  = sends immediately
 # ─────────────────────────────────────────────────────────────────────────
 
 
 def build_html_table(df: pd.DataFrame) -> str:
-    """Convert a dataframe into a simple, clean HTML table for email clients."""
+    """Convert a dataframe into a simple HTML table for the email body."""
     table_html = df.to_html(index=False, border=0)
 
-    # Basic inline styling so it renders decently in Outlook/Gmail
     style = """
     <style>
-        table { border-collapse: collapse; font-family: Arial, sans-serif; font-size: 13px; }
-        th { background-color: #1F4E78; color: white; padding: 8px 12px; text-align: left; }
-        td { padding: 8px 12px; border-bottom: 1px solid #ddd; }
+        table { border-collapse: collapse; font-family: Calibri, Arial, sans-serif; font-size: 11pt; }
+        th { background-color: #1F4E78; color: white; padding: 6px 10px; text-align: left; }
+        td { padding: 6px 10px; border-bottom: 1px solid #ddd; }
         tr:nth-child(even) { background-color: #f2f2f2; }
     </style>
     """
 
     body = f"""
-    <html>
-        <head>{style}</head>
-        <body>
-            <p>Hi,</p>
-            <p>Here's the latest FP / NCM count:</p>
-            {table_html}
-            <p>Let me know if you have any questions.</p>
-        </body>
-    </html>
+    <div style='font-family:"Calibri",sans-serif; font-size:11.0pt;'>
+        {style}
+        Hi,<br><br>
+        Here's the latest FP / NCM count:<br><br>
+        {table_html}
+        <br>
+        Let me know if you have any questions.
+    </div>
     """
     return body
 
@@ -51,22 +45,24 @@ def build_html_table(df: pd.DataFrame) -> str:
 def send_email(df: pd.DataFrame):
     html_body = build_html_table(df)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = SUBJECT
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = ", ".join(RECIPIENTS)
-    msg.attach(MIMEText(html_body, "html"))
+    outlook = win32.Dispatch("outlook.application")
+    mail = outlook.CreateItem(0)  # 0 = olMailItem
+    mail.To = ";".join(RECIPIENTS)
+    if CC:
+        mail.CC = ";".join(CC)
+    mail.Subject = SUBJECT
+    mail.HTMLBody = html_body
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_PASS)
-        server.sendmail(SENDER_EMAIL, RECIPIENTS, msg.as_string())
-
-    print("Email sent successfully.")
+    if SEND_DIRECTLY:
+        mail.Send()
+        print("Email sent.")
+    else:
+        mail.Save()  # saves to Drafts for you to review first
+        print("Draft saved in Outlook.")
 
 
 if __name__ == "__main__":
-    # Replace this with your actual FP dataframe (e.g. FP.head(20) from your notebook)
+    # Replace with your actual FP dataframe (e.g. FP.head(20) from your notebook)
     FP = pd.DataFrame({
         "FP": [4226.0],
         "Mc_After_8_5_2026": [0.0]
