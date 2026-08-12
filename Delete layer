@@ -1,162 +1,150 @@
 """
-Build Texas Census Tract Population Density Tier Table
----------------------------------------------------------
-Pulls ACS 5-Year population estimates + TIGER/Line tract boundaries
-for Texas, calculates population density per square mile, and buckets
-every tract into urban / medium / rural tiers.
+Sample pattern: narrow geo-join first, widen with extra columns after.
 
-Requirements:
-    pip install requests pandas geopandas
+The core idea:
+  1. Build the smallest possible "candidates" table -- just the columns
+     needed for the grid-bucket + haversine distance calc (meterno,
+     esi_loc, removal date, lat, lon, grid cells). NOT hardware model,
+     NOT workedby, NOT anything else yet.
+  2. Join that narrow table to population, apply the grid-bucket filter
+     AND a real radius/distance cutoff. This keeps row counts small at
+     the one step that's actually expensive (the many-to-many geo join).
+  3. Only AFTER that filtered result exists, join back to asset /
+     work_orders to attach the extra descriptive columns you want in
+     the final output. Joining wide tables happens last, on a small
+     row count, instead of first, on a huge one.
 
-Usage:
-    1. Set your Census API key below (or set it as an environment
-       variable CENSUS_API_KEY instead of hardcoding it).
-    2. Run: python build_tx_density_tiers.py
-    3. Outputs:
-       - tx_tract_density_tiers.csv      (no geometry, lightweight)
-       - tx_tract_density_tiers.geojson  (full polygons, for mapping)
+Replace table/column names with your actual schema as needed.
 """
 
-import os
-import json
-import zipfile
-import io
-import requests
-import pandas as pd
-import geopandas as gpd
+import duckdb
 
-# ---------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------
+con = duckdb.connect()
+con.register("prev_meter_history", prev_meter_history)
+con.register("location_df", location_df)
+con.register("population", population)
+con.register("asset", asset)
+con.register("work_orders", work_orders)
 
-# Recommended: set this as an environment variable instead of hardcoding
-#   Windows (cmd):    set CENSUS_API_KEY=your_key_here
-#   Windows (PowerShell): $env:CENSUS_API_KEY="your_key_here"
-#   Mac/Linux:         export CENSUS_API_KEY=your_key_here
-CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "PASTE_YOUR_KEY_HERE")
+WALK_RADIUS_MILES = 1.0   # <-- set to whatever your actual radius of interest is
+GRID_SIZE = 0.02          # must be >= WALK_RADIUS_MILES in degrees-equivalent;
+                           # 0.02 deg ~= 1.4 miles, safely covers a 1-mile radius
 
-ACS_YEAR = 2024  # vintage 2024 = 2020-2024 ACS 5-year estimates (most recent as of Aug 2026)
-STATE_FIPS = "48"  # Texas
+query = f"""
+WITH params AS (
+    SELECT {WALK_RADIUS_MILES} AS walk_radius_miles,
+           {GRID_SIZE} AS grid_size
+),
 
-# Boundary vintage matched to the ACS data vintage above (both "2024")
-TIGER_URL = f"https://www2.census.gov/geo/tiger/TIGER2024/TRACT/tl_2024_{STATE_FIPS}_tract.zip"
-ACS_URL = (
-    f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
-    f"?get=NAME,B01003_001E&for=tract:*&in=state:{STATE_FIPS}&key={CENSUS_API_KEY}"
+-- ---------------------------------------------------------------
+-- STEP 1: narrow "hist" table -- geo columns only, nothing wide yet
+-- ---------------------------------------------------------------
+hist_narrow AS (
+    SELECT DISTINCT
+        hist.meterno,
+        hist.esi_loc,
+        CAST(hist.meter_removal_date AS DATE) AS meter_removal_date,
+        loc.latitude,
+        loc.longitude,
+        FLOOR(loc.latitude  / (SELECT grid_size FROM params)) AS lat_grid,
+        FLOOR(loc.longitude / (SELECT grid_size FROM params)) AS lon_grid
+    FROM prev_meter_history hist
+    JOIN location_df loc
+        ON loc.esi_loc = hist.esi_loc
+    WHERE hist.CURRENT_METER_FLAG = 'CURRENT_METER'
+      AND loc.latitude IS NOT NULL
+      AND loc.longitude IS NOT NULL
+),
+
+-- ---------------------------------------------------------------
+-- STEP 2: narrow "population" (candidate B meters) table
+-- ---------------------------------------------------------------
+pop_narrow AS (
+    SELECT DISTINCT
+        pop.meterno,
+        CAST(pop.meter_removal_date AS DATE) AS meter_removal_date,
+        pop.latitude,
+        pop.longitude,
+        FLOOR(pop.latitude  / (SELECT grid_size FROM params)) AS lat_grid,
+        FLOOR(pop.longitude / (SELECT grid_size FROM params)) AS lon_grid
+    FROM population pop
+    WHERE pop.latitude IS NOT NULL
+      AND pop.longitude IS NOT NULL
+),
+
+-- expand hist_narrow to its own grid cell + 8 neighbors, so points near
+-- a cell boundary still find true neighbors in the adjacent cell
+hist_expanded AS (
+    SELECT
+        h.*,
+        h.lat_grid + offset_lat AS search_lat_grid,
+        h.lon_grid + offset_lon AS search_lon_grid
+    FROM hist_narrow h
+    CROSS JOIN (
+        SELECT unnest([-1,-1,-1, 0,0,0, 1,1,1]) AS offset_lat,
+               unnest([-1, 0, 1,-1,0,1,-1,0,1]) AS offset_lon
+    ) offsets
+),
+
+-- ---------------------------------------------------------------
+-- STEP 3: cheap equality join on grid cells, THEN real distance
+--         filter -- this is the step that was exploding before
+-- ---------------------------------------------------------------
+matched_narrow AS (
+    SELECT * FROM (
+        SELECT
+            h.meterno       AS meter_a,
+            h.esi_loc       AS location_a,
+            h.meter_removal_date AS removal_date_a,
+            h.latitude      AS latitude_a,
+            h.longitude     AS longitude_a,
+            p.meterno       AS meter_b,
+            p.meter_removal_date AS removal_date_b,
+            p.latitude      AS latitude_b,
+            p.longitude     AS longitude_b,
+            3959 * 2 * ASIN(SQRT(
+                POWER(SIN(RADIANS(p.latitude - h.latitude) / 2), 2)
+                + COS(RADIANS(h.latitude)) * COS(RADIANS(p.latitude))
+                * POWER(SIN(RADIANS(p.longitude - h.longitude) / 2), 2)
+            )) AS distance_miles
+        FROM hist_expanded h
+        JOIN pop_narrow p
+            ON p.lat_grid = h.search_lat_grid
+           AND p.lon_grid = h.search_lon_grid
+           AND (p.meter_removal_date >= h.meter_removal_date OR p.meter_removal_date IS NULL)
+           AND p.meterno <> h.meterno
+    )
+    -- THE MISSING PIECE: actual radius cutoff, applied right here,
+    -- before this ever gets wide or gets deduplicated/sorted
+    WHERE distance_miles <= (SELECT walk_radius_miles FROM params)
+),
+
+-- de-duplicate now, on a NARROW set of key columns only (not 15+ wide
+-- columns) -- much cheaper than DISTINCT on the full wide row later
+matched_dedup AS (
+    SELECT DISTINCT meter_a, location_a, removal_date_a, latitude_a, longitude_a,
+                     meter_b, removal_date_b, latitude_b, longitude_b, distance_miles
+    FROM matched_narrow
 )
 
-OUTPUT_DIR = "."  # change if you want output written elsewhere
-SHAPEFILE_DIR = "tx_tracts_shapefile"
+-- ---------------------------------------------------------------
+-- STEP 4: NOW widen -- join back to asset / work_orders, only on
+--         the small, already-filtered result set
+-- ---------------------------------------------------------------
+SELECT
+    m.*,
+    hw.revisionid AS hardware_model,
+    wo.workedby,
+    wo.wr_workeddate
+FROM matched_dedup m
+LEFT JOIN asset hw
+    ON hw.meterno = m.meter_a
+LEFT JOIN work_orders wo
+    ON TRIM(wo.esi_loc) = m.location_a
+   AND CAST(wo.meter_removal_date AS DATE) = m.removal_date_a
+   AND wo.workedby <> 'XAIUSER'
+ORDER BY m.meter_a, m.distance_miles
+"""
 
-SQM_PER_SQMI = 2_589_988.11
-
-# Density thresholds (people per square mile) used to bucket tracts.
-# Adjust these if your own knowledge of the territories suggests
-# different cutoffs.
-RURAL_MAX = 500
-MEDIUM_MAX = 3000
-
-
-# ---------------------------------------------------------------------
-# STEP 1: Pull population data from the Census ACS API
-# ---------------------------------------------------------------------
-
-def fetch_population():
-    print("Fetching population data from Census API...")
-    resp = requests.get(ACS_URL)
-    resp.raise_for_status()
-
-    # The Census API returns an HTML error page (not JSON) on bad key /
-    # bad request, so catch that explicitly with a clear message.
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        raise RuntimeError(
-            "Census API did not return valid JSON. This usually means "
-            "the API key is invalid, unactivated, or malformed. "
-            "Response preview:\n" + resp.text[:300]
-        )
-
-    df = pd.DataFrame(data[1:], columns=data[0])
-    df["GEOID"] = df["state"] + df["county"] + df["tract"]
-    df["population"] = pd.to_numeric(df["B01003_001E"])
-    return df[["GEOID", "NAME", "population"]]
-
-
-# ---------------------------------------------------------------------
-# STEP 2: Download and unzip TIGER/Line tract boundary shapefile
-# ---------------------------------------------------------------------
-
-def fetch_tract_boundaries():
-    print("Downloading TIGER/Line tract boundaries...")
-    resp = requests.get(TIGER_URL)
-    resp.raise_for_status()
-
-    os.makedirs(SHAPEFILE_DIR, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        z.extractall(SHAPEFILE_DIR)
-
-    shp_path = os.path.join(SHAPEFILE_DIR, f"tl_2024_{STATE_FIPS}_tract.shp")
-    tracts = gpd.read_file(shp_path)
-    return tracts[["GEOID", "ALAND", "AWATER", "INTPTLAT", "INTPTLON", "geometry"]]
-
-
-# ---------------------------------------------------------------------
-# STEP 3: Merge, calculate density, classify tiers
-# ---------------------------------------------------------------------
-
-def classify_density(density):
-    if density < RURAL_MAX:
-        return "rural"
-    elif density < MEDIUM_MAX:
-        return "medium"
-    else:
-        return "urban"
-
-
-def build_density_table():
-    pop_df = fetch_population()
-    tracts = fetch_tract_boundaries()
-
-    merged = tracts.merge(pop_df, on="GEOID", how="inner")
-    print(f"Merged {len(merged)} tracts (population rows: {len(pop_df)}, "
-          f"boundary rows: {len(tracts)})")
-
-    merged["land_sqmi"] = merged["ALAND"] / SQM_PER_SQMI
-    merged["pop_density_sqmi"] = merged["population"] / merged["land_sqmi"]
-
-    # Avoid inf/div-by-zero on essentially-zero-land tracts (e.g. pure water)
-    merged.loc[merged["land_sqmi"] < 0.01, "pop_density_sqmi"] = 0
-
-    valid = merged[merged["land_sqmi"] >= 0.01].copy()
-    valid["density_tier"] = valid["pop_density_sqmi"].apply(classify_density)
-
-    return valid
-
-
-# ---------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------
-
-if __name__ == "__main__":
-    if CENSUS_API_KEY == "PASTE_YOUR_KEY_HERE":
-        raise SystemExit(
-            "No Census API key set. Either set the CENSUS_API_KEY "
-            "environment variable, or edit this script and paste your "
-            "key into the CENSUS_API_KEY variable at the top."
-        )
-
-    table = build_density_table()
-
-    print(table["density_tier"].value_counts())
-    print(table.groupby("density_tier")["pop_density_sqmi"]
-          .agg(["min", "median", "max", "count"]))
-
-    csv_path = os.path.join(OUTPUT_DIR, "tx_tract_density_tiers.csv")
-    geojson_path = os.path.join(OUTPUT_DIR, "tx_tract_density_tiers.geojson")
-
-    table.drop(columns="geometry").to_csv(csv_path, index=False)
-    table.to_file(geojson_path, driver="GeoJSON")
-
-    print(f"\nSaved: {csv_path}")
-    print(f"Saved: {geojson_path}")
+result_df = con.execute(query).df()
+print(f"{len(result_df):,} rows")
