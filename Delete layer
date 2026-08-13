@@ -1,69 +1,30 @@
-import pandas as pd
-import oracledb  # or: import cx_Oracle as oracledb
+from sqlalchemy import text
 
-# ---------------------------------------------------------------
-# 1. Get the meter list out of your dataframe
-# ---------------------------------------------------------------
-meters = (
-    df["meterno"]
-    .dropna()
-    .astype(str)          # match the column type in Oracle
-    .str.strip()
-    .unique()
-    .tolist()
-)
-print(f"{len(meters):,} unique meters")
-
-# ---------------------------------------------------------------
-# 2. Connection
-# ---------------------------------------------------------------
-conn = oracledb.connect(
-    user="USERNAME",
-    password="PASSWORD",
-    dsn="HOST:PORT/SERVICE_NAME",
-)
-
-# ---------------------------------------------------------------
-# 3. Query template - {in_clause} gets swapped per batch
-# ---------------------------------------------------------------
-SQL = """
-SELECT a.assetnum,
-       a.meterno,
-       s.assetattrid,
-       s.alnvalue,
-       s.numvalue,
-       s.changedate
-  FROM MXRADS.VW_ASSET a
-  JOIN MXRADS.VW_ASSETSPEC s
-    ON s.assetnum = a.assetnum
- WHERE a.meterno IN ({in_clause})
-"""
-
-# ---------------------------------------------------------------
-# 4. Batch loop (Oracle caps IN lists at 1000)
-# ---------------------------------------------------------------
 BATCH = 900
 frames = []
 
-with conn.cursor() as cur:
+with ods_alchemy_engine.connect() as conn:
     for i in range(0, len(meters), BATCH):
         chunk = meters[i : i + BATCH]
+        if not chunk:
+            continue
 
-        # named binds: :m0, :m1, ... :m899
         names = [f"m{j}" for j in range(len(chunk))]
         in_clause = ", ".join(f":{n}" for n in names)
         binds = dict(zip(names, chunk))
 
-        cur.execute(SQL.format(in_clause=in_clause), binds)
+        stmt = text(query.format(meters=in_clause))
+        res = conn.execute(stmt, binds)
 
-        cols = [c[0].lower() for c in cur.description]
-        rows = cur.fetchall()
+        rows = res.fetchall()
+        cols = [c.upper() for c in res.keys()]
+
         if rows:
             frames.append(pd.DataFrame(rows, columns=cols))
 
         print(f"batch {i // BATCH + 1}: {len(rows):,} rows")
 
-conn.close()
+ods_alchemy_engine.dispose()
 
 result = (
     pd.concat(frames, ignore_index=True)
