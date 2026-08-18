@@ -1,34 +1,96 @@
-from sqlalchemy import text
+def write_orders(df):
 
-BATCH = 900
-frames = []
+    orders_df = df[
+        [
+            "WR_ID",
+            "FA_ID",
+            "WR_STATUS_UPD_DTTM",
+            "COMMENTS",
+            "INSTRUCTIONS"
+        ]
+    ].copy()
 
-with ods_alchemy_engine.connect() as conn:
-    for i in range(0, len(meters), BATCH):
-        chunk = meters[i : i + BATCH]
-        if not chunk:
-            continue
+    orders_df = orders_df.drop_duplicates(
+        subset=["WR_ID", "FA_ID"]
+    )
 
-        names = [f"m{j}" for j in range(len(chunk))]
-        in_clause = ", ".join(f":{n}" for n in names)
-        binds = dict(zip(names, chunk))
+    with db.connect() as conn:
+        conn.register("orders_df", orders_df)
 
-        stmt = text(query.format(meters=in_clause))
-        res = conn.execute(stmt, binds)
+        try:
+            conn.execute("""
+                INSERT INTO orders (
+                    wr_id,
+                    fa_id,
+                    wr_status_upd_dttm,
+                    comments,
+                    instructions
+                )
 
-        rows = res.fetchall()
-        cols = [c.upper() for c in res.keys()]
+                SELECT
+                    WR_ID,
+                    FA_ID,
+                    WR_STATUS_UPD_DTTM,
+                    COMMENTS,
+                    INSTRUCTIONS
 
-        if rows:
-            frames.append(pd.DataFrame(rows, columns=cols))
+                FROM orders_df src
 
-        print(f"batch {i // BATCH + 1}: {len(rows):,} rows")
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM orders tgt
+                    WHERE tgt.wr_id = src.WR_ID
+                      AND tgt.fa_id = src.FA_ID
+                );
+            """)
 
-ods_alchemy_engine.dispose()
+        finally:
+            conn.unregister("orders_df")
 
-result = (
-    pd.concat(frames, ignore_index=True)
-    if frames
-    else pd.DataFrame()
-)
-print(f"total: {len(result):,} rows")
+
+def write_preprocessed_orders(df):
+
+    cleaned_df = df[
+        [
+            "WR_ID",
+            "FA_ID",
+            "cleaned_comments",
+            "cleaned_instructions"
+        ]
+    ].copy()
+
+    cleaned_df = cleaned_df.drop_duplicates(
+        subset=["WR_ID", "FA_ID"]
+    )
+
+    with db.connect() as conn:
+        conn.register("cleaned_df", cleaned_df)
+
+        try:
+            conn.execute("""
+                INSERT INTO cleaned_text (
+                    order_id,
+                    cleaned_comments,
+                    cleaned_instructions
+                )
+
+                SELECT
+                    o.order_id,
+                    c.cleaned_comments,
+                    c.cleaned_instructions
+
+                FROM cleaned_df c
+
+                INNER JOIN orders o
+                    ON o.wr_id = c.WR_ID
+                   AND o.fa_id = c.FA_ID
+
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM cleaned_text ct
+                    WHERE ct.order_id = o.order_id
+                );
+            """)
+
+        finally:
+            conn.unregister("cleaned_df")
