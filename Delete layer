@@ -1,41 +1,62 @@
-def get_orders(df, tables):
+def write_preprocessed_orders(df, tables):
 
-    orders_df = df[
+    df = df.rename(
+        columns={"cleaned_comment": "cleaned_comments"}
+    )
+
+    cleaned_df = df[
         [
             "WR_ID",
             "FA_ID",
-            "WR_STATUS_UPD_DTTM",
-            "COMMENTS",
-            "INSTRUCTIONS"
+            "cleaned_comments",
+            "cleaned_instructions",
         ]
     ].copy()
 
-    orders_df.columns = orders_df.columns.str.lower()
+    cleaned_df.columns = cleaned_df.columns.str.lower()
 
-    # Get orders already in the database
-    existing_orders = tables.orders.select_all()
-    existing_orders.columns = existing_orders.columns.str.lower()
+    # Get order_id from orders table
+    orders_lookup = tables.orders.select_all()
+    orders_lookup.columns = orders_lookup.columns.str.lower()
 
-    # Find only NEW wr_id + fa_id combinations
-    new_orders = orders_df.merge(
-        existing_orders[["wr_id", "fa_id"]],
+    cleaned_df = cleaned_df.merge(
+        orders_lookup[["order_id", "wr_id", "fa_id"]],
         on=["wr_id", "fa_id"],
         how="left",
-        indicator=True
     )
 
-    new_orders = new_orders[
-        new_orders["_merge"] == "left_only"
+    # Keep only columns belonging to cleaned_text
+    cleaned_df = cleaned_df[
+        [
+            "order_id",
+            "cleaned_comments",
+            "cleaned_instructions",
+        ]
+    ]
+
+    # Get rows already saved in cleaned_text
+    existing_cleaned = tables.cleaned_text.select_all()
+    existing_cleaned.columns = existing_cleaned.columns.str.lower()
+
+    # Keep only order_ids that are NOT already in cleaned_text
+    new_cleaned = cleaned_df.merge(
+        existing_cleaned[["order_id"]],
+        on="order_id",
+        how="left",
+        indicator=True,
+    )
+
+    new_cleaned = new_cleaned[
+        new_cleaned["_merge"] == "left_only"
     ].drop(columns="_merge")
 
-    # Convert only new orders to records
-    orders_data = new_orders.to_dict(orient="records")
+    cleaned_data = new_cleaned.to_dict(orient="records")
 
-    if orders_data:
-        tables.orders.insert(
-            tables.orders.prep_insert_data(orders_data)
-        )
+    # Only insert if there is actually something new
+    if cleaned_data:
+        tables.cleaned_text.insert(cleaned_data)
 
-    print(f"{len(orders_data):,} new rows successfully saved to orders table")
-
-
+    print(
+        f"{len(cleaned_data):,} new rows successfully saved "
+        "to cleaned_text table"
+    )
