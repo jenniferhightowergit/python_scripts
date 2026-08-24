@@ -1,62 +1,157 @@
-def write_preprocessed_orders(df, tables):
+# ============================================================
+# CREATE SHARED DRIVE DUCKDB DATABASE
+# Run this ONCE to initialize the POC database
+# ============================================================
 
-    df = df.rename(
-        columns={"cleaned_comment": "cleaned_comments"}
+from pathlib import Path
+from dotenv import load_dotenv
+
+from amslib.database.orm import (
+    DatabaseOperator,
+    Tables
+)
+
+from settings import get_settings
+
+
+# ------------------------------------------------------------
+# 1. LOAD EXISTING SETTINGS
+# ------------------------------------------------------------
+
+load_dotenv("../data/config/local.env", override=True)
+
+settings = get_settings()
+
+
+# ------------------------------------------------------------
+# 2. SHARED DRIVE DATABASE LOCATION
+# ------------------------------------------------------------
+
+SHARED_DB_PATH = Path(
+    r"\\YOUR_SERVER\YOUR_SHARED_FOLDER\nlp_poc\work_orders.duckdb"
+)
+
+# Make sure the folder already exists / is accessible
+if not SHARED_DB_PATH.parent.exists():
+    raise FileNotFoundError(
+        f"Shared drive folder does not exist or cannot be accessed:\n"
+        f"{SHARED_DB_PATH.parent}"
     )
 
-    cleaned_df = df[
-        [
-            "WR_ID",
-            "FA_ID",
-            "cleaned_comments",
-            "cleaned_instructions",
-        ]
-    ].copy()
+print(f"Shared DB location:\n{SHARED_DB_PATH}")
 
-    cleaned_df.columns = cleaned_df.columns.str.lower()
+# ------------------------------------------------------------
+# 3. POINT EXISTING SETTINGS TO SHARED DUCKDB
+# ------------------------------------------------------------
 
-    # Get order_id from orders table
-    orders_lookup = tables.orders.select_all()
-    orders_lookup.columns = orders_lookup.columns.str.lower()
+settings.db.uri = SHARED_DB_PATH
 
-    cleaned_df = cleaned_df.merge(
-        orders_lookup[["order_id", "wr_id", "fa_id"]],
-        on=["wr_id", "fa_id"],
-        how="left",
-    )
+print(f"Database URI: {settings.db.uri}")
 
-    # Keep only columns belonging to cleaned_text
-    cleaned_df = cleaned_df[
-        [
-            "order_id",
-            "cleaned_comments",
-            "cleaned_instructions",
-        ]
+settings.db.uri = str(SHARED_DB_PATH)
+
+
+# ------------------------------------------------------------
+# 4. INITIALIZE DATABASE OPERATOR
+# ------------------------------------------------------------
+
+db = DatabaseOperator(
+    db_model=settings.db,
+    sql_dir=settings.sql_dir
+)
+
+# ------------------------------------------------------------
+# 5. CREATE / OPEN DATABASE FILE
+# ------------------------------------------------------------
+
+if not Path(settings.db.uri).is_file():
+
+    with db.connect() as con:
+        pass
+
+    print(f"Created database:\n{settings.db.uri}")
+
+else:
+    print(f"Database already exists:\n{settings.db.uri}")
+
+
+# ------------------------------------------------------------
+# 7. EXECUTE SCHEMA
+# ------------------------------------------------------------
+
+db.execute_script(sql)
+
+print("Shared DuckDB schema created successfully.")
+
+
+# ------------------------------------------------------------
+# 8. REFLECT TABLES
+# ------------------------------------------------------------
+
+tables_config = {
+    "tables": [
+        {
+            "name": "orders",
+            "schema": None,
+            "reflect": True
+        },
+        {
+            "name": "cleaned_text",
+            "schema": None,
+            "reflect": True
+        },
+        {
+            "name": "category",
+            "schema": None,
+            "reflect": True
+        },
+        {
+            "name": "order_category",
+            "schema": None,
+            "reflect": True
+        }
     ]
+}
 
-    # Get rows already saved in cleaned_text
-    existing_cleaned = tables.cleaned_text.select_all()
-    existing_cleaned.columns = existing_cleaned.columns.str.lower()
 
-    # Keep only order_ids that are NOT already in cleaned_text
-    new_cleaned = cleaned_df.merge(
-        existing_cleaned[["order_id"]],
-        on="order_id",
-        how="left",
-        indicator=True,
-    )
+tables = Tables(
+    db_model=settings.db,
+    sql_dir=settings.sql_dir,
+    tables_config=tables_config,
+    custom_objects=[]
+)
 
-    new_cleaned = new_cleaned[
-        new_cleaned["_merge"] == "left_only"
-    ].drop(columns="_merge")
 
-    cleaned_data = new_cleaned.to_dict(orient="records")
 
-    # Only insert if there is actually something new
-    if cleaned_data:
-        tables.cleaned_text.insert(cleaned_data)
+# ------------------------------------------------------------
+# 9. VERIFY
+# ------------------------------------------------------------
 
-    print(
-        f"{len(cleaned_data):,} new rows successfully saved "
-        "to cleaned_text table"
-    )
+print("Orders:")
+print(tables.orders.peek())
+
+print("\nCleaned Text:")
+print(tables.cleaned_text.peek())
+
+print("\nCategory:")
+print(tables.category.peek())
+
+print("\nOrder Category:")
+print(tables.order_category.peek())
+
+print("\nREADY.")
+print(f"Shared database: {settings.db.uri}")
+
+
+load_dotenv("../data/config/local.env", override=True)
+settings = get_settings()
+
+settings.db.uri = str(
+    Path(r"\\YOUR_SERVER\YOUR_SHARED_FOLDER\nlp_poc\work_orders.duckdb")
+)
+
+db = DatabaseOperator(
+    db_model=settings.db,
+    sql_dir=settings.sql_dir
+)
+
