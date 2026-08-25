@@ -1,5 +1,10 @@
-import shutil
-local_db = r"C:\Users\UIX9\Documents\Gitlab Repos\aoa_svco\data\database\dev.db"
+import duckdb
+
 shared_db = r"\\wvamsappprd0001.corp.oncor.com\AMS2\T2 AMS OPS\Use Cases\NLP_Work_Orders\Work_Orders_CommentClassifier_POC.duckdb"
-shutil.copy2(local_db, shared_db)
-print("copied")
+con = duckdb.connect(shared_db, read_only=True)
+
+print(con.execute("SHOW TABLES").fetchall())
+print(con.execute("SELECT COUNT(*) FROM orders").fetchone())
+print(con.execute("SELECT COUNT(*) FROM cleaned_text").fetchone())
+
+con.execute("SELECT * FROM orders LIMIT 5").df()
