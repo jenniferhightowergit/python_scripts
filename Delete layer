@@ -1,1 +1,43 @@
-nnn
+
+import os
+
+shared_root = r"\\eucprdnasa01\u_support\Greg Automation Scripts"
+
+for root, dirs, files in os.walk(shared_root):
+
+    for file in files:
+
+        # Search filenames
+        if any(term in file.lower() for term in [
+            "password",
+            "config",
+            "credential",
+            "secret",
+            "customlogger"
+        ]):
+            print("FILE:", os.path.join(root, file))
+
+        # Search contents of Python files
+        if file.lower().endswith(".py"):
+            path = os.path.join(root, file)
+
+            try:
+                with open(
+                    path,
+                    "r",
+                    encoding="utf-8",
+                    errors="ignore"
+                ) as f:
+                    text = f.read().lower()
+
+                if any(term in text for term in [
+                    "from config import password",
+                    "password =",
+                    "password=",
+                    "customlogger",
+                    "credential"
+                ]):
+                    print("CONTENT:", path)
+
+            except Exception as e:
+                pass
