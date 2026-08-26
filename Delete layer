@@ -1,10 +1,163 @@
-import duckdb
+"""
+Daily backfill for the work-orders data intake pipeline.
 
-shared_db = r"\\wvamsappprd0001.corp.oncor.com\AMS2\T2 AMS OPS\Use Cases\NLP_Work_Orders\Work_Orders_CommentClassifier_POC.duckdb"
-con = duckdb.connect(shared_db, read_only=True)
+Behavior:
+  1. Determine the 30-day retention window ending at the current hour.
+  2. Find which hourly windows inside that range already have data.
+  3. Group the missing hours into contiguous runs and pull only those.
+  4. Optionally purge rows that have aged out of the retention window.
 
-print(con.execute("SHOW TABLES").fetchall())
-print(con.execute("SELECT COUNT(*) FROM orders").fetchone())
-print(con.execute("SELECT COUNT(*) FROM cleaned_text").fetchone())
+Safe to run repeatedly -- already-loaded windows are skipped.
+"""
 
-con.execute("SELECT * FROM orders LIMIT 5").df()
+import logging
+from datetime import datetime
+
+import pandas as pd
+
+# --- Configuration -----------------------------------------------------------
+
+RETENTION_DAYS = 30
+WINDOW_SIZE = "1h"          # size of each pipeline pull
+DTTM_COL = "wr_status_upd_dttm"
+PURGE_OLD_ROWS = False      # set True once you've confirmed the backfill works
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+)
+log = logging.getLogger("backfill")
+
+
+# --- Window discovery --------------------------------------------------------
+
+def get_expected_windows(now=None):
+    """Every hourly window boundary in the retention range."""
+    now = now or pd.Timestamp.now()
+    end = now.floor(WINDOW_SIZE)
+    start = end - pd.Timedelta(days=RETENTION_DAYS)
+    return pd.date_range(start, end, freq=WINDOW_SIZE)
+
+
+def get_loaded_windows(tables, start, end):
+    """
+    Hourly buckets that already contain at least one row.
+
+    Returns a DatetimeIndex of window start times.
+    """
+    sql = f"""
+    select distinct
+        date_trunc('hour', {DTTM_COL}) as window_start
+    from orders
+    where {DTTM_COL} >= '{start}'
+      and {DTTM_COL} <  '{end}'
+    """
+    df = tables.select(sql)
+    if df.empty:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex(pd.to_datetime(df["window_start"])).sort_values()
+
+
+def group_consecutive(missing):
+    """
+    Collapse a sorted DatetimeIndex of missing hours into (t1, t2) ranges.
+
+    Twelve consecutive missing hours become one 12-hour pull rather than
+    twelve separate ones.
+    """
+    if len(missing) == 0:
+        return []
+
+    step = pd.Timedelta(WINDOW_SIZE)
+    ranges = []
+    run_start = missing[0]
+    prev = missing[0]
+
+    for ts in missing[1:]:
+        if ts - prev > step:
+            ranges.append((run_start, prev + step))
+            run_start = ts
+        prev = ts
+
+    ranges.append((run_start, prev + step))
+    return ranges
+
+
+# --- Retention ---------------------------------------------------------------
+
+def purge_expired(tables, cutoff):
+    """Delete rows older than the retention cutoff."""
+    for table in ("orders", "cleaned_text"):
+        sql = f"delete from {table} where {DTTM_COL} < '{cutoff}'"
+        try:
+            tables.select(sql)
+            log.info("Purged rows before %s from %s", cutoff, table)
+        except Exception:
+            log.exception("Purge failed on %s -- continuing", table)
+
+
+# --- Main --------------------------------------------------------------------
+
+def run_backfill(tables, run_pipeline, now=None, dry_run=False):
+    """
+    tables:       your Tables object
+    run_pipeline: callable (tables, t1, t2) -> None
+                  i.e. run_data_intake_pipeline
+    dry_run:      log what would be pulled without pulling it
+    """
+    expected = get_expected_windows(now)
+    start, end = expected[0], expected[-1]
+    log.info("Retention window: %s -> %s (%d hourly slots)",
+             start, end, len(expected))
+
+    loaded = get_loaded_windows(tables, start, end)
+    log.info("Already loaded: %d windows", len(loaded))
+
+    missing = expected.difference(loaded)
+    if len(missing) == 0:
+        log.info("Nothing to backfill -- database is current.")
+        return []
+
+    ranges = group_consecutive(missing)
+    log.info("Missing %d windows across %d contiguous range(s)",
+             len(missing), len(ranges))
+
+    if dry_run:
+        for t1, t2 in ranges:
+            log.info("  [dry run] would pull %s -> %s", t1, t2)
+        return ranges
+
+    completed, failed = [], []
+    for i, (t1, t2) in enumerate(ranges, 1):
+        log.info("[%d/%d] Pulling %s -> %s", i, len(ranges), t1, t2)
+        try:
+            run_pipeline(
+                tables,
+                t1.strftime("%Y-%m-%d %H:%M:%S"),
+                t2.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            completed.append((t1, t2))
+        except Exception:
+            log.exception("  FAILED %s -> %s -- continuing", t1, t2)
+            failed.append((t1, t2))
+
+    log.info("Done. %d succeeded, %d failed.", len(completed), len(failed))
+
+    if PURGE_OLD_ROWS and not failed:
+        purge_expired(tables, start)
+    elif PURGE_OLD_ROWS:
+        log.warning("Skipping purge -- some windows failed this run.")
+
+    return completed
+
+
+if __name__ == "__main__":
+    # Wire these up to your existing setup:
+    #
+    #   from data_intake.pipeline import run_data_intake_pipeline
+    #   tables = Tables(db_model=settings.db, sql_dir=settings.sql_dir, ...)
+    #
+    #   run_backfill(tables, run_data_intake_pipeline, dry_run=True)
+    #
+    # Run once with dry_run=True to see the ranges before pulling anything.
+    pass
