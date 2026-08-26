@@ -1,270 +1,49 @@
-"""
-Data Intake Backfill / Retention
-=================================
+import duckdb
+scratch = r"C:\Users\UIX9\Documents\Gitlab Repos\aoa_svco\data\database\dev_scratch.db"
+con = duckdb.connect(scratch, read_only=True)
+print(con.execute("""
+    select count(*) as total,
+           min(wr_status_upd_dttm) as oldest,
+           max(wr_status_upd_dttm) as newest
+    from orders
+""").df())
+con.close()
 
-Corrected version of the original draft.
 
-Every change from the original is marked with a  # CHANGED:  comment
-explaining what was different and why.
 
-Design assumption for this POC: work order records are IMMUTABLE
-once worked -- a record does not change after it is completed.
-If that turns out to be false, the retention/backfill logic needs
-a revisit (see NOTES at the bottom).
-"""
+
+
+
+
+
+print(settings.db.uri)   # must say dev_scratch.db
+
+
+
+
+
+
 
 import logging
-import time
+logging.basicConfig(level=logging.INFO, force=True)
+
+manage_retention(settings, tables, dry_run=True)
+
+
+
 
 import pandas as pd
+cutoff = pd.Timestamp.now().floor("1h") - pd.Timedelta("6h")
+print("cutoff:", cutoff)
 
-from data_intake.pipeline import run_data_intake_pipeline
-
-log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------
-# RETENTION
-# ---------------------------------------------------------------------
-
-def manage_retention(settings, tables, dry_run=True):
-    """
-    Delete records older than the retention period.
-
-    CHANGED: the comparison operator was flipped.
-        original:  delete from orders where wr_status_upd_dttm > :min_dttm_allowed
-        corrected: delete from orders where wr_status_upd_dttm < :min_dttm_allowed
-
-    The original deletes everything NEWER than the cutoff, which wipes
-    recent data and keeps the old. The log message in the original said
-    "<" while the SQL said ">", so this was a typo.
-
-    CHANGED: added `tables` as an explicit parameter. The original
-    relied on `tables` existing as a global, which breaks when this is
-    imported as a module.
-
-    CHANGED: added dry_run, defaulting to True. Deletes are hard to undo,
-    so this must be opted into deliberately.
-    """
-    retention = pd.Timedelta(settings.etl.retention.get("orders"))
-
-    # CHANGED: settings.etl.window_hours -> settings.etl.window_size
-    # The original used window_hours here and window_size elsewhere.
-    # Only one of them exists; using it consistently.
-    min_dttm_allowed = (
-        pd.Timestamp.now().floor(settings.etl.window_size) - retention
-    )
-
-    if dry_run:
-        count_sql = (
-            "select count(*) as n from orders "
-            "where wr_status_upd_dttm < :min_dttm_allowed"
-        )
-        df = tables.select(
-            count_sql, params=dict(min_dttm_allowed=min_dttm_allowed)
-        )
-        log.info(
-            "[dry run] would delete %s rows older than %s",
-            df["n"][0], min_dttm_allowed,
-        )
-        return
-
-    sql = "delete from orders where wr_status_upd_dttm < :min_dttm_allowed"
-    tables.execute(sql, params=dict(min_dttm_allowed=min_dttm_allowed))
-    log.info("Deleted records where wr_status_upd_dttm < %s", min_dttm_allowed)
-
-    # NOTE: cleaned_text is not purged here. It has no date column of its
-    # own -- it joins back to orders on order_id. Ask team lead whether
-    # orphaned cleaned_text rows should also be removed.
+tables.select(
+    "select count(*) as n from orders where wr_status_upd_dttm < :cutoff",
+    params=dict(cutoff=cutoff),
+)
 
 
-# ---------------------------------------------------------------------
-# FIND WHAT'S MISSING
-# ---------------------------------------------------------------------
-
-def get_missing_windows(settings, tables):
-    """
-    Return a dataframe of (t1, t2) windows that need to be filled.
-
-    CHANGED: the hardcoded now_dttm and max_dttm (both marked TODO in the
-    original) are now read from the database.
-
-    CHANGED: max_dttm.ceil(...) -> .floor(...)
-    ceil rounds UP to the next window boundary. If the newest record is
-    08:30 and windows are hourly, ceil starts the backfill at 09:00 --
-    so the partial 08:00-09:00 hour is never re-pulled and anything
-    arriving later in that hour is silently lost. floor re-pulls that
-    partial hour, and the existing left_only guard in get_orders /
-    write_preprocessed_orders absorbs the overlapping rows.
-
-    CHANGED: added `tables` as an explicit parameter (see above).
-    """
-    window_size = settings.etl.window_size
-    retention = pd.Timedelta(settings.etl.retention.get("orders"))
-
-    sql = """
-    select
-        min(wr_status_upd_dttm) as min_dttm,
-        max(wr_status_upd_dttm) as max_dttm
-    from orders
-    """
-    df = tables.select(sql)
-
-    now_floor = pd.Timestamp.now().floor(window_size)
-
-    if df.empty or pd.isna(df["max_dttm"][0]):
-        # Cold start: nothing in the table, so go back a full retention
-        # period.
-        start = (now_floor - retention).floor(window_size)
-    else:
-        # CHANGED: original had `max_dttm = df['min_dttm'][0]` -- reading
-        # the MIN column into max_dttm. That would restart the backfill
-        # from the oldest record every single run and re-pull the entire
-        # retention window daily.
-        max_dttm = pd.Timestamp(df["max_dttm"][0])
-        start = max_dttm.floor(window_size)
-
-        # Never reach back further than the retention period allows.
-        earliest = (now_floor - retention).floor(window_size)
-        start = max(start, earliest)
-
-    times = pd.date_range(start, now_floor, freq=window_size)
-
-    if len(times) < 2:
-        # Nothing to do -- the table is current.
-        return pd.DataFrame(columns=["t1", "t2"])
-
-    return pd.DataFrame({"t1": times[:-1], "t2": times[1:]})
 
 
-# ---------------------------------------------------------------------
-# FILL
-# ---------------------------------------------------------------------
-
-def fill_orders(settings, tables, missing_windows):
-    """
-    Pull and load each missing window.
-
-    CHANGED: the original called
-        df = query_orders(t1, t2)
-        tables.orders.insert(df)
-
-    That bypasses the rest of the pipeline entirely:
-      - preprocess_orders never runs, so cleaned_text is never populated
-      - the left_only dedupe guard inside get_orders and
-        write_preprocessed_orders never runs, so re-running a window
-        would insert duplicate rows
-
-    run_data_intake_pipeline does query -> preprocess -> guarded write
-    for both tables, which is what we actually want.
-
-    CHANGED: wrapped each window in try/except so one bad window doesn't
-    abort the whole run. Failures are logged and reported at the end.
-    """
-    completed, failed = [], []
-
-    total = len(missing_windows)
-    for i, row in enumerate(missing_windows.itertuples(index=False), 1):
-        log.info("[%d/%d] Filling %s -> %s", i, total, row.t1, row.t2)
-        try:
-            run_data_intake_pipeline(
-                tables,
-                row.t1.strftime("%Y-%m-%d %H:%M:%S"),
-                row.t2.strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            completed.append((row.t1, row.t2))
-        except Exception:
-            log.exception("  FAILED %s -> %s -- continuing", row.t1, row.t2)
-            failed.append((row.t1, row.t2))
-
-    log.info("Fill complete: %d succeeded, %d failed", len(completed), len(failed))
-    return completed, failed
 
 
-# ---------------------------------------------------------------------
-# ENTRY POINTS
-# ---------------------------------------------------------------------
 
-def run_once(settings, tables, dry_run=False, purge=False):
-    """
-    A single pass. This is what you want for a daily scheduled job,
-    and what to use in the notebook.
-
-    CHANGED: this function is new. The original only had run(), which
-    was an infinite `while True:` loop -- a long-running service, not a
-    daily job. In a notebook it hangs forever.
-
-    dry_run: log the windows that would be filled without filling them.
-    purge:   run retention deletes. Off by default.
-    """
-    if purge:
-        manage_retention(settings, tables, dry_run=dry_run)
-
-    missing = get_missing_windows(settings, tables)
-
-    if missing.empty:
-        log.info("Nothing to backfill -- database is current.")
-        return missing
-
-    log.info("Found %d window(s) to fill", len(missing))
-
-    if dry_run:
-        for row in missing.itertuples(index=False):
-            log.info("  [dry run] would fill %s -> %s", row.t1, row.t2)
-        return missing
-
-    fill_orders(settings, tables, missing)
-    return missing
-
-
-def run_service(settings, tables, purge=False):
-    """
-    Continuous version -- the original run(). Kept for reference.
-
-    CHANGED: fill_orders(settings) -> fill_orders(settings, tables, missing_windows)
-    The original called fill_orders with one argument while the function
-    signature required two, which is an immediate TypeError.
-
-    Do NOT run this in a notebook -- it never returns.
-    """
-    while True:
-        if purge:
-            manage_retention(settings, tables, dry_run=False)
-
-        missing_windows = get_missing_windows(settings, tables)
-
-        if missing_windows.empty:
-            time.sleep(pd.Timedelta(settings.etl.window_size).total_seconds())
-            continue
-
-        fill_orders(settings, tables, missing_windows)
-
-
-# ---------------------------------------------------------------------
-# NOTES / OPEN QUESTIONS FOR TEAM LEAD
-# ---------------------------------------------------------------------
-#
-# 1. query_orders(t1, t2) in the original was a bare stub (`return`).
-#    This version calls run_data_intake_pipeline instead, which already
-#    contains the real Oracle query.
-#
-# 2. This fills FORWARD from the newest record only. Interior gaps --
-#    from, say, a run that crashed midweek -- are invisible to it.
-#    Detecting those needs a per-window presence check:
-#        select distinct date_trunc('hour', wr_status_upd_dttm) from orders
-#    Fine to leave out under the immutable-record assumption, but worth
-#    raising.
-#
-# 3. Late-arriving records: if a work order lands in the source system
-#    after its own timestamp, its window may already be behind max_dttm
-#    and get skipped. The floor() change above helps for the current
-#    partial window. A fuller fix is re-pulling the last 24-48 hours on
-#    every run and letting the dedupe guard absorb the overlap.
-#
-# 4. Cold start = a full retention period of hourly windows (~720 pulls).
-#    May want to cap or batch that for the first run.
-#
-# 5. cleaned_text retention -- see note in manage_retention.
-#
-# 6. Config keys: confirm whether settings.etl has window_size,
-#    window_hours, or both. This file uses window_size throughout.
