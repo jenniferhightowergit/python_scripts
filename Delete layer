@@ -1,49 +1,367 @@
-import duckdb
-scratch = r"C:\Users\UIX9\Documents\Gitlab Repos\aoa_svco\data\database\dev_scratch.db"
-con = duckdb.connect(scratch, read_only=True)
-print(con.execute("""
-    select count(*) as total,
-           min(wr_status_upd_dttm) as oldest,
-           max(wr_status_upd_dttm) as newest
-    from orders
-""").df())
-con.close()
+Periodic Testing S4eX Meter Tech Behavior Analysis
 
+Project Goal
 
+The purpose of this analysis is to evaluate meter technician behavior and efficiency during periodic-testing work involving aging S4eX meters.
 
+When a meter technician is already dispatched to an area for a periodic-testing meter, there may be additional aging/eligible meters nearby that could potentially be replaced during the same trip.
 
+The main business question is:
 
+When technicians perform periodic-testing work in an area, how effectively are they taking advantage of opportunities to replace other aging meters nearby?
 
+The eventual goal is to compare higher-efficiency and lower-efficiency technicians/groups and determine what behaviors distinguish them.
 
+This should NOT simply rank technicians by number of meter changes because technicians working in dense urban areas naturally have more nearby opportunities than technicians working in rural areas.
 
-print(settings.db.uri)   # must say dev_scratch.db
+⸻
 
+Main Analysis Concept
 
+For each historical periodic-testing/meter-change event:
 
+1. Identify the meter that was changed.
+2. Identify the technician who performed the work.
+3. Identify the date of the meter change.
+4. Determine the geographic location of that meter.
+5. Reconstruct the population of meters that were still installed/current at that point in time.
+6. Identify those meters located within approximately 0.5 mile of the changed meter.
+7. Determine how many nearby meters represented potential additional replacement opportunities.
+8. Determine which nearby meters were subsequently/also changed.
+9. Aggregate these results by technician to measure how effectively technicians utilized the opportunities available to them.
 
+The key concept is therefore:
 
+Meter changes performed relative to meter-change opportunities available.
 
+⸻
 
-import logging
-logging.basicConfig(level=logging.INFO, force=True)
+Important Historical-Time Requirement
 
-manage_retention(settings, tables, dry_run=True)
+The nearby-meter population cannot be based only on today’s currently installed meters.
 
+For a meter changed on a historical date, the analysis needs to answer:
 
+Which other meters were installed/current in that area on the date this meter was changed?
 
+For example:
 
-import pandas as pd
-cutoff = pd.Timestamp.now().floor("1h") - pd.Timedelta("6h")
-print("cutoff:", cutoff)
+* Meter A was changed on June 1.
+* Meter B was nearby and still installed on June 1.
+* Meter B was eventually changed on July 15.
 
-tables.select(
-    "select count(*) as n from orders where wr_status_upd_dttm < :cutoff",
-    params=dict(cutoff=cutoff),
-)
+Meter B still needs to count as an available nearby meter on June 1, even though it is no longer a current meter today.
 
+This is why the meter-history table and installation/removal dates are required.
 
+Conceptually, a nearby meter should be considered active on the event date when:
 
+installation date <= event date < removal date
 
+For meters represented with the 3001-01-01 sentinel removal date, that indicates the meter is currently installed.
 
+⸻
 
+Data Built So Far
 
+1. Periodic Testing Population
+
+An Excel periodic-testing report contains the population of meters relevant to the analysis.
+
+This represents the primary population/cohort of aging S4eX meters being evaluated.
+
+⸻
+
+2. Meter History
+
+MC_History.parquet is being used to reconstruct meter history at each ESI/service location.
+
+DuckDB SQL uses LAG() partitioned by ESI location to determine relationships between meters occupying the same service location.
+
+Important resulting fields include:
+
+* meterno
+* prev_meterno
+* INSTALLATION_DATE
+* meter_removal_date
+* CURRENT_METER_FLAG
+* sp_id
+* esi_loc
+
+3001-01-01 is being used as the sentinel removal date for a meter that is still current.
+
+The history logic has been manually checked against individual ESI locations to verify that previous/current meter relationships are reasonable.
+
+⸻
+
+3. Hardware Information
+
+Meter history has been joined to asset/hardware data.
+
+Fields include information such as:
+
+* Hardware Model
+* Revision ID
+* Meter number
+
+This allows the analysis to identify the specific S4e/S4eX hardware population.
+
+⸻
+
+4. Work Order / Technician Information
+
+Work-order data has been joined using ESI location and meter-removal/work dates.
+
+Important fields include:
+
+* wr_workeddate
+* workedby
+
+System/generated users such as XATUSER are excluded.
+
+This provides the technician associated with historical meter-change events.
+
+⸻
+
+5. Geographic Location Data
+
+Service-location data provides:
+
+* ESI location
+* latitude
+* longitude
+* address
+* ZIP
+* city
+* state
+
+Latitude and longitude are used to identify nearby meters.
+
+⸻
+
+Census Data
+
+A separate CensusData.ipynb notebook pulls ACS Census information for Texas.
+
+The Census API currently retrieves:
+
+B01003_001E — Total Population
+
+Census tract information is retrieved and county population totals are also being generated.
+
+The purpose of Census information is to provide geographic-density context.
+
+A technician working in a densely populated urban area will naturally encounter more meters than a technician working in a rural area.
+
+Therefore, raw meter-change counts should NOT be used by themselves to compare technician efficiency.
+
+Census population may eventually be used as:
+
+* contextual information,
+* a density classification,
+* a normalization variable,
+* or part of a weighting/scoring system.
+
+However, the strongest direct measure of technician opportunity will likely be the actual number of eligible meters surrounding each work event, rather than Census population alone.
+
+⸻
+
+Geographic Opportunity Analysis
+
+The current major development step is identifying meters near each historical meter-change event.
+
+A Haversine distance calculation is being used to calculate geographic distance between meters.
+
+The target radius discussed is approximately:
+
+0.5 mile
+
+The analysis initially attempted to compare historical meters against the meter population using latitude/longitude bounds followed by the Haversine calculation.
+
+Example concept:
+
+Changed Meter A
+
+→ identify meters geographically near A
+→ determine whether those meters existed/current on A’s removal date
+→ calculate exact distance
+→ retain meters within the desired radius.
+
+⸻
+
+Performance Problem Encountered
+
+The geographic join became very slow when comparing the historical meter-change population against the full meter population.
+
+This occurs because comparing every meter against every other meter creates an extremely large number of potential meter pairs.
+
+To reduce the search space, geographic grid fields were introduced:
+
+* lat_grid
+* lon_grid
+
+using calculations similar to:
+
+FLOOR(latitude / 0.02)
+
+and
+
+FLOOR(longitude / 0.02)
+
+The intention is to use geographic grid cells/bounding boxes to identify only plausible nearby candidates BEFORE performing the more expensive Haversine calculation.
+
+Latitude/longitude bounding conditions such as approximately ±0.01 or ±0.02 degrees have also been tested.
+
+The optimization strategy is:
+
+Full meter population
+
+→ geographic/grid candidate filtering
+
+→ historical-date eligibility filtering
+
+→ Haversine calculation
+
+→ final 0.5-mile population.
+
+This is where development was largely paused.
+
+⸻
+
+Current Working Dataset
+
+The full_s4e_pop_mapping / combined work is assembling fields similar to:
+
+* historical meter
+* nearby/close meter
+* previous meter
+* current-meter flag
+* meter removal date
+* installation date
+* ESI location
+* hardware model
+* revision ID
+* work date
+* technician (workedby)
+* historical latitude
+* historical longitude
+* nearby-meter latitude
+* nearby-meter longitude
+* calculated distance
+
+This dataset is intended to become the foundation of the technician-efficiency analysis.
+
+⸻
+
+Planned Technician Efficiency Analysis
+
+The final technician comparison should account for opportunity, not simply raw production.
+
+Potential event-level metrics include:
+
+Nearby Opportunity Count
+
+Number of eligible/aging meters within the defined radius when the technician was already working in the area.
+
+Nearby Meter Changes
+
+Number of those nearby meters that were changed within the appropriate visit/time window.
+
+Opportunity Capture Rate
+
+nearby meters changed / nearby eligible meters
+
+Example:
+
+A technician visits an area containing 8 other eligible meters and changes 4.
+
+Opportunity Capture Rate = 4 / 8 = 50%
+
+A rural technician who encounters only 2 eligible nearby meters and changes both would have a 100% capture rate despite performing fewer raw meter changes.
+
+This makes the comparison substantially fairer than simply ranking technicians by meter-change counts.
+
+⸻
+
+Census / Density Adjustment
+
+Census information should initially be treated as a contextual or stratification variable rather than automatically building it into a weighted score.
+
+Possible approach:
+
+Classify events/areas into groups such as:
+
+* Rural / low density
+* Medium density
+* Urban / high density
+
+Then compare technicians within similar opportunity environments.
+
+After the basic opportunity metrics have been validated, determine whether a formal weighted efficiency score is necessary.
+
+This avoids creating an unnecessarily complicated coefficient before understanding the underlying technician behavior.
+
+⸻
+
+Proposed Final Analysis
+
+Once the historical nearby-meter dataset is complete:
+
+1. Calculate opportunity metrics for every periodic-testing event.
+2. Aggregate metrics by technician.
+3. Separate technicians into higher-efficiency and lower-efficiency groups.
+4. Compare the two groups.
+
+Possible comparison variables include:
+
+* average nearby opportunities per visit
+* average nearby meter changes
+* opportunity capture rate
+* number of meter changes
+* number of battery changes
+* urban/rural mix
+* population/density
+* hardware mix
+* distance between nearby replacements
+* number of work locations visited
+* repeated trips into the same geographic area
+
+The objective is not merely to identify “good” and “bad” technicians.
+
+The more useful question is:
+
+What behavior is different when technicians achieve higher replacement efficiency?
+
+⸻
+
+Current Stopping Point / Next Step
+
+The immediate technical task is to finish and optimize the historical nearby-meter join.
+
+For every meter-change event:
+
+Event meter + event date
+
+→ reconstruct meters active on that date
+
+→ geographically pre-filter nearby candidates
+
+→ calculate Haversine distance
+
+→ retain meters within ~0.5 mile
+
+→ identify which were eligible S4eX meters
+
+→ determine whether/when those nearby meters were changed.
+
+Once this table can be generated efficiently for the full population, technician-level scoring and comparison can begin.
+
+Important Reminder
+
+Do not calculate technician efficiency using raw meter-change counts alone.
+
+The fundamental unit of this analysis should be:
+
+What did the technician do relative to the opportunities that existed around them at the time they were already working there?
+
+That is the core business question for the project.
