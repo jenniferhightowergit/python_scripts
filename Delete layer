@@ -1,84 +1,20 @@
-
-def run_once(settings, tables, dry_run=False, purge=False):
-    """
-    A single pass. This is what you want for a daily scheduled job,
-    and what to use in the notebook.
-
-    CHANGED: this function is new. The original only had run(), which
-    was an infinite `while True:` loop -- a long-running service, not a
-    daily job. In a notebook it hangs forever.
-
-    dry_run: log the windows that would be filled without filling them.
-    purge:   run retention deletes. Off by default.
-    """
-    if purge:
-        manage_retention(settings, tables, dry_run=dry_run)
-
-    missing = get_missing_windows(settings, tables)
-
-    if missing.empty:
-        log.info("Nothing to backfill -- database is current.")
-        return missing
-
-    log.info("Found %d window(s) to fill", len(missing))
-
-    if dry_run:
-        for row in missing.itertuples(index=False):
-            log.info("  [dry run] would fill %s -> %s", row.t1, row.t2)
-        return missing
-
-    fill_orders(settings, tables, missing)
-    return missing
-
-
-def run_service(settings, tables, purge=False):
-    """
-    Continuous version -- the original run(). Kept for reference.
-
-    CHANGED: fill_orders(settings) -> fill_orders(settings, tables, missing_windows)
-    The original called fill_orders with one argument while the function
-    signature required two, which is an immediate TypeError.
-
-    Do NOT run this in a notebook -- it never returns.
-    """
-    while True:
-        if purge:
-            manage_retention(settings, tables, dry_run=False)
-
-        missing_windows = get_missing_windows(settings, tables)
-
-        if missing_windows.empty:
-            time.sleep(pd.Timedelta(settings.etl.window_size).total_seconds())
-            continue
-
-        fill_orders(settings, tables, missing_windows)
-
-
-# ---------------------------------------------------------------------
-# NOTES / OPEN QUESTIONS FOR TEAM LEAD
-# ---------------------------------------------------------------------
-#
-# 1. query_orders(t1, t2) in the original was a bare stub (`return`).
-#    This version calls run_data_intake_pipeline instead, which already
-#    contains the real Oracle query.
-#
-# 2. This fills FORWARD from the newest record only. Interior gaps --
-#    from, say, a run that crashed midweek -- are invisible to it.
-#    Detecting those needs a per-window presence check:
-#        select distinct date_trunc('hour', wr_status_upd_dttm) from orders
-#    Fine to leave out under the immutable-record assumption, but worth
-#    raising.
-#
-# 3. Late-arriving records: if a work order lands in the source system
-#    after its own timestamp, its window may already be behind max_dttm
-#    and get skipped. The floor() change above helps for the current
-#    partial window. A fuller fix is re-pulling the last 24-48 hours on
-#    every run and letting the dedupe guard absorb the overlap.
-#
-# 4. Cold start = a full retention period of hourly windows (~720 pulls).
-#    May want to cap or batch that for the first run.
-#
-# 5. cleaned_text retention -- see note in manage_retention.
-#
-# 6. Config keys: confirm whether settings.etl has window_size,
-#    window_hours, or both. This file uses window_size throughout.
+WITH scd AS (
+  SELECT substr(to_char(trim(mtr.CLIENT_CO_LOCATION_ID)),8,10) esi_loc,
+         trim(mtr.CLIENT_MDVC_NUMBER) meter,
+         trunc(mtr.EFFECTIVE_DATE) eff_dt
+  FROM wacsmdms.vw_scd_meter mtr
+),
+flagged AS (
+  SELECT esi_loc, meter, eff_dt,
+         CASE WHEN nvl(LAG(meter) OVER (PARTITION BY esi_loc ORDER BY eff_dt),'~') = meter
+              THEN 0 ELSE 1 END is_new
+  FROM scd
+),
+grp AS (
+  SELECT esi_loc, meter, eff_dt,
+         SUM(is_new) OVER (PARTITION BY esi_loc ORDER BY eff_dt) g
+  FROM flagged
+)
+SELECT esi_loc, meter, MIN(eff_dt) install_date,
+       LEAD(MIN(eff_dt)) OVER (PARTITION BY esi_loc ORDER BY MIN(eff_dt)) removal_date
+FROM grp GROUP BY esi_loc, meter, g ORDER BY 3;
