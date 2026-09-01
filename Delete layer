@@ -1,74 +1,51 @@
+combined = conn.execute("""
 
-create or replace table visits as
 select
-  hist_meter as new_meter,
-  esi_loc,
-  cast(installation_date as date) as work_date,
-  hist_latitude as lat,
-  hist_longitude as lon
-from s4x_pop_mapping
-where installation_date is not null
+  -- THE TARGET: the meter this tech actually pulled
+  a.hist_meter        as target_meter,
+  a.esi_loc           as target_esi_loc,
+  a.workedby,
+  cast(a.hist_meter_removal_date as date) as work_date,
+  a.hist_latitude     as target_lat,
+  a.hist_longitude    as target_lon,
 
+  -- THE NEIGHBOR: another S4e sitting nearby that day
+  b.hist_meter        as nearby_meter,
+  b.esi_loc           as nearby_esi_loc,
+  b.workedby          as nearby_workedby,
+  cast(b.hist_meter_removal_date as date) as nearby_removal_date,
+  b.hist_latitude     as nearby_lat,
+  b.hist_longitude    as nearby_lon,
 
-
-
-
-
-create or replace table visit_clusters as
-select
-  workedby,
-  work_date,
-  floor(lat / 0.002) as lat_cell,     -- ~220m cells
-  floor(lon / 0.002) as lon_cell,
-  count(*) as installs_here,
-  avg(lat) as cluster_lat,
-  avg(lon) as cluster_lon
-from visits
-group by 1, 2, 3, 4
-
-
-create or replace table cluster_opportunity as
-select
-  c.workedby,
-  c.work_date,
-  c.lat_cell, c.lon_cell,
-  c.cluster_lat, c.cluster_lon,
-  b.hist_meter as nearby_meter,
-  b.esi_loc,
-  b.hist_latitude as lat,
-  b.hist_longitude as lon,
   case
-    when b.hist_meter_removal_date = c.work_date then 'CAPTURED'
-    when b.hist_meter_removal_date > c.work_date
-     and b.hist_meter_removal_date <> date '3001-01-01' then 'RETURN TRIP'
-    else 'MISSED'
-  end as outcome
-from visit_clusters c
+    when b.hist_meter = a.hist_meter then 'TARGET ITSELF'
+    when cast(b.hist_meter_removal_date as date) = cast(a.hist_meter_removal_date as date)
+         and b.workedby = a.workedby then 'CAPTURED SAME DAY'
+    when cast(b.hist_meter_removal_date as date) = cast(a.hist_meter_removal_date as date)
+         then 'SAME DAY OTHER TECH'
+    when b.hist_meter_removal_date = date '3001-01-01' then 'STILL NOT REMOVED'
+    when cast(b.hist_meter_removal_date as date) > cast(a.hist_meter_removal_date as date)
+         then 'REMOVED LATER'
+    else 'ALREADY GONE'
+  end as outcome,
+
+  round(3959 * 2 * asin(sqrt(
+      power(sin(radians(b.hist_latitude - a.hist_latitude)/2), 2)
+      + cos(radians(a.hist_latitude)) * cos(radians(b.hist_latitude))
+      * power(sin(radians(b.hist_longitude - a.hist_longitude)/2), 2)
+  )) * 5280, 0) as distance_feet
+
+from s4e_pop_mapping a
 join s4e_pop_mapping b
-  on b.hist_latitude  between c.cluster_lat - 0.0015 and c.cluster_lat + 0.0015
- and b.hist_longitude between c.cluster_lon - 0.0018 and c.cluster_lon + 0.0018
- and b.installation_date < c.work_date
- and b.hist_meter_removal_date >= c.work_date   -- still in ground that morning
-where 3959 * 2 * asin(sqrt(
-        power(sin(radians(b.hist_latitude - c.cluster_lat)/2), 2)
-        + cos(radians(c.cluster_lat)) * cos(radians(b.hist_latitude))
-        * power(sin(radians(b.hist_longitude - c.cluster_lon)/2), 2)
-      )) <= 0.1
+  on  b.hist_latitude  between a.hist_latitude  - 0.0015 and a.hist_latitude  + 0.0015
+  and b.hist_longitude between a.hist_longitude - 0.0018 and a.hist_longitude + 0.0018
 
+where a.hist_meter_removal_date <> date '3001-01-01'
+  and a.workedby is not null
+  and b.installation_date < cast(a.hist_meter_removal_date as date)
 
+  and a.workedby = 'U5T5'
+  and cast(a.hist_meter_removal_date as date) = date '2026-05-07'
 
-create or replace table opportunity_capture as
-select
-  workedby,
-  work_date,
-  lat_cell, lon_cell,
-  cluster_lat, cluster_lon,
-  count(*) as meters_available,
-  count(*) filter (where outcome = 'CAPTURED')    as captured,
-  count(*) filter (where outcome = 'RETURN TRIP') as return_trips,
-  count(*) filter (where outcome = 'MISSED')      as missed,
-  round(100.0 * count(*) filter (where outcome = 'CAPTURED') / count(*), 1) as capture_pct
-from cluster_opportunity
-group by 1,2,3,4,5,6
-
-
+order by a.hist_meter, distance_feet
+""").df()
