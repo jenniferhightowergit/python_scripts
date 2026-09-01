@@ -1,3 +1,19 @@
+
+create or replace table visits as
+select
+  hist_meter as new_meter,
+  esi_loc,
+  cast(installation_date as date) as work_date,
+  hist_latitude as lat,
+  hist_longitude as lon
+from s4x_pop_mapping
+where installation_date is not null
+
+
+
+
+
+
 create or replace table visit_clusters as
 select
   workedby,
