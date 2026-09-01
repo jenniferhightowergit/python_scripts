@@ -1,20 +1,58 @@
-WITH scd AS (
-  SELECT substr(to_char(trim(mtr.CLIENT_CO_LOCATION_ID)),8,10) esi_loc,
-         trim(mtr.CLIENT_MDVC_NUMBER) meter,
-         trunc(mtr.EFFECTIVE_DATE) eff_dt
-  FROM wacsmdms.vw_scd_meter mtr
-),
-flagged AS (
-  SELECT esi_loc, meter, eff_dt,
-         CASE WHEN nvl(LAG(meter) OVER (PARTITION BY esi_loc ORDER BY eff_dt),'~') = meter
-              THEN 0 ELSE 1 END is_new
-  FROM scd
-),
-grp AS (
-  SELECT esi_loc, meter, eff_dt,
-         SUM(is_new) OVER (PARTITION BY esi_loc ORDER BY eff_dt) g
-  FROM flagged
-)
-SELECT esi_loc, meter, MIN(eff_dt) install_date,
-       LEAD(MIN(eff_dt)) OVER (PARTITION BY esi_loc ORDER BY MIN(eff_dt)) removal_date
-FROM grp GROUP BY esi_loc, meter, g ORDER BY 3;
+create or replace table visit_clusters as
+select
+  workedby,
+  work_date,
+  floor(lat / 0.002) as lat_cell,     -- ~220m cells
+  floor(lon / 0.002) as lon_cell,
+  count(*) as installs_here,
+  avg(lat) as cluster_lat,
+  avg(lon) as cluster_lon
+from visits
+group by 1, 2, 3, 4
+
+
+create or replace table cluster_opportunity as
+select
+  c.workedby,
+  c.work_date,
+  c.lat_cell, c.lon_cell,
+  c.cluster_lat, c.cluster_lon,
+  b.hist_meter as nearby_meter,
+  b.esi_loc,
+  b.hist_latitude as lat,
+  b.hist_longitude as lon,
+  case
+    when b.hist_meter_removal_date = c.work_date then 'CAPTURED'
+    when b.hist_meter_removal_date > c.work_date
+     and b.hist_meter_removal_date <> date '3001-01-01' then 'RETURN TRIP'
+    else 'MISSED'
+  end as outcome
+from visit_clusters c
+join s4e_pop_mapping b
+  on b.hist_latitude  between c.cluster_lat - 0.0015 and c.cluster_lat + 0.0015
+ and b.hist_longitude between c.cluster_lon - 0.0018 and c.cluster_lon + 0.0018
+ and b.installation_date < c.work_date
+ and b.hist_meter_removal_date >= c.work_date   -- still in ground that morning
+where 3959 * 2 * asin(sqrt(
+        power(sin(radians(b.hist_latitude - c.cluster_lat)/2), 2)
+        + cos(radians(c.cluster_lat)) * cos(radians(b.hist_latitude))
+        * power(sin(radians(b.hist_longitude - c.cluster_lon)/2), 2)
+      )) <= 0.1
+
+
+
+create or replace table opportunity_capture as
+select
+  workedby,
+  work_date,
+  lat_cell, lon_cell,
+  cluster_lat, cluster_lon,
+  count(*) as meters_available,
+  count(*) filter (where outcome = 'CAPTURED')    as captured,
+  count(*) filter (where outcome = 'RETURN TRIP') as return_trips,
+  count(*) filter (where outcome = 'MISSED')      as missed,
+  round(100.0 * count(*) filter (where outcome = 'CAPTURED') / count(*), 1) as capture_pct
+from cluster_opportunity
+group by 1,2,3,4,5,6
+
+
