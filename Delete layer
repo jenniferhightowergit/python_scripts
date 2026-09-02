@@ -1,37 +1,22 @@
-import pandas as pd
-import numpy as np
-from sklearn.cluster import DBSCAN
-
-pts = conn.execute("""
-    select distinct workedby, work_date, meterno, latitude, longitude
-    from for_mapping
-""").df()
-
-EPS_MILES = 0.25          # points within ~1/4 mile chain together
-EARTH_MI  = 3959.0
-
-labeled = []
-for (tech, day), g in pts.groupby(['workedby', 'work_date']):
-    coords = np.radians(g[['latitude', 'longitude']].to_numpy())
-    db = DBSCAN(
-        eps=EPS_MILES / EARTH_MI,
-        min_samples=2,
-        metric='haversine'
-    ).fit(coords)
-    g = g.copy()
-    g['cluster_id'] = [
-        f"{tech}_{day}_{lbl}" if lbl >= 0 else f"{tech}_{day}_solo{i}"
-        for i, lbl in enumerate(db.labels_)
-    ]
-    labeled.append(g)
-
-clusters = pd.concat(labeled)
-conn.register('meter_clusters', clusters)
-
-
-select cluster_id, count(*) as meters,
-  round(max(latitude) - min(latitude), 4) as lat_spread
+create or replace table cluster_legs as
+select
+  workedby, work_date, cluster_id, meterno, wr_workeddatetime,
+  date_diff('minute',
+    lag(wr_workeddatetime) over w, wr_workeddatetime) as minutes_since_prev,
+  3959 * 2 * asin(sqrt(
+    power(sin(radians(latitude - lag(latitude) over w)/2), 2)
+    + cos(radians(lag(latitude) over w)) * cos(radians(latitude))
+    * power(sin(radians(longitude - lag(longitude) over w)/2), 2)
+  )) as miles_since_prev
 from meter_clusters
-where workedby = 'U5T5' and work_date = '2026-05-07'
-group by 1 order by 2 desc
+window w as (partition by workedby, work_date, cluster_id order by wr_workeddatetime)
+
+
+
+select
+  median(minutes_since_prev) as median_min_within_cluster,
+  median(miles_since_prev)   as median_miles_within_cluster
+from cluster_legs
+where minutes_since_prev is not null
+  and minutes_since_prev between 1 and 120   -- drop lunch breaks and overnight gaps
 
