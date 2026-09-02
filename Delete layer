@@ -1,22 +1,12 @@
-create or replace table cluster_legs as
 select
-  workedby, work_date, cluster_id, meterno, wr_workeddatetime,
-  date_diff('minute',
-    lag(wr_workeddatetime) over w, wr_workeddatetime) as minutes_since_prev,
-  3959 * 2 * asin(sqrt(
-    power(sin(radians(latitude - lag(latitude) over w)/2), 2)
-    + cos(radians(lag(latitude) over w)) * cos(radians(latitude))
-    * power(sin(radians(longitude - lag(longitude) over w)/2), 2)
-  )) as miles_since_prev
-from meter_clusters
-window w as (partition by workedby, work_date, cluster_id order by wr_workeddatetime)
-
-
-
-select
-  median(minutes_since_prev) as median_min_within_cluster,
-  median(miles_since_prev)   as median_miles_within_cluster
+  case
+    when hour(worked_datetime) < 12 then 'Morning'
+    when hour(worked_datetime) < 17 then 'Afternoon'
+    else 'Evening'
+  end as time_block,
+  count(*) as meters_removed,
+  count(distinct cluster_id) as clusters,
+  round(count(*) * 1.0 / count(distinct cluster_id), 1) as meters_per_cluster
 from cluster_legs
-where minutes_since_prev is not null
-  and minutes_since_prev between 1 and 120   -- drop lunch breaks and overnight gaps
-
+where outcome in ('PERIODIC TEST', 'CAPTURED SAME DAY')
+group by 1 order by 1
