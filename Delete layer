@@ -1,51 +1,37 @@
-combined = conn.execute("""
+import pandas as pd
+import numpy as np
+from sklearn.cluster import DBSCAN
 
-select
-  -- THE TARGET: the meter this tech actually pulled
-  a.hist_meter        as target_meter,
-  a.esi_loc           as target_esi_loc,
-  a.workedby,
-  cast(a.hist_meter_removal_date as date) as work_date,
-  a.hist_latitude     as target_lat,
-  a.hist_longitude    as target_lon,
-
-  -- THE NEIGHBOR: another S4e sitting nearby that day
-  b.hist_meter        as nearby_meter,
-  b.esi_loc           as nearby_esi_loc,
-  b.workedby          as nearby_workedby,
-  cast(b.hist_meter_removal_date as date) as nearby_removal_date,
-  b.hist_latitude     as nearby_lat,
-  b.hist_longitude    as nearby_lon,
-
-  case
-    when b.hist_meter = a.hist_meter then 'TARGET ITSELF'
-    when cast(b.hist_meter_removal_date as date) = cast(a.hist_meter_removal_date as date)
-         and b.workedby = a.workedby then 'CAPTURED SAME DAY'
-    when cast(b.hist_meter_removal_date as date) = cast(a.hist_meter_removal_date as date)
-         then 'SAME DAY OTHER TECH'
-    when b.hist_meter_removal_date = date '3001-01-01' then 'STILL NOT REMOVED'
-    when cast(b.hist_meter_removal_date as date) > cast(a.hist_meter_removal_date as date)
-         then 'REMOVED LATER'
-    else 'ALREADY GONE'
-  end as outcome,
-
-  round(3959 * 2 * asin(sqrt(
-      power(sin(radians(b.hist_latitude - a.hist_latitude)/2), 2)
-      + cos(radians(a.hist_latitude)) * cos(radians(b.hist_latitude))
-      * power(sin(radians(b.hist_longitude - a.hist_longitude)/2), 2)
-  )) * 5280, 0) as distance_feet
-
-from s4e_pop_mapping a
-join s4e_pop_mapping b
-  on  b.hist_latitude  between a.hist_latitude  - 0.0015 and a.hist_latitude  + 0.0015
-  and b.hist_longitude between a.hist_longitude - 0.0018 and a.hist_longitude + 0.0018
-
-where a.hist_meter_removal_date <> date '3001-01-01'
-  and a.workedby is not null
-  and b.installation_date < cast(a.hist_meter_removal_date as date)
-
-  and a.workedby = 'U5T5'
-  and cast(a.hist_meter_removal_date as date) = date '2026-05-07'
-
-order by a.hist_meter, distance_feet
+pts = conn.execute("""
+    select distinct workedby, work_date, meterno, latitude, longitude
+    from for_mapping
 """).df()
+
+EPS_MILES = 0.25          # points within ~1/4 mile chain together
+EARTH_MI  = 3959.0
+
+labeled = []
+for (tech, day), g in pts.groupby(['workedby', 'work_date']):
+    coords = np.radians(g[['latitude', 'longitude']].to_numpy())
+    db = DBSCAN(
+        eps=EPS_MILES / EARTH_MI,
+        min_samples=2,
+        metric='haversine'
+    ).fit(coords)
+    g = g.copy()
+    g['cluster_id'] = [
+        f"{tech}_{day}_{lbl}" if lbl >= 0 else f"{tech}_{day}_solo{i}"
+        for i, lbl in enumerate(db.labels_)
+    ]
+    labeled.append(g)
+
+clusters = pd.concat(labeled)
+conn.register('meter_clusters', clusters)
+
+
+select cluster_id, count(*) as meters,
+  round(max(latitude) - min(latitude), 4) as lat_spread
+from meter_clusters
+where workedby = 'U5T5' and work_date = '2026-05-07'
+group by 1 order by 2 desc
+
