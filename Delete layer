@@ -1,27 +1,77 @@
-test = conn.execute("""
-    
-    select
+targets = conn.execute("""
+    select distinct
         workedby,
         work_date,
-        nearby_meter,
-        
-        count(distinct target_meter) as target_count,
-        
-        list(distinct target_meter) as target_meters
-        
+        target_meter,
+        target_worked_datetime,
+        target_lat as latitude,
+        target_lon as longitude
     from combined
-    
     where target_worked_datetime is not null
-      and outcome = 'MISSED OPPORTUNITY'
-      and nearby_meter is not null
-    
-    group by
-        workedby,
-        work_date,
-        nearby_meter
-        
-    having count(distinct target_meter) > 1
-    
-    order by target_count desc
-
+      and workedby is not null
+      and target_meter is not null
+      and target_lat is not null
+      and target_lon is not null
 """).df()
+
+
+EPS_MILES = 0.25
+EARTH_MI = 3959.0
+
+labelled = []
+
+for (tech, day), g in targets.groupby(["workedby", "work_date"]):
+
+    coords = np.radians(
+        g[["latitude", "longitude"]].to_numpy()
+    )
+
+    db = DBSCAN(
+        eps=EPS_MILES / EARTH_MI,
+        min_samples=2,
+        metric="haversine"
+    ).fit(coords)
+
+    g = g.copy()
+
+    g["cluster_num"] = db.labels_
+
+    g["cluster_id"] = [
+        f"{tech}_{day}_{lbl}"
+        if lbl >= 0
+        else f"{tech}_{day}_solo_{meter}"
+        for lbl, meter in zip(
+            db.labels_,
+            g["target_meter"]
+        )
+    ]
+
+    labelled.append(g)
+
+target_clusters = pd.concat(labelled, ignore_index=True)
+
+conn.register("target_clusters", target_clusters)
+
+
+
+with relationships as (
+
+    select
+        c.*,
+        tc.cluster_id
+
+    from combined c
+
+    left join target_clusters tc
+        on c.workedby = tc.workedby
+       and c.work_date = tc.work_date
+       and c.target_meter = tc.target_meter
+
+)
+
+select *
+from relationships
+
+
+
+
