@@ -1,20 +1,27 @@
-pts = conn.execute("""
+test = conn.execute("""
+    
     select
         workedby,
         work_date,
-        meterno,
-        min(worked_datetime) as worked_datetime,
-        any_value(latitude) as latitude,
-        any_value(longitude) as longitude,
-        max(pt_flag) as pt_flag
-    from for_mapping
-    where workedby is not null
-      and meterno is not null
-      and latitude is not null
-      and longitude is not null
-      and outcome <> 'ALREADY GONE'
+        nearby_meter,
+        
+        count(distinct target_meter) as target_count,
+        
+        list(distinct target_meter) as target_meters
+        
+    from combined
+    
+    where target_worked_datetime is not null
+      and outcome = 'MISSED OPPORTUNITY'
+      and nearby_meter is not null
+    
     group by
         workedby,
         work_date,
-        meterno
+        nearby_meter
+        
+    having count(distinct target_meter) > 1
+    
+    order by target_count desc
+
 """).df()
