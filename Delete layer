@@ -1,12 +1,20 @@
-select
-  case
-    when hour(worked_datetime) < 12 then 'Morning'
-    when hour(worked_datetime) < 17 then 'Afternoon'
-    else 'Evening'
-  end as time_block,
-  count(*) as meters_removed,
-  count(distinct cluster_id) as clusters,
-  round(count(*) * 1.0 / count(distinct cluster_id), 1) as meters_per_cluster
-from cluster_legs
-where outcome in ('PERIODIC TEST', 'CAPTURED SAME DAY')
-group by 1 order by 1
+pts = conn.execute("""
+    select
+        workedby,
+        work_date,
+        meterno,
+        min(worked_datetime) as worked_datetime,
+        any_value(latitude) as latitude,
+        any_value(longitude) as longitude,
+        max(pt_flag) as pt_flag
+    from for_mapping
+    where workedby is not null
+      and meterno is not null
+      and latitude is not null
+      and longitude is not null
+      and outcome <> 'ALREADY GONE'
+    group by
+        workedby,
+        work_date,
+        meterno
+""").df()
