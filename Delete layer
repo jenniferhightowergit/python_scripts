@@ -1,77 +1,226 @@
-targets = conn.execute("""
-    select distinct
-        workedby,
-        work_date,
-        target_meter,
-        target_worked_datetime,
-        target_lat as latitude,
-        target_lon as longitude
-    from combined
-    where target_worked_datetime is not null
-      and workedby is not null
-      and target_meter is not null
-      and target_lat is not null
-      and target_lon is not null
-""").df()
+"""
+METER_EFFECTIVEDATE_CHANGE - incremental parquet load.
+
+Pulls only meters whose SCD rows changed in the last N days, upserts them into
+the existing parquet on (esi_loc, meterno), recomputes prev_meterno, and writes
+the file back. No truncate-and-reload.
+
+Designed to be called from the loading schedule:
+    python load_meter_effectivedate_change.py
+or imported:
+    from load_meter_effectivedate_change import run
+    run(lookback_days=30)
+"""
+
+import logging
+import os
+import sys
+from datetime import datetime
+
+import duckdb
+import pandas as pd
+
+# from your existing connection module:
+# from <your_module> import edw_alchemy_engine
+
+PARQUET_PATH = r"C:\Users\UIX9\Documents\JensFakeDW\Staging\parquet\METER_EFFECTIVEDATE_CHANGE.parquet"
+LOOKBACK_DAYS = 30
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+)
+log = logging.getLogger("meter_effdate_load")
 
 
-EPS_MILES = 0.25
-EARTH_MI = 3959.0
+# ---------------------------------------------------------------------------
+# 1. Delta pull from the EDW
+# ---------------------------------------------------------------------------
+# Two stages on purpose:
+#   changed -> the (esi_loc, meterno) pairs that had ANY row touched recently
+#   scd     -> ALL history rows for those pairs
+# We need every row for a changed pair, not just the recent ones, because the
+# min(installation_date) / max(meter_removal_date) rollup below would otherwise
+# be computed off a partial history and produce wrong dates.
 
-labelled = []
+DELTA_SQL = """
+WITH changed AS (
+    SELECT DISTINCT
+           trim(mtr.CLIENT_CO_LOCATION_ID) loc_id,
+           trim(mtr.CLIENT_MDVC_NUMBER)    mdvc
+      FROM wacsmdms.vw_scd_meter mtr
+     WHERE mtr.EFFECTIVE_DATE >= trunc(sysdate) - :lookback_days
+        OR (    mtr.END_EFFECTIVE_DATE >= trunc(sysdate) - :lookback_days
+            AND mtr.END_EFFECTIVE_DATE <  date '4000-12-31')
+),
+scd AS (
+    SELECT substr(to_char(trim(mtr.CLIENT_CO_LOCATION_ID)), 8, 10) esi_loc,
+           trim(mtr.CLIENT_MDVC_NUMBER)      meterno,
+           trunc(mtr.EFFECTIVE_DATE)         eff_dt,
+           trunc(mtr.END_EFFECTIVE_DATE)     end_dt
+      FROM wacsmdms.vw_scd_meter mtr
+      JOIN changed c
+        ON trim(mtr.CLIENT_CO_LOCATION_ID) = c.loc_id
+       AND trim(mtr.CLIENT_MDVC_NUMBER)    = c.mdvc
+)
+SELECT DISTINCT
+       eff_dt AS installation_date,
+       CASE WHEN end_dt = date '4000-12-31'
+            THEN date '3001-01-01'
+            ELSE end_dt
+       END    AS meter_removal_date,
+       esi_loc,
+       meterno
+  FROM scd
+"""
 
-for (tech, day), g in targets.groupby(["workedby", "work_date"]):
 
-    coords = np.radians(
-        g[["latitude", "longitude"]].to_numpy()
+def fetch_delta(engine, lookback_days):
+    """Return raw changed SCD rows as a DataFrame."""
+    with engine.connect() as sql_connection:
+        df = pd.read_sql(
+            DELTA_SQL,
+            sql_connection,
+            params={"lookback_days": lookback_days},
+        )
+    df.columns = [c.lower() for c in df.columns]
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 2. Merge into the existing parquet
+# ---------------------------------------------------------------------------
+
+def merge_into_parquet(delta_df, parquet_path):
+    """Upsert delta_df into parquet_path. Returns (inserted, updated, total)."""
+    con = duckdb.connect()
+    con.register("delta_raw", delta_df)
+
+    con.execute(
+        "CREATE OR REPLACE VIEW existing AS SELECT * FROM read_parquet(?)",
+        [parquet_path],
     )
 
-    db = DBSCAN(
-        eps=EPS_MILES / EARTH_MI,
-        min_samples=2,
-        metric="haversine"
-    ).fit(coords)
+    # Same rollup you do today, but only over the changed pairs.
+    con.execute("""
+        CREATE OR REPLACE TABLE delta AS
+        SELECT min(installation_date)  AS installation_date,
+               max(meter_removal_date) AS meter_removal_date,
+               esi_loc,
+               meterno
+          FROM delta_raw
+         GROUP BY esi_loc, meterno
+    """)
 
-    g = g.copy()
+    # Only keep rows that are genuinely new or genuinely different.
+    con.execute("""
+        CREATE OR REPLACE TABLE changed AS
+        SELECT d.installation_date,
+               d.meter_removal_date,
+               d.esi_loc,
+               d.meterno,
+               CASE WHEN e.meterno IS NULL THEN 'insert' ELSE 'update' END AS action
+          FROM delta d
+          LEFT JOIN existing e
+                 ON e.esi_loc = d.esi_loc
+                AND e.meterno = d.meterno
+         WHERE e.meterno IS NULL
+            OR e.meter_removal_date IS DISTINCT FROM d.meter_removal_date
+            OR e.installation_date  IS DISTINCT FROM d.installation_date
+    """)
 
-    g["cluster_num"] = db.labels_
+    inserted, updated = con.execute("""
+        SELECT count(*) FILTER (WHERE action = 'insert'),
+               count(*) FILTER (WHERE action = 'update')
+          FROM changed
+    """).fetchone()
 
-    g["cluster_id"] = [
-        f"{tech}_{day}_{lbl}"
-        if lbl >= 0
-        else f"{tech}_{day}_solo_{meter}"
-        for lbl, meter in zip(
-            db.labels_,
-            g["target_meter"]
+    if inserted == 0 and updated == 0:
+        log.info("No new or changed meters in the lookback window. File untouched.")
+        con.close()
+        return 0, 0, 0
+
+    # Old rows minus the ones being replaced, plus the new/changed ones.
+    con.execute("""
+        CREATE OR REPLACE TABLE merged AS
+        SELECT e.installation_date, e.meter_removal_date, e.esi_loc, e.meterno
+          FROM existing e
+         WHERE NOT EXISTS (
+                   SELECT 1 FROM changed c
+                    WHERE c.esi_loc = e.esi_loc
+                      AND c.meterno = e.meterno)
+        UNION ALL
+        SELECT installation_date, meter_removal_date, esi_loc, meterno
+          FROM changed
+    """)
+
+    # prev_meterno is order-dependent, so it has to be recomputed after the
+    # merge - inserting a meter shifts the lag chain for that whole esi_loc.
+    con.execute("""
+        CREATE OR REPLACE TABLE final AS
+        SELECT lag(meterno) OVER (PARTITION BY esi_loc
+                                  ORDER BY installation_date) AS prev_meterno,
+               installation_date,
+               meter_removal_date,
+               esi_loc,
+               meterno
+          FROM merged
+    """)
+
+    total = con.execute("SELECT count(*) FROM final").fetchone()[0]
+
+    # Write to a temp file first so a failure never leaves a half-written parquet.
+    tmp_path = parquet_path + ".tmp"
+    con.execute(
+        "COPY final TO ? (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        [tmp_path],
+    )
+    con.close()
+
+    backup_path = parquet_path + ".bak"
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+    os.replace(parquet_path, backup_path)
+    os.replace(tmp_path, parquet_path)
+
+    return inserted, updated, total
+
+
+# ---------------------------------------------------------------------------
+# 3. Entry point
+# ---------------------------------------------------------------------------
+
+def run(engine=None, parquet_path=PARQUET_PATH, lookback_days=LOOKBACK_DAYS):
+    start = datetime.now()
+
+    if engine is None:
+        raise ValueError("Pass in edw_alchemy_engine (or import it at the top).")
+
+    if not os.path.exists(parquet_path):
+        raise FileNotFoundError(
+            f"{parquet_path} does not exist. Run the full historical load once "
+            "before switching to the incremental job."
         )
-    ]
 
-    labelled.append(g)
+    log.info("Pulling meters changed in the last %s days...", lookback_days)
+    delta_df = fetch_delta(engine, lookback_days)
+    log.info("Delta pull returned %s SCD rows.", len(delta_df))
 
-target_clusters = pd.concat(labelled, ignore_index=True)
+    if delta_df.empty:
+        log.info("Nothing changed. Done in %s.", datetime.now() - start)
+        return
 
-conn.register("target_clusters", target_clusters)
-
-
-
-with relationships as (
-
-    select
-        c.*,
-        tc.cluster_id
-
-    from combined c
-
-    left join target_clusters tc
-        on c.workedby = tc.workedby
-       and c.work_date = tc.work_date
-       and c.target_meter = tc.target_meter
-
-)
-
-select *
-from relationships
+    inserted, updated, total = merge_into_parquet(delta_df, parquet_path)
+    log.info(
+        "Inserted %s, updated %s, file now %s rows. Elapsed %s.",
+        inserted, updated, total, datetime.now() - start,
+    )
 
 
-
-
+if __name__ == "__main__":
+    from <your_module> import edw_alchemy_engine  # noqa: F401 - fix this import
+    try:
+        run(engine=edw_alchemy_engine)
+    except Exception:
+        log.exception("Incremental load failed.")
+        sys.exit(1)
