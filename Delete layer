@@ -1,23 +1,156 @@
-select
-    workedby,
-    work_date,
-    cluster_id,
+, cluster_overlaps as (
 
-    cluster_start_time,
-    cluster_end_time,
+    select
+        a.workedby,
+        a.work_date,
 
-    previous_cluster_id,
-    previous_cluster_end_time,
+        a.cluster_id as cluster_a,
+        b.cluster_id as cluster_b,
 
-    datediff(
-        'minute',
-        previous_cluster_end_time,
-        cluster_start_time
-    ) as calculated_gap_minutes
+        a.cluster_start_time as cluster_a_start,
+        a.cluster_end_time   as cluster_a_end,
 
-from cluster_sequence
+        b.cluster_start_time as cluster_b_start,
+        b.cluster_end_time   as cluster_b_end,
 
+        greatest(
+            a.cluster_start_time,
+            b.cluster_start_time
+        ) as overlap_start,
+
+        least(
+            a.cluster_end_time,
+            b.cluster_end_time
+        ) as overlap_end,
+
+        datediff(
+            'minute',
+            greatest(
+                a.cluster_start_time,
+                b.cluster_start_time
+            ),
+            least(
+                a.cluster_end_time,
+                b.cluster_end_time
+            )
+        ) as overlap_minutes
+
+    from cluster_time_summary a
+
+    join cluster_time_summary b
+        on a.workedby = b.workedby
+       and a.work_date = b.work_date
+
+       -- prevents A/B and B/A duplicates
+       and a.cluster_id < b.cluster_id
+
+       -- intervals overlap
+       and a.cluster_start_time < b.cluster_end_time
+       and b.cluster_start_time < a.cluster_end_time
+)
+
+
+select *
+from cluster_overlaps
 where workedby = 'RUNU'
-  and work_date = date '2026-02-10'
+  and work_date = date '2026-02-10';
 
-order by cluster_start_time;
+
+, ordered_clusters as (
+
+    select
+        *,
+
+        max(cluster_end_time) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+            rows between unbounded preceding and 1 preceding
+        ) as prior_max_end
+
+    from cluster_time_summary
+),
+
+episode_starts as (
+
+    select
+        *,
+
+        case
+            when prior_max_end is null
+              or cluster_start_time > prior_max_end
+            then 1
+            else 0
+        end as new_episode_flag
+
+    from ordered_clusters
+),
+
+episode_numbers as (
+
+    select
+        *,
+
+        sum(new_episode_flag) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+        ) as episode_num
+
+    from episode_starts
+),
+
+activity_episodes as (
+
+    select
+        workedby,
+        work_date,
+        episode_num,
+
+        min(cluster_start_time) as episode_start_time,
+        max(cluster_end_time)   as episode_end_time,
+
+        count(distinct cluster_id) as clusters_in_episode,
+
+        datediff(
+            'minute',
+            min(cluster_start_time),
+            max(cluster_end_time)
+        ) as episode_minutes
+
+    from episode_numbers
+
+    group by
+        workedby,
+        work_date,
+        episode_num
+)
+
+
+, event_sequence as (
+
+    select
+        *,
+
+        lag(cluster_id) over (
+            partition by workedby, work_date
+            order by worked_datetime
+        ) as previous_cluster_id
+
+    from actual_work
+)
+
+
+, cluster_switches as (
+
+    select
+        *,
+
+        case
+            when previous_cluster_id is not null
+             and cluster_id <> previous_cluster_id
+            then 1
+            else 0
+        end as cluster_switch_flag
+
+    from event_sequence
+)
+
