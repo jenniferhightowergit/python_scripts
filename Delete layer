@@ -1,34 +1,3 @@
-with actual_work as (
-
-    select distinct
-        cluster_id,
-        workedby,
-        work_date,
-        target_meter as meterno,
-        target_worked_datetime as worked_datetime
-
-    from prep_for_mapping
-
-    where cluster_id is not null
-      and workedby is not null
-      and target_worked_datetime is not null
-
-),
-
-work_gaps as (
-
-    select
-        *,
-
-        lag(worked_datetime) over (
-            partition by cluster_id
-            order by worked_datetime
-        ) as previous_worked_datetime
-
-    from actual_work
-
-),
-
 cluster_time_summary as (
 
     select
@@ -38,6 +7,12 @@ cluster_time_summary as (
 
         min(worked_datetime) as cluster_start_time,
         max(worked_datetime) as cluster_end_time,
+
+        arg_min(latitude, worked_datetime) as cluster_start_lat,
+        arg_min(longitude, worked_datetime) as cluster_start_lon,
+
+        arg_max(latitude, worked_datetime) as cluster_end_lat,
+        arg_max(longitude, worked_datetime) as cluster_end_lon,
 
         count(distinct meterno) as meters_worked,
 
@@ -78,6 +53,82 @@ cluster_time_summary as (
         workedby,
         work_date
 )
+, cluster_sequence as (
+
+    select
+        *,
+
+        lag(cluster_id) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+        ) as previous_cluster_id,
+
+        lag(cluster_end_time) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+        ) as previous_cluster_end_time,
+
+        lag(cluster_end_lat) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+        ) as previous_cluster_end_lat,
+
+        lag(cluster_end_lon) over (
+            partition by workedby, work_date
+            order by cluster_start_time
+        ) as previous_cluster_end_lon
+
+    from cluster_time_summary
+)
+
+, cluster_metrics as (
+
+    select
+        *,
+
+        case
+            when previous_cluster_id is null then null
+
+            else round(
+                3959 * 2 * asin(
+                    sqrt(
+                        power(
+                            sin(
+                                radians(
+                                    cluster_start_lat
+                                    - previous_cluster_end_lat
+                                ) / 2
+                            ), 2
+                        )
+                        +
+                        cos(radians(previous_cluster_end_lat))
+                        * cos(radians(cluster_start_lat))
+                        * power(
+                            sin(
+                                radians(
+                                    cluster_start_lon
+                                    - previous_cluster_end_lon
+                                ) / 2
+                            ), 2
+                        )
+                    )
+                ),
+                2
+            )
+        end as travel_miles_from_previous_cluster,
+
+        case
+            when previous_cluster_id is null then null
+
+            else datediff(
+                'minute',
+                previous_cluster_end_time,
+                cluster_start_time
+            )
+        end as minutes_since_previous_cluster
+
+    from cluster_sequence
+)
 
 select *
-from cluster_time_summary
+from cluster_metrics
