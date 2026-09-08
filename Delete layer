@@ -1,47 +1,23 @@
-, daily_metrics as (
+select
+    workedby,
+    work_date,
+    cluster_id,
 
-    select
-        workedby,
-        work_date,
+    cluster_start_time,
+    cluster_end_time,
 
-        -- workload
-        count(distinct cluster_id) as clusters_worked,
-        sum(meters_worked) as meters_worked,
+    previous_cluster_id,
+    previous_cluster_end_time,
 
-        -- distance
-        sum(travel_miles_from_previous_cluster)
-            as total_travel_miles,
+    datediff(
+        'minute',
+        previous_cluster_end_time,
+        cluster_start_time
+    ) as calculated_gap_minutes
 
-        avg(travel_miles_from_previous_cluster)
-            as avg_miles_between_clusters,
+from cluster_sequence
 
-        -- meter work time
-        sum(cluster_duration_minutes)
-            as total_cluster_work_minutes,
+where workedby = 'RUNU'
+  and work_date = date '2026-02-10'
 
-        avg(cluster_duration_minutes)
-            as avg_minutes_per_cluster,
-
-        -- pace within clusters
-        avg(avg_minutes_between_changes)
-            as avg_minutes_between_changes,
-
-        median(median_minutes_between_changes)
-            as median_minutes_between_changes,
-
-        -- time between clusters
-        sum(minutes_since_previous_cluster)
-            as total_minutes_between_clusters,
-
-        avg(minutes_since_previous_cluster)
-            as avg_minutes_between_clusters
-
-    from cluster_metrics
-
-    group by
-        workedby,
-        work_date
-)
-
-select *
-from daily_metrics
+order by cluster_start_time;
