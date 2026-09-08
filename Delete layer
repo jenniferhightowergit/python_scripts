@@ -1,156 +1,273 @@
-, cluster_overlaps as (
+-- ============================================================================
+-- Meter tech field behavior metrics
+-- Source: prep_for_mapping
+--
+-- Layers (each one is queryable on its own):
+--   meter_events   -> one row per meter work event
+--   meter_visits   -> same rows, tagged with which cluster "visit" they belong to
+--   visit_metrics  -> one row per cluster VISIT (a stint inside a cluster)
+--   cluster_daily  -> one row per tech / day / cluster
+--   tech_daily     -> one row per tech / day        <- your main dashboard grain
+--   tech_summary   -> one row per tech
+--
+-- Key modeling change from the original:
+--   The old script summarized by cluster_id per day using min()/max() of
+--   worked_datetime. If a tech leaves cluster A, works cluster B, then comes
+--   back to A, that makes A's "duration" swallow the entire B detour, and the
+--   travel chain misses the return trips. Here the unit is a VISIT (a
+--   contiguous run of meters in one cluster), so switching back and forth is
+--   represented directly instead of needing the overlap / episode CTEs.
+-- ============================================================================
 
-    select
-        a.workedby,
-        a.work_date,
 
-        a.cluster_id as cluster_a,
-        b.cluster_id as cluster_b,
-
-        a.cluster_start_time as cluster_a_start,
-        a.cluster_end_time   as cluster_a_end,
-
-        b.cluster_start_time as cluster_b_start,
-        b.cluster_end_time   as cluster_b_end,
-
-        greatest(
-            a.cluster_start_time,
-            b.cluster_start_time
-        ) as overlap_start,
-
-        least(
-            a.cluster_end_time,
-            b.cluster_end_time
-        ) as overlap_end,
-
-        datediff(
-            'minute',
-            greatest(
-                a.cluster_start_time,
-                b.cluster_start_time
-            ),
-            least(
-                a.cluster_end_time,
-                b.cluster_end_time
+-- ----------------------------------------------------------------------------
+-- 0. Reusable helpers (kills ~40 lines of inline haversine)
+-- ----------------------------------------------------------------------------
+create or replace macro miles_between(lat1, lon1, lat2, lon2) as
+    round(
+        3959 * 2 * asin(
+            sqrt(
+                power(sin(radians(lat2 - lat1) / 2), 2)
+                + cos(radians(lat1))
+                  * cos(radians(lat2))
+                  * power(sin(radians(lon2 - lon1) / 2), 2)
             )
-        ) as overlap_minutes
+        ),
+        2
+    );
 
-    from cluster_time_summary a
-
-    join cluster_time_summary b
-        on a.workedby = b.workedby
-       and a.work_date = b.work_date
-
-       -- prevents A/B and B/A duplicates
-       and a.cluster_id < b.cluster_id
-
-       -- intervals overlap
-       and a.cluster_start_time < b.cluster_end_time
-       and b.cluster_start_time < a.cluster_end_time
-)
+create or replace macro minutes_between(t1, t2) as
+    datediff('second', t1, t2) / 60.0;
 
 
-select *
-from cluster_overlaps
-where workedby = 'RUNU'
-  and work_date = date '2026-02-10';
+-- ----------------------------------------------------------------------------
+-- 1. Base events
+--    Materialized as a table so the views below don't depend on the pandas
+--    frame still being in scope.
+-- ----------------------------------------------------------------------------
+create or replace table meter_events as
+select distinct
+    workedby,
+    work_date,
+    cluster_id,
+    target_meter           as meterno,
+    target_worked_datetime as worked_datetime,
+    target_lat             as latitude,
+    target_lon             as longitude
+from prep_for_mapping
+where cluster_id             is not null
+  and workedby               is not null
+  and target_worked_datetime is not null;
 
 
-, ordered_clusters as (
-
+-- ----------------------------------------------------------------------------
+-- 2. Tag each event with the previous event for that tech's day, and flag the
+--    moments where they moved to a different cluster.
+--    NOTE: the original lagged by cluster_id only. Partitioning by
+--    (workedby, work_date) is what you actually want -- it keeps two techs in
+--    the same cluster from being chained together.
+-- ----------------------------------------------------------------------------
+create or replace view meter_visits as
+with seq as (
     select
         *,
-
-        max(cluster_end_time) over (
-            partition by workedby, work_date
-            order by cluster_start_time
-            rows between unbounded preceding and 1 preceding
-        ) as prior_max_end
-
-    from cluster_time_summary
+        lag(cluster_id)      over w as previous_cluster_id,
+        lag(worked_datetime) over w as previous_worked_datetime
+    from meter_events
+    window w as (partition by workedby, work_date order by worked_datetime)
 ),
-
-episode_starts as (
-
+flagged as (
     select
         *,
-
         case
-            when prior_max_end is null
-              or cluster_start_time > prior_max_end
-            then 1
+            when previous_cluster_id is null            then 1
+            when cluster_id <> previous_cluster_id      then 1
             else 0
-        end as new_episode_flag
+        end as is_cluster_switch
+    from seq
+)
+select
+    *,
+    sum(is_cluster_switch) over (
+        partition by workedby, work_date
+        order by worked_datetime
+        rows between unbounded preceding and current row
+    ) as visit_num
+from flagged;
 
-    from ordered_clusters
-),
 
-episode_numbers as (
-
-    select
-        *,
-
-        sum(new_episode_flag) over (
-            partition by workedby, work_date
-            order by cluster_start_time
-        ) as episode_num
-
-    from episode_starts
-),
-
-activity_episodes as (
-
+-- ----------------------------------------------------------------------------
+-- 3. One row per visit: how long they were there, how far they came, pace
+-- ----------------------------------------------------------------------------
+create or replace view visit_metrics as
+with visit_base as (
     select
         workedby,
         work_date,
-        episode_num,
+        visit_num,
+        cluster_id,
 
-        min(cluster_start_time) as episode_start_time,
-        max(cluster_end_time)   as episode_end_time,
+        min(worked_datetime) as visit_start_time,
+        max(worked_datetime) as visit_end_time,
 
-        count(distinct cluster_id) as clusters_in_episode,
+        arg_min(latitude,  worked_datetime) as start_lat,
+        arg_min(longitude, worked_datetime) as start_lon,
+        arg_max(latitude,  worked_datetime) as end_lat,
+        arg_max(longitude, worked_datetime) as end_lon,
 
-        datediff(
-            'minute',
-            min(cluster_start_time),
-            max(cluster_end_time)
-        ) as episode_minutes
+        count(distinct meterno) as meters_worked,
+        count(*)                as meter_changes,
 
-    from episode_numbers
+        minutes_between(min(worked_datetime), max(worked_datetime))
+            as visit_minutes,
 
-    group by
-        workedby,
-        work_date,
-        episode_num
+        -- pace inside the cluster; the filter drops the arrival gap, which is
+        -- travel time rather than working time
+        avg(minutes_between(previous_worked_datetime, worked_datetime))
+            filter (where is_cluster_switch = 0)
+            as avg_minutes_between_meters,
+        median(minutes_between(previous_worked_datetime, worked_datetime))
+            filter (where is_cluster_switch = 0)
+            as median_minutes_between_meters,
+        max(minutes_between(previous_worked_datetime, worked_datetime))
+            filter (where is_cluster_switch = 0)
+            as max_minutes_between_meters
+
+    from meter_visits
+    group by workedby, work_date, visit_num, cluster_id
 )
+select
+    *,
+    lag(cluster_id)     over w as previous_cluster_id,
+    lag(visit_end_time) over w as previous_visit_end_time,
+
+    minutes_between(lag(visit_end_time) over w, visit_start_time)
+        as travel_minutes_from_previous,
+
+    miles_between(
+        lag(end_lat) over w,
+        lag(end_lon) over w,
+        start_lat,
+        start_lon
+    ) as travel_miles_from_previous
+
+from visit_base
+window w as (partition by workedby, work_date order by visit_start_time);
 
 
-, event_sequence as (
+-- ----------------------------------------------------------------------------
+-- 4. Per cluster, per day. visits > 1 means they left and came back.
+-- ----------------------------------------------------------------------------
+create or replace view cluster_daily as
+select
+    workedby,
+    work_date,
+    cluster_id,
 
-    select
-        *,
+    count(*)                          as visits,
+    count(*) - 1                      as times_returned,
+    sum(meters_worked)                as meters_worked,
+    sum(meter_changes)                as meter_changes,
+    sum(visit_minutes)                as minutes_in_cluster,
+    sum(travel_miles_from_previous)   as miles_traveled_to_reach,
+    sum(travel_minutes_from_previous) as minutes_traveled_to_reach,
 
-        lag(cluster_id) over (
-            partition by workedby, work_date
-            order by worked_datetime
-        ) as previous_cluster_id
+    min(visit_start_time)             as first_seen,
+    max(visit_end_time)               as last_seen
 
-    from actual_work
-)
+from visit_metrics
+group by workedby, work_date, cluster_id;
 
 
-, cluster_switches as (
+-- ----------------------------------------------------------------------------
+-- 5. Per tech, per day -- this is the one that answers your list
+-- ----------------------------------------------------------------------------
+create or replace view tech_daily as
+select
+    workedby,
+    work_date,
 
-    select
-        *,
+    -- workload
+    count(distinct cluster_id)              as clusters_worked,
+    count(*)                                as cluster_visits,
+    count(*) - count(distinct cluster_id)   as cluster_revisits,
+    greatest(count(*) - 1, 0)               as cluster_switches,
+    sum(meters_worked)                      as meters_worked,
+    sum(meter_changes)                      as meter_changes,
 
-        case
-            when previous_cluster_id is not null
-             and cluster_id <> previous_cluster_id
-            then 1
-            else 0
-        end as cluster_switch_flag
+    -- distance
+    sum(travel_miles_from_previous)         as total_travel_miles,
+    avg(travel_miles_from_previous)         as avg_miles_between_clusters,
 
-    from event_sequence
-)
+    -- time working
+    sum(visit_minutes)                      as total_cluster_minutes,
+    avg(visit_minutes)                      as avg_minutes_per_visit,
 
+    -- time moving
+    sum(travel_minutes_from_previous)       as total_travel_minutes,
+    avg(travel_minutes_from_previous)       as avg_minutes_between_clusters,
+
+    -- pace within clusters
+    avg(avg_minutes_between_meters)         as avg_minutes_between_changes,
+    median(median_minutes_between_meters)   as median_minutes_between_changes,
+
+    -- shift shape
+    min(visit_start_time)                   as day_start,
+    max(visit_end_time)                     as day_end,
+    minutes_between(min(visit_start_time), max(visit_end_time))
+                                            as day_span_minutes,
+    round(
+        100.0 * sum(visit_minutes)
+        / nullif(minutes_between(min(visit_start_time), max(visit_end_time)), 0),
+        1
+    )                                       as pct_of_day_in_clusters
+
+from visit_metrics
+group by workedby, work_date;
+
+
+-- ----------------------------------------------------------------------------
+-- 6. Per tech, all days
+-- ----------------------------------------------------------------------------
+create or replace view tech_summary as
+select
+    workedby,
+
+    count(distinct work_date)                as days_worked,
+    count(distinct cluster_id)               as distinct_clusters,
+    count(*)                                 as total_cluster_visits,
+    sum(meters_worked)                       as total_meters,
+    sum(meter_changes)                       as total_meter_changes,
+
+    sum(travel_miles_from_previous)          as total_travel_miles,
+    sum(visit_minutes)                       as total_cluster_minutes,
+    sum(travel_minutes_from_previous)        as total_travel_minutes,
+
+    round(sum(travel_miles_from_previous)
+          / nullif(count(distinct work_date), 0), 1)  as avg_miles_per_day,
+    round(sum(visit_minutes)
+          / nullif(count(distinct work_date), 0), 1)  as avg_cluster_minutes_per_day,
+    round(sum(meters_worked)
+          / nullif(count(distinct work_date), 0), 1)  as avg_meters_per_day
+
+from visit_metrics
+group by workedby;
+
+
+-- ============================================================================
+-- Python side becomes:
+--
+--   import duckdb
+--   conn = duckdb.connect()
+--   conn.execute(open("meter_tech_metrics.sql").read())
+--
+--   tech_daily    = conn.execute("select * from tech_daily "
+--                                "order by workedby, work_date").df()
+--   tech_summary  = conn.execute("select * from tech_summary "
+--                                "order by workedby").df()
+--   cluster_daily = conn.execute("select * from cluster_daily "
+--                                "order by workedby, work_date, first_seen").df()
+--
+-- Debugging a weird number now means selecting from one layer instead of
+-- bisecting a 380-line CTE chain.
+-- ============================================================================
