@@ -1,70 +1,83 @@
---cluster summary
+with actual_work as (
 
-select
-    cluster_id,
-    workedby,
-    work_date,
+    select distinct
+        cluster_id,
+        workedby,
+        work_date,
+        target_meter as meterno,
+        target_worked_datetime as worked_datetime
 
-    count(distinct case
-        when outcome in ('TARGET ITSELF', 'PERIODIC TEST')
-        then meterno
-    end) as meters_worked,
+    from prep_for_mapping
 
-    count(distinct case
-        when outcome = 'PERIODIC TEST'
-        then meterno
-    end) as periodic_tests,
+    where cluster_id is not null
+      and workedby is not null
+      and target_worked_datetime is not null
 
-    count(distinct case
-        when outcome = 'MISSED OPPORTUNITY'
-        then meterno
-    end) as unique_missed_meters,
+),
 
-    count(distinct case
-        when outcome = 'CAPTURED SAME DAY'
-        then meterno
-    end) as captured_meters
+work_gaps as (
 
-from for_mapping
+    select
+        *,
 
-where cluster_id is not null
+        lag(worked_datetime) over (
+            partition by cluster_id
+            order by worked_datetime
+        ) as previous_worked_datetime
 
-group by
-    cluster_id,
-    workedby,
-    work_date
+    from actual_work
 
+),
 
---meter opportunity
+cluster_time_summary as (
 
-select
-    cluster_id,
-    workedby,
-    work_date,
-    meterno,
+    select
+        cluster_id,
+        workedby,
+        work_date,
 
-    max(case
-        when outcome = 'MISSED OPPORTUNITY'
-        then 1 else 0
-    end) as missed_flag,
+        min(worked_datetime) as cluster_start_time,
+        max(worked_datetime) as cluster_end_time,
 
-    count(distinct target_meter) as target_exposures,
+        count(distinct meterno) as meters_worked,
 
-    min(distance_feet) as closest_target_feet
+        datediff(
+            'second',
+            min(worked_datetime),
+            max(worked_datetime)
+        ) / 60.0 as cluster_duration_minutes,
 
-from for_mapping
+        avg(
+            datediff(
+                'second',
+                previous_worked_datetime,
+                worked_datetime
+            ) / 60.0
+        ) as avg_minutes_between_changes,
 
-where outcome = 'MISSED OPPORTUNITY'
+        median(
+            datediff(
+                'second',
+                previous_worked_datetime,
+                worked_datetime
+            ) / 60.0
+        ) as median_minutes_between_changes,
 
-group by
-    cluster_id,
-    workedby,
-    work_date,
-    meterno
+        max(
+            datediff(
+                'second',
+                previous_worked_datetime,
+                worked_datetime
+            ) / 60.0
+        ) as max_gap_minutes
 
+    from work_gaps
 
+    group by
+        cluster_id,
+        workedby,
+        work_date
+)
 
-
-
-
-
+select *
+from cluster_time_summary
