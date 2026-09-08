@@ -1,21 +1,68 @@
-def merge_into_parquet(delta_df, parquet_path):
-    con = duckdb.connect()
-    con.register("delta_raw", delta_df)
+--cluster summary
 
-    tmp_path  = parquet_path + ".tmp"
-    safe_path = parquet_path.replace("\\", "/")
-    safe_tmp  = tmp_path.replace("\\", "/")
+select
+    cluster_id,
+    workedby,
+    work_date,
 
-    con.execute(
-        f"CREATE OR REPLACE VIEW existing AS SELECT * FROM read_parquet('{safe_path}')"
-    )
+    count(distinct case
+        when outcome in ('TARGET ITSELF', 'PERIODIC TEST')
+        then meterno
+    end) as meters_worked,
+
+    count(distinct case
+        when outcome = 'PERIODIC TEST'
+        then meterno
+    end) as periodic_tests,
+
+    count(distinct case
+        when outcome = 'MISSED OPPORTUNITY'
+        then meterno
+    end) as unique_missed_meters,
+
+    count(distinct case
+        when outcome = 'CAPTURED SAME DAY'
+        then meterno
+    end) as captured_meters
+
+from for_mapping
+
+where cluster_id is not null
+
+group by
+    cluster_id,
+    workedby,
+    work_date
 
 
+--meter opportunity
 
-    con.execute(
-        f"COPY final TO '{safe_tmp}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-    )
-    con.close()
+select
+    cluster_id,
+    workedby,
+    work_date,
+    meterno,
+
+    max(case
+        when outcome = 'MISSED OPPORTUNITY'
+        then 1 else 0
+    end) as missed_flag,
+
+    count(distinct target_meter) as target_exposures,
+
+    min(distance_feet) as closest_target_feet
+
+from for_mapping
+
+where outcome = 'MISSED OPPORTUNITY'
+
+group by
+    cluster_id,
+    workedby,
+    work_date,
+    meterno
+
+
 
 
 
