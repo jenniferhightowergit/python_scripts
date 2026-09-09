@@ -1,0 +1,184 @@
+"""
+Gantt chart of one meter tech's workday.
+
+Each bar is a visit -- a contiguous stint in one cluster. Rows are clusters,
+so if a tech leaves a cluster and comes back, you get two bars on the same
+row with a gap between them. That's the backtracking, visible.
+
+Gaps between bars are travel. Dots on the bars are individual meter changes.
+
+Requires: visit_metrics and meter_events from meter_tech_weekly.sql
+"""
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Patch
+
+# ---------------------------------------------------------------------------
+# Pick your subject
+# ---------------------------------------------------------------------------
+TECH = "U36O"
+DAY = "2026-04-21"
+
+MIN_BAR_MINUTES = 2.0   # single-meter visits have zero duration; without a
+                        # floor they render as invisible hairlines
+
+
+def busiest_days(conn, limit=15):
+    """Run this first to find a day worth looking at."""
+    return conn.execute("""
+        select
+            workedby,
+            work_date,
+            count(*)                   as visits,
+            count(distinct cluster_id) as clusters,
+            sum(meters_worked)         as meters
+        from visit_metrics
+        group by workedby, work_date
+        having count(*) >= 4
+        order by visits desc, meters desc
+        limit ?
+    """, [limit]).df()
+
+
+def plot_workday(conn, tech, day, min_bar_minutes=MIN_BAR_MINUTES):
+
+    visits = conn.execute("""
+        select
+            cluster_id,
+            visit_num,
+            visit_start_time,
+            visit_end_time,
+            visit_minutes,
+            meters_worked,
+            travel_miles_from_previous,
+            travel_minutes_from_previous
+        from visit_metrics
+        where workedby = ?
+          and work_date = cast(? as date)
+        order by visit_start_time
+    """, [tech, day]).df()
+
+    if visits.empty:
+        print(f"No visits for {tech} on {day}")
+        return None
+
+    events = conn.execute("""
+        select cluster_id, worked_datetime
+        from meter_events
+        where workedby = ?
+          and work_date = cast(? as date)
+        order by worked_datetime
+    """, [tech, day]).df()
+
+    # rows ordered by first appearance, so the chart reads top-to-bottom
+    # in the order the tech encountered the clusters
+    order = visits.drop_duplicates("cluster_id")["cluster_id"].tolist()
+    row_of = {cid: i for i, cid in enumerate(order)}
+
+    colors = plt.cm.tab20.colors
+    color_of = {cid: colors[i % len(colors)] for i, cid in enumerate(order)}
+
+    fig, ax = plt.subplots(figsize=(13, 1.1 * len(order) + 2.5))
+
+    for _, v in visits.iterrows():
+        start = mdates.date2num(v["visit_start_time"])
+        minutes = max(float(v["visit_minutes"] or 0), min_bar_minutes)
+        width = minutes / (24 * 60)
+        row = row_of[v["cluster_id"]]
+
+        ax.barh(
+            row, width, left=start, height=0.55,
+            color=color_of[v["cluster_id"]],
+            edgecolor="black", linewidth=0.6, zorder=3,
+        )
+
+        ax.text(
+            start + width / 2, row,
+            f"{int(v['meters_worked'])}m",
+            ha="center", va="center",
+            fontsize=8, fontweight="bold",
+            color="white", zorder=5,
+        )
+
+    # travel connectors between consecutive visits
+    for i in range(1, len(visits)):
+        prev = visits.iloc[i - 1]
+        cur = visits.iloc[i]
+
+        x0 = mdates.date2num(prev["visit_end_time"])
+        x1 = mdates.date2num(cur["visit_start_time"])
+        y0 = row_of[prev["cluster_id"]]
+        y1 = row_of[cur["cluster_id"]]
+
+        ax.annotate(
+            "", xy=(x1, y1), xytext=(x0, y0),
+            arrowprops=dict(
+                arrowstyle="->", color="grey",
+                linestyle="--", linewidth=1.1,
+                connectionstyle="arc3,rad=0.12",
+            ),
+            zorder=2,
+        )
+
+        miles = cur["travel_miles_from_previous"]
+        mins = cur["travel_minutes_from_previous"]
+        if miles is not None and mins is not None:
+            ax.text(
+                (x0 + x1) / 2, (y0 + y1) / 2 - 0.32,
+                f"{miles:.1f} mi / {mins:.0f} min",
+                ha="center", fontsize=7.5, color="dimgrey", zorder=4,
+            )
+
+    # individual meter changes
+    for _, e in events.iterrows():
+        ax.scatter(
+            mdates.date2num(e["worked_datetime"]),
+            row_of.get(e["cluster_id"], 0),
+            s=9, color="black", zorder=6,
+        )
+
+    ax.set_yticks(range(len(order)))
+    # cluster ids are long; the trailing segment is the distinguishing part
+    ax.set_yticklabels([c.split("_")[-1] for c in order], fontsize=9)
+    ax.set_ylabel("Cluster")
+    ax.invert_yaxis()
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I:%M %p"))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    total_meters = int(visits["meters_worked"].sum())
+    total_miles = visits["travel_miles_from_previous"].sum()
+    revisits = len(visits) - visits["cluster_id"].nunique()
+
+    ax.set_title(
+        f"{tech} — {day}\n"
+        f"{len(visits)} visits across {visits['cluster_id'].nunique()} clusters"
+        f"  ·  {total_meters} meters  ·  {total_miles:.1f} mi"
+        f"  ·  {revisits} revisit(s)",
+        fontsize=11, loc="left",
+    )
+
+    ax.grid(axis="x", alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+
+    ax.legend(
+        handles=[
+            Patch(facecolor="grey", label="Time in cluster"),
+            plt.Line2D([], [], color="grey", linestyle="--", label="Travel"),
+            plt.Line2D([], [], color="black", marker="o", linestyle="",
+                       markersize=4, label="Meter change"),
+        ],
+        loc="upper right", fontsize=8, framealpha=0.9,
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+if __name__ == "__main__":
+    print(busiest_days(conn))
+    fig = plot_workday(conn, TECH, DAY)
+    if fig:
+        plt.show()
