@@ -1,18 +1,14 @@
 -- ============================================================================
--- Meter tech weekly behavior metrics
+-- Base datasets + weekly summary, built off `combined`
 --
--- Run AFTER recluster_weekly.py (cluster_id must be week-scoped).
--- Sources: prep_for_mapping (combined + week-scoped cluster_id), combined
+-- `combined` is target x neighbor grain: one work event fans out to one row
+-- per nearby S4e meter. Two derived tables split that back apart:
 --
--- Layers:
---   meter_events      -> one row per meter work event
---   meter_visits      -> events tagged with visit membership
---   visit_metrics     -> one row per cluster visit
---   cluster_density   -> one row per cluster, with URBAN/MID-CITY/RURAL band
---   cluster_week      -> one row per tech / week / cluster
---   missed_by_week    -> one row per tech / week (nearby-meter metric)
---   tech_week         -> one row per tech / week  <- Tableau's main source
---   tech_summary      -> one row per tech         <- the summary tiles
+--   work_events    -> one row per actual meter change   (target grain)
+--   neighbor_pairs -> one row per target/neighbor pair  (combined grain)
+--
+-- Everything about how a tech spent their day comes from work_events.
+-- Only the "someone else changed it later" metric comes from neighbor_pairs.
 -- ============================================================================
 
 
@@ -20,393 +16,287 @@
 -- 0. Helpers
 -- ----------------------------------------------------------------------------
 create or replace macro miles_between(lat1, lon1, lat2, lon2) as
-    round(
-        3959 * 2 * asin(
-            sqrt(
-                power(sin(radians(lat2 - lat1) / 2), 2)
-                + cos(radians(lat1))
-                  * cos(radians(lat2))
-                  * power(sin(radians(lon2 - lon1) / 2), 2)
-            )
-        ),
-        2
-    );
+    round(3959 * 2 * asin(sqrt(
+        power(sin(radians(lat2 - lat1) / 2), 2)
+        + cos(radians(lat1)) * cos(radians(lat2))
+          * power(sin(radians(lon2 - lon1) / 2), 2)
+    )), 2);
 
 create or replace macro minutes_between(t1, t2) as
     datediff('second', t1, t2) / 60.0;
 
 
 -- ----------------------------------------------------------------------------
--- 1. Base events
+-- 1. Work events -- the de-fanned target grain
+--
+--    NOTE ON radius_filter: your filter is `distance_feet <= 7920`. A target
+--    with no S4e neighbor within 1.5 mi gets NULL from the left join, and
+--    NULL <= 7920 is false, so that target is dropped entirely. Isolated
+--    meters disappear from the dataset -- which is exactly the population
+--    that would read as "fragmented". Build work_events from `combined`, not
+--    from radius_filter, so nothing is lost.
 -- ----------------------------------------------------------------------------
-create or replace table meter_events as
+create or replace table work_events as
 select distinct
     workedby,
-    cast(work_date as date)                      as work_date,
-    date_trunc('week', cast(work_date as date))  as work_week,
+    work_date,
+    date_trunc('week', cast(work_date as date)) as work_week,
+    target_meter                                as meterno,
+    target_worked_datetime                      as worked_datetime,
+    target_lat                                  as latitude,
+    target_lon                                  as longitude,
+    target_Hardware_Model                       as hardware_model,
+    target_Ticket_Type                          as ticket_type,
     cluster_id,
-    target_meter           as meterno,
-    target_worked_datetime as worked_datetime,
-    target_lat             as latitude,
-    target_lon             as longitude
-from prep_for_mapping
-where cluster_id             is not null
+    lower(target_Hardware_Model) like '%s4e%'   as is_s4e
+from combined
+where target_worked_datetime is not null
   and workedby               is not null
-  and target_worked_datetime is not null;
+  and target_meter           is not null;
+
+-- sanity: this should be 1
+-- select count(*) * 1.0 / count(distinct (workedby, work_date, meterno))
+-- from work_events;
 
 
 -- ----------------------------------------------------------------------------
--- 2. Visit membership
---    Contiguity is still evaluated WITHIN A DAY -- a visit can't span
---    midnight. But cluster_id is now week-scoped, so returning to the same
---    area on a later day registers as a second visit to the same cluster.
+-- 2. Neighbor pairs -- keep combined's grain, just narrow it
 -- ----------------------------------------------------------------------------
-create or replace view meter_visits as
+create or replace view neighbor_pairs as
+select
+    workedby,
+    work_date,
+    date_trunc('week', cast(work_date as date)) as work_week,
+    cluster_id,
+    target_meter,
+    nearby_meter,
+    nearby_workedby,
+    nearby_removal_date,
+    nearby_Ticket_Type,
+    outcome,
+    distance_feet
+from combined
+where nearby_meter is not null
+  and nearby_meter <> target_meter;
+
+
+-- ----------------------------------------------------------------------------
+-- 3. Visits -- contiguous runs in one cluster, for travel and revisits
+-- ----------------------------------------------------------------------------
+create or replace view work_visits as
 with seq as (
     select
         *,
-        lag(cluster_id)      over w as previous_cluster_id,
-        lag(worked_datetime) over w as previous_worked_datetime
-    from meter_events
+        lag(cluster_id)      over w as prev_cluster_id,
+        lag(worked_datetime) over w as prev_worked_datetime
+    from work_events
     window w as (partition by workedby, work_date order by worked_datetime)
 ),
 flagged as (
-    select
-        *,
-        case
-            when previous_cluster_id is null       then 1
-            when cluster_id <> previous_cluster_id then 1
-            else 0
-        end as is_cluster_switch
+    select *,
+        case when prev_cluster_id is null
+                  or cluster_id <> prev_cluster_id then 1 else 0
+        end as is_switch
     from seq
 )
-select
-    *,
-    sum(is_cluster_switch) over (
+select *,
+    sum(is_switch) over (
         partition by workedby, work_date
         order by worked_datetime
         rows between unbounded preceding and current row
     ) as visit_num
 from flagged;
 
-
--- ----------------------------------------------------------------------------
--- 3. One row per visit
--- ----------------------------------------------------------------------------
 create or replace view visit_metrics as
-with visit_base as (
+with base as (
     select
-        workedby,
-        work_date,
-        work_week,
-        visit_num,
-        cluster_id,
-
-        min(worked_datetime) as visit_start_time,
-        max(worked_datetime) as visit_end_time,
-
+        workedby, work_date, work_week, visit_num, cluster_id,
+        min(worked_datetime)                as visit_start,
+        max(worked_datetime)                as visit_end,
         arg_min(latitude,  worked_datetime) as start_lat,
         arg_min(longitude, worked_datetime) as start_lon,
         arg_max(latitude,  worked_datetime) as end_lat,
         arg_max(longitude, worked_datetime) as end_lon,
-
-        count(distinct meterno) as meters_worked,
-        count(*)                as meter_changes,
-
+        count(distinct meterno)             as meters_worked,
         minutes_between(min(worked_datetime), max(worked_datetime))
-            as visit_minutes,
-
-        avg(minutes_between(previous_worked_datetime, worked_datetime))
-            filter (where is_cluster_switch = 0) as avg_minutes_between_meters,
-        median(minutes_between(previous_worked_datetime, worked_datetime))
-            filter (where is_cluster_switch = 0) as median_minutes_between_meters
-
-    from meter_visits
+                                            as visit_minutes
+    from work_visits
     group by workedby, work_date, work_week, visit_num, cluster_id
 )
-select
-    *,
-    minutes_between(lag(visit_end_time) over w, visit_start_time)
-        as travel_minutes_from_previous,
-    miles_between(
-        lag(end_lat) over w, lag(end_lon) over w, start_lat, start_lon
-    ) as travel_miles_from_previous
-from visit_base
-window w as (partition by workedby, work_date order by visit_start_time);
+select *,
+    minutes_between(lag(visit_end) over w, visit_start) as travel_minutes,
+    miles_between(lag(end_lat) over w, lag(end_lon) over w,
+                  start_lat, start_lon)                 as travel_miles
+from base
+window w as (partition by workedby, work_date order by visit_start);
 
 
 -- ----------------------------------------------------------------------------
--- 4. Density bands -- your thresholds, regrouped
---
---    Your original grouped by (outcome, workedby, work_date, cluster_id,
---    Hardware_Model), so total_cnt was meters per cluster PER OUTCOME PER
---    MODEL. A 600-meter cluster split across 3 outcomes and 4 models yields
---    slices of ~50 each and lands in RURAL. Density is a property of the
---    cluster, so cluster_id is the whole grouping key here.
---
---    Thresholds (>500 URBAN, >50 MID-CITY, else RURAL) are unchanged, but
---    they were tuned against the fragmented counts -- expect bands to shift
---    upward now. Recheck the split before wiring it into Tableau.
+-- 4. Density bands (your thresholds, grouped on cluster only)
 -- ----------------------------------------------------------------------------
 create or replace view cluster_density as
 select
     cluster_id,
-    total_cnt,
-    case
-        when total_cnt > 500 then 'URBAN'
-        when total_cnt > 50  then 'MID-CITY'
-        else 'RURAL'
-    end as density_band
-from (
-    select
-        cluster_id,
-        count(distinct target_meter) as total_cnt
-    from prep_for_mapping
-    where cluster_id is not null
-    group by cluster_id
-) t1;
+    count(distinct meterno) as total_cnt,
+    case when count(distinct meterno) > 500 then 'URBAN'
+         when count(distinct meterno) > 50  then 'MID-CITY'
+         else 'RURAL' end   as density_band
+from work_events
+where cluster_id is not null
+group by cluster_id;
 
 
 -- ----------------------------------------------------------------------------
--- 5. Per cluster, per week
+-- 5. Per tech, per week
 -- ----------------------------------------------------------------------------
-create or replace view cluster_week as
-select
-    v.workedby,
-    v.work_week,
-    v.cluster_id,
-    d.density_band,
-    d.total_cnt                             as cluster_meter_population,
-
-    count(*)                                as visits,
-    count(*) - 1                            as times_returned,
-    count(distinct v.work_date)             as days_present,
-    sum(v.meters_worked)                    as meters_worked,
-    sum(v.meter_changes)                    as meter_changes,
-    sum(v.visit_minutes)                    as minutes_in_cluster,
-    sum(v.travel_miles_from_previous)       as miles_traveled_to_reach
-
-from visit_metrics v
-left join cluster_density d using (cluster_id)
-group by v.workedby, v.work_week, v.cluster_id, d.density_band, d.total_cnt;
-
-
--- ----------------------------------------------------------------------------
--- 6. Meters this tech was near that a DIFFERENT tech changed later that week
---
---    NEAR_FEET is the knob. Your bounding-box join is a rectangle roughly
---    1.5 mi on a side (2+ mi corner to corner) and never filters on
---    distance_feet, so tune this to what "near" should actually mean.
--- ----------------------------------------------------------------------------
-create or replace view missed_by_week as
-with near as (
-    select distinct
-        workedby,
-        date_trunc('week', cast(work_date as date)) as work_week,
-        nearby_meter
-    from combined
-    where nearby_meter    is not null
-      and nearby_workedby is not null
-      and nearby_workedby <> workedby
-      and distance_feet   <= 2640                    -- NEAR_FEET: 0.5 mile
-      and cast(nearby_removal_date as date)
-            >  cast(work_date as date)
-      and date_trunc('week', cast(nearby_removal_date as date))
-            =  date_trunc('week', cast(work_date as date))
-)
-select
-    workedby,
-    work_week,
-    count(*) as meters_near_changed_by_other_tech
-from near
-group by workedby, work_week;
-
-
--- ----------------------------------------------------------------------------
--- 7. Per tech, per week -- the metric list, plus the classifier inputs
--- ----------------------------------------------------------------------------
-create or replace view tech_week_base as
+create or replace view tech_week as
 with meters as (
-    -- counted at event grain so a meter touched in two visits counts once
     select
-        workedby,
-        work_week,
-        count(distinct meterno) as meters_changed
-    from meter_events
+        workedby, work_week,
+        count(distinct meterno)                              as meters_changed,
+        count(distinct meterno) filter (where is_s4e)        as s4e_changes,
+        count(distinct meterno) filter (where not is_s4e)    as non_s4e_changes,
+        count(distinct cluster_id)                           as clusters_visited,
+        count(distinct work_date)                            as days_worked
+    from work_events
+    group by workedby, work_week
+),
+daily_hours as (
+    select workedby, work_week,
+        avg(day_minutes) / 60.0 as avg_hours_per_day
+    from (
+        select workedby, work_week, work_date,
+            minutes_between(min(worked_datetime), max(worked_datetime))
+                as day_minutes
+        from work_events
+        group by workedby, work_week, work_date
+    ) d
     group by workedby, work_week
 ),
 visits as (
     select
-        workedby,
-        work_week,
-
-        count(distinct cluster_id)              as unique_clusters,
+        workedby, work_week,
         count(*)                                as cluster_visits,
         count(*) - count(distinct cluster_id)   as cluster_revisits,
-        count(distinct work_date)               as days_worked,
-
-        sum(travel_miles_from_previous)         as total_travel_miles,
-        sum(visit_minutes)                      as total_cluster_minutes,
-        sum(travel_minutes_from_previous)       as total_travel_minutes,
-        avg(avg_minutes_between_meters)         as avg_minutes_between_changes
-
+        sum(travel_miles)                       as travel_miles,
+        sum(travel_minutes)                     as travel_minutes,
+        sum(visit_minutes)                      as cluster_minutes
     from visit_metrics
     group by workedby, work_week
 ),
-band as (
-    -- a tech works several clusters a week; the dominant band is the one
-    -- where they changed the most meters
+missed as (
+    -- meters near this tech that a DIFFERENT tech changed later
     select
-        workedby,
-        work_week,
-        arg_max(density_band, meters_worked) as density_band
-    from cluster_week
+        workedby, work_week,
+        count(distinct nearby_meter) as meters_others_changed
+    from neighbor_pairs
+    where nearby_workedby is not null
+      and nearby_workedby <> workedby
+      and cast(nearby_removal_date as date) > cast(work_date as date)
+      and distance_feet <= 2640                      -- NEAR_FEET: 0.5 mi
+    group by workedby, work_week
+),
+band as (
+    select workedby, work_week,
+        arg_max(d.density_band, w.meters) as density_band
+    from (
+        select workedby, work_week, cluster_id,
+               count(distinct meterno) as meters
+        from work_events group by 1, 2, 3
+    ) w
+    join cluster_density d using (cluster_id)
     group by workedby, work_week
 )
 select
-    v.workedby,
-    v.work_week,
-    v.days_worked,
+    m.workedby,
+    m.work_week,
+    m.days_worked,
     b.density_band,
 
-    -- workload
-    v.unique_clusters,
+    m.meters_changed,
+    m.s4e_changes,
+    m.non_s4e_changes,
+    m.clusters_visited,
     v.cluster_visits,
     v.cluster_revisits,
-    m.meters_changed,
+    coalesce(x.meters_others_changed, 0)        as meters_others_changed,
 
-    -- distance and time
-    v.total_travel_miles,
-    v.total_cluster_minutes,
-    v.total_travel_minutes,
-    v.avg_minutes_between_changes,
+    v.travel_miles,
+    v.travel_minutes,
+    v.cluster_minutes,
+    h.avg_hours_per_day,
 
-    coalesce(x.meters_near_changed_by_other_tech, 0)
-        as meters_near_changed_by_other_tech,
-
-    -- ratios: these drive the behavior buckets
-    round(v.cluster_visits * 1.0
-          / nullif(v.unique_clusters, 0), 3)      as revisit_rate,
     round(m.meters_changed * 1.0
-          / nullif(v.unique_clusters, 0), 2)      as meters_per_cluster,
-    round(v.total_travel_miles
-          / nullif(m.meters_changed, 0), 3)       as miles_per_meter,
-    round(v.total_cluster_minutes
-          / nullif(m.meters_changed, 0), 2)       as minutes_per_meter
+          / nullif(m.clusters_visited, 0), 2)   as meters_per_cluster,
+    round(v.cluster_minutes
+          / nullif(m.meters_changed, 0), 2)     as minutes_per_meter,
+    round(v.cluster_visits * 1.0
+          / nullif(m.clusters_visited, 0), 3)   as revisit_rate,
+    round(v.travel_miles
+          / nullif(m.meters_changed, 0), 3)     as miles_per_meter
 
-from visits v
-join meters m using (workedby, work_week)
-left join band b using (workedby, work_week)
-left join missed_by_week x using (workedby, work_week);
+from meters m
+left join visits      v using (workedby, work_week)
+left join daily_hours h using (workedby, work_week)
+left join missed      x using (workedby, work_week)
+left join band        b using (workedby, work_week);
 
 
 -- ----------------------------------------------------------------------------
--- 8. Behavior pattern buckets
---
---    Cutoffs come from percentiles of your own distribution rather than
---    fixed numbers, so they self-calibrate. Order matters: revisiting is
---    tested first because heavy backtracking can co-occur with any of the
---    others, and it's the more interesting signal when it does.
---
---    OTHER is deliberate. Watch its share -- if it's over ~15%, the cutoffs
---    need loosening, and you want to see that rather than have leftovers
---    quietly swept into "sequential".
+-- 6. Behavior patterns (cutoffs from your own distribution)
 -- ----------------------------------------------------------------------------
 create or replace view pattern_thresholds as
 select
-    quantile_cont(meters_per_cluster, 0.50) as med_meters_per_cluster,
-    quantile_cont(meters_per_cluster, 0.25) as p25_meters_per_cluster,
-    quantile_cont(miles_per_meter,    0.75) as p75_miles_per_meter
-from tech_week_base
+    quantile_cont(meters_per_cluster, 0.50) as med_mpc,
+    quantile_cont(meters_per_cluster, 0.25) as p25_mpc,
+    quantile_cont(miles_per_meter,    0.75) as p75_mpm
+from tech_week
 where meters_changed > 0;
 
-create or replace view tech_week as
-select
-    t.*,
+create or replace view tech_week_labelled as
+select t.*,
     case
-        -- backtracking: returned to clusters repeatedly
-        when t.cluster_revisits >= 2
-             and t.revisit_rate >= 1.25
+        when t.cluster_revisits >= 2 and t.revisit_rate >= 1.25
             then 'REVISITING'
-
-        -- focused: few clusters, heavy meter count in each
-        when t.unique_clusters <= 2
-             and t.meters_per_cluster >= p.med_meters_per_cluster
+        when t.clusters_visited <= 2 and t.meters_per_cluster >= p.med_mpc
             then 'FOCUSED'
-
-        -- fragmented: lots of ground covered per meter, thin clusters
-        when t.miles_per_meter    >= p.p75_miles_per_meter
-             and t.meters_per_cluster <= p.p25_meters_per_cluster
+        when t.miles_per_meter >= p.p75_mpm
+             and t.meters_per_cluster <= p.p25_mpc
             then 'FRAGMENTED'
-
-        -- sequential: several clusters, worked once each, moving on
-        when t.unique_clusters >= 3
-             and t.revisit_rate < 1.25
+        when t.clusters_visited >= 3 and t.revisit_rate < 1.25
             then 'SEQUENTIAL'
-
         else 'OTHER'
     end as behavior_pattern
-
-from tech_week_base t
+from tech_week t
 cross join pattern_thresholds p;
 
 
 -- ----------------------------------------------------------------------------
--- 9. Per tech -- the summary tiles
+-- 7. Per tech -- the summary tiles
 -- ----------------------------------------------------------------------------
 create or replace view tech_summary as
 select
     workedby,
-
-    count(*)                                    as weeks_active,
-    sum(days_worked)                            as days_worked,
-
-    -- averages per week
-    round(avg(unique_clusters), 1)              as avg_clusters_per_week,
-    round(avg(meters_changed), 1)               as avg_meters_per_week,
-    round(avg(meters_per_cluster), 1)           as avg_meters_per_cluster_per_week,
-    round(avg(cluster_revisits), 1)             as avg_repeat_visits_per_week,
-    round(avg(total_travel_miles), 1)           as avg_miles_per_week,
-    round(avg(minutes_per_meter), 1)            as avg_minutes_per_meter_per_week,
-    round(avg(meters_near_changed_by_other_tech), 1)
-                                                as avg_meters_near_missed_per_week,
-
-    -- totals
-    sum(meters_changed)                         as total_meters,
-    sum(total_travel_miles)                     as total_travel_miles,
-    sum(meters_near_changed_by_other_tech)      as total_meters_near_missed,
-
-    -- unique clusters across the whole period. Cluster ids are week-scoped,
-    -- so this counts cluster-weeks, not distinct physical places. A tech in
-    -- the same territory for 6 weeks shows 6x their real footprint.
-    sum(unique_clusters)                        as total_cluster_weeks,
-
-    -- dominant pattern and band
-    mode(behavior_pattern)                      as typical_pattern,
-    mode(density_band)                          as typical_density_band
-
-from tech_week
+    count(*)                                as weeks_active,
+    round(avg(meters_changed), 1)           as avg_meters_per_week,
+    round(avg(s4e_changes), 1)              as avg_s4e_per_week,
+    round(avg(non_s4e_changes), 1)          as avg_non_s4e_per_week,
+    round(avg(clusters_visited), 1)         as avg_clusters_per_week,
+    round(avg(meters_per_cluster), 1)       as avg_meters_per_cluster,
+    round(avg(meters_others_changed), 1)    as avg_meters_others_changed,
+    round(avg(cluster_revisits), 1)         as avg_revisits_per_week,
+    round(avg(travel_miles), 1)             as avg_miles_per_week,
+    round(avg(travel_minutes), 1)           as avg_travel_minutes_per_week,
+    round(avg(minutes_per_meter), 1)        as avg_minutes_per_meter,
+    round(avg(avg_hours_per_day), 1)        as avg_hours_per_day,
+    mode(behavior_pattern)                  as typical_pattern,
+    mode(density_band)                      as typical_density_band
+from tech_week_labelled
 group by workedby;
 
-
 -- ============================================================================
--- Tableau extracts:
---
---   tech_week    -> behavior distribution bar chart (count of tech-weeks by
---                   behavior_pattern), and the density crosstab: density_band
---                   on columns, count of tech-weeks as measure, colored by
---                   behavior_pattern, set to 100% stacked.
---
---   tech_summary -> summary tiles and the top-5 ranking. Sort by whichever
---                   measure defines "top" -- avg_meters_per_week rewards
---                   volume, avg_minutes_per_meter_per_week rewards speed,
---                   and those will give you different fives.
---
---   cluster_week -> drill-down when someone asks why a tech got a label.
---
--- Sanity checks worth running first:
---
---   select behavior_pattern, count(*) from tech_week group by 1 order by 2 desc;
---   select density_band, count(*) from cluster_density group by 1;
---   select * from pattern_thresholds;
+-- Tableau: tech_week_labelled feeds both the behavior bar chart and the
+-- behavior-by-density crosstab (density_band on columns, count of tech-weeks,
+-- colored by behavior_pattern, 100% stacked). tech_summary feeds the tiles
+-- and the top-5 ranking.
 -- ============================================================================
