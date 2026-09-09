@@ -1,4 +1,226 @@
-select count(*) as pairs,
-       count(distinct target_meter) as targets,
-       count(distinct target_meter) filter (where nearby_meter is null) as isolated
-from radius_filter;
+-- ============================================================================
+-- Meter summary page
+--
+-- Grain flips from tech to METER. The unit is nearby_meter, not target_meter.
+--
+--   meter_near_events -> one row per meter / tech / day a tech was nearby
+--   meter_week        -> one row per meter / week
+--   meter_profile     -> one row per meter (lifetime, with pulled/in-field status)
+--   weekly_summary    -> one row per week (the tiles)
+--   meter_rankings    -> two ranked lists for the heat maps
+--
+-- GRAIN TRAP: neighbor_pairs repeats a meter once per nearby target. A tech
+-- working 5 targets near meter X on one day puts X on 5 rows. Every count
+-- below is distinct on (meter, tech, day) so one pass counts once.
+-- ============================================================================
+
+-- Distance that counts as "in the area". Keep it consistent everywhere.
+-- 2640 ft = 0.5 mi. Your bounding-box join tops out around 1.5 mi.
+create or replace macro near_feet() as 2640;
+
+
+-- ----------------------------------------------------------------------------
+-- 1. Meter x tech x day -- the de-duplicated exposure grain
+-- ----------------------------------------------------------------------------
+create or replace table meter_near_events as
+select distinct
+    nearby_meter                                 as meterno,
+    workedby                                     as passing_tech,
+    work_date,
+    date_trunc('week', cast(work_date as date))  as work_week,
+    nearby_removal_date,
+    nearby_Ticket_Type,
+    -- still installed at the time this tech passed?
+    (nearby_removal_date = date '3001-01-01'
+     or cast(nearby_removal_date as date) > cast(work_date as date))
+                                                 as was_missable
+from neighbor_pairs
+where nearby_meter  is not null
+  and distance_feet <= near_feet()
+  and nearby_workedby is distinct from workedby;   -- someone else's meter
+
+
+-- ----------------------------------------------------------------------------
+-- 2. Per meter, per week
+--
+--    A "miss" is one tech-day where a tech was in the area and the meter was
+--    still in the ground. Two techs on the same day = 2 misses. One tech
+--    working 5 nearby targets = 1 miss.
+-- ----------------------------------------------------------------------------
+create or replace view meter_week as
+select
+    meterno,
+    work_week,
+
+    count(*) filter (where was_missable)                    as miss_events,
+    count(distinct passing_tech) filter (where was_missable) as techs_nearby,
+    count(distinct work_date) filter (where was_missable)    as days_nearby,
+
+    -- days where 2+ different techs were in this meter's area
+    count(distinct work_date) filter (
+        where was_missable and techs_that_day >= 2
+    )                                                        as multi_tech_days
+
+from (
+    select *,
+        count(distinct passing_tech) over (
+            partition by meterno, work_date
+        ) as techs_that_day
+    from meter_near_events
+)
+group by meterno, work_week;
+
+
+-- ----------------------------------------------------------------------------
+-- 3. Per meter -- lifetime profile and current status
+-- ----------------------------------------------------------------------------
+create or replace view meter_profile as
+with lifetime as (
+    select
+        meterno,
+        any_value(nearby_removal_date)                       as removal_date,
+        count(*) filter (where was_missable)                 as total_miss_events,
+        count(distinct work_week) filter (where was_missable) as weeks_missed,
+        count(distinct passing_tech) filter (where was_missable) as distinct_techs,
+        min(work_date) filter (where was_missable)           as first_missed,
+        max(work_date) filter (where was_missable)           as last_missed
+    from meter_near_events
+    group by meterno
+)
+select
+    *,
+    case when removal_date = date '3001-01-01'
+         then 'STILL_IN_FIELD' else 'PULLED' end            as meter_status,
+    -- for pulled meters: how long it sat after the first tech passed it by
+    case when removal_date <> date '3001-01-01'
+         then datediff('day', first_missed, cast(removal_date as date))
+    end                                                      as days_missed_to_pull
+from lifetime
+where total_miss_events > 0;
+
+
+-- ----------------------------------------------------------------------------
+-- 4. Weekly tiles
+--
+--    Rates are per-meter-per-week averages over meters that were exposed
+--    that week -- not over all meters, which would drown the signal.
+-- ----------------------------------------------------------------------------
+create or replace view weekly_meter_summary as
+with per_week as (
+    select
+        w.work_week,
+        count(distinct w.meterno)                            as meters_exposed,
+        sum(w.miss_events)                                   as total_miss_events,
+        avg(w.miss_events)                                   as avg_misses_per_meter,
+        avg(w.techs_nearby)                                  as avg_techs_per_meter,
+        sum(w.multi_tech_days)                               as multi_tech_day_events,
+        count(distinct w.meterno) filter (where w.multi_tech_days > 0)
+                                                             as meters_seen_by_2plus
+    from meter_week w
+    group by w.work_week
+),
+resolved as (
+    -- previously-missed meters that got pulled during this week
+    select
+        date_trunc('week', cast(p.removal_date as date))     as work_week,
+        count(*)                                             as missed_meters_pulled
+    from meter_profile p
+    where p.meter_status = 'PULLED'
+    group by 1
+),
+work as (
+    -- target-side ticket mix
+    select
+        work_week,
+        count(distinct meterno) filter (where is_s4e)        as s4e_changes,
+        count(distinct meterno) filter (
+            where upper(ticket_type) like '%PERIODIC%')      as periodic_tests
+    from work_events
+    group by work_week
+)
+select
+    w.work_week,
+    w.meters_exposed,
+    w.total_miss_events,
+    round(w.avg_misses_per_meter, 2)                         as avg_misses_per_meter,
+    round(w.avg_techs_per_meter, 2)                          as avg_techs_per_meter,
+    w.multi_tech_day_events,
+    w.meters_seen_by_2plus,
+    coalesce(r.missed_meters_pulled, 0)                      as missed_meters_pulled,
+    coalesce(k.s4e_changes, 0)                               as s4e_changes,
+    coalesce(k.periodic_tests, 0)                            as periodic_tests
+from per_week w
+left join resolved r using (work_week)
+left join work     k using (work_week);
+
+-- one-row overall averages for the summary tiles
+create or replace view meter_summary_tiles as
+select
+    count(*)                                         as weeks,
+    round(avg(avg_misses_per_meter), 2)              as avg_misses_per_meter_per_week,
+    round(avg(avg_techs_per_meter), 2)               as avg_techs_per_meter_per_week,
+    round(avg(multi_tech_day_events), 1)             as avg_multi_tech_days_per_week,
+    round(avg(missed_meters_pulled), 1)              as avg_missed_meters_pulled_per_week,
+    round(avg(s4e_changes), 1)                       as avg_s4e_changes_per_week,
+    round(avg(periodic_tests), 1)                    as avg_periodic_tests_per_week,
+    (select count(*) from meter_profile
+     where meter_status = 'STILL_IN_FIELD')          as missed_still_in_field
+from weekly_meter_summary;
+
+
+-- ----------------------------------------------------------------------------
+-- 5. Rankings for the two heat maps
+--
+--    Ranked separately because the two lists mean different things:
+--    STILL_IN_FIELD is an actionable work list; PULLED is a retrospective
+--    "how long did we walk past this" record.
+--
+--    Coordinates come from full_s4e_pop_mapping -- neighbor_pairs doesn't
+--    carry nearby_lat/lon through. Adjust the join if yours differs.
+-- ----------------------------------------------------------------------------
+create or replace view meter_rankings as
+select
+    p.*,
+    m.hist_latitude                                  as latitude,
+    m.hist_longitude                                 as longitude,
+    m.esi_loc,
+    rank() over (
+        partition by p.meter_status
+        order by p.total_miss_events desc, p.weeks_missed desc
+    )                                                as miss_rank
+from meter_profile p
+left join (
+    select distinct hist_meter, hist_latitude, hist_longitude, esi_loc
+    from full_s4e_pop_mapping
+) m on m.hist_meter = p.meterno;
+
+-- heat map 1: the work list
+create or replace view still_in_field_ranked as
+select * from meter_rankings
+where meter_status = 'STILL_IN_FIELD'
+order by miss_rank;
+
+-- heat map 2: the retrospective
+create or replace view pulled_ranked as
+select * from meter_rankings
+where meter_status = 'PULLED'
+order by miss_rank;
+
+
+-- ============================================================================
+-- Sanity checks before trusting any of it:
+--
+--   -- should be 1.0; if higher, meter_near_events is still fanned out
+--   select count(*) * 1.0 / count(distinct (meterno, passing_tech, work_date))
+--   from meter_near_events;
+--
+--   -- status split; STILL_IN_FIELD is your actionable population
+--   select meter_status, count(*), round(avg(total_miss_events), 1)
+--   from meter_profile group by 1;
+--
+--   -- distribution of miss counts. If most meters sit at 1, there is no
+--   -- "consistently missed" population to map and the heat map won't show
+--   -- anything. Check this before building the viz.
+--   select total_miss_events, count(*) as meters
+--   from meter_profile group by 1 order by 1 limit 20;
+-- ============================================================================
