@@ -1,13 +1,59 @@
-sql = """ ...your whole script... """
+import folium
 
-stmts = [s.strip() for s in sql.split(";") if s.strip()]
+TECH, DAY = "U9Z5", "2026-06-18"
+AWAY_MI, NEAR_MI = 1.0, 0.5          # same thresholds as day_returns
 
-for i, s in enumerate(stmts, 1):
-    head = " ".join(s.split())[:70]
-    try:
-        conn.execute(s)
-        print(f"{i:>3} ok   {head}")
-    except Exception as e:
-        print(f"{i:>3} FAIL {head}")
-        print(f"     {e}")
-        break
+d = full_s4e_pop_mapping
+d = d[(d.workedby == TECH) &
+      (d.wr_workeddatetime.dt.date == pd.Timestamp(DAY).date())]
+d = (d.drop_duplicates(["hist_meter", "wr_workeddatetime"])
+      .sort_values(["wr_workeddatetime", "hist_meter"])   # tiebreaker for tied timestamps
+      .reset_index(drop=True))
+
+lat, lon = d.hist_latitude.to_numpy(), d.hist_longitude.to_numpy()
+d["order_num"] = np.arange(1, len(d) + 1)
+d["gap_min"]   = d.wr_workeddatetime.diff().dt.total_seconds() / 60
+d["stint"]     = (d.gap_min > 20).cumsum()
+d["mi_prev"]   = np.r_[np.nan, miles(lat[:-1], lon[:-1], lat[1:], lon[1:])]
+
+# return = left (>1 mi from prev) and landed near an earlier order,
+# skipping the immediately preceding one
+d["return_to"] = np.nan
+for i in range(2, len(d)):
+    if d.mi_prev.iat[i] > AWAY_MI:
+        dist = miles(lat[:i-1], lon[:i-1], lat[i], lon[i])
+        j = dist.argmin()
+        if dist[j] <= NEAR_MI:
+            d.loc[i, "return_to"] = j + 1
+
+cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]   # Gantt colors
+m = folium.Map(tiles="CartoDB positron")
+
+for i in range(1, len(d)):
+    ret = pd.notna(d.return_to.iat[i])
+    new_stint = d.stint.iat[i] != d.stint.iat[i-1]
+    folium.PolyLine([[lat[i-1], lon[i-1]], [lat[i], lon[i]]],
+                    color="red" if ret else "grey", weight=3 if ret else 2,
+                    dash_array="8" if new_stint else None, opacity=0.8).add_to(m)
+
+for r in d.itertuples():
+    ret = pd.notna(r.return_to)
+    popup = (f"<b>#{r.order_num}</b> {r.wr_workeddatetime:%I:%M %p} · stint {r.stint}<br>"
+             f"meter {r.hist_meter} · {r.Harware_Model}<br>"
+             f"{r.gap_min:.0f} min · {r.mi_prev:.2f} mi since prev"
+             + (f"<br><b style='color:red'>RETURN near #{int(r.return_to)}</b>" if ret else ""))
+    folium.Marker(
+        [r.hist_latitude, r.hist_longitude],
+        tooltip=f"#{r.order_num} {r.wr_workeddatetime:%I:%M %p}",
+        popup=folium.Popup(popup, max_width=300),
+        icon=folium.DivIcon(icon_size=(22, 22), icon_anchor=(11, 11), html=
+            f"<div style='width:22px;height:22px;border-radius:50%;"
+            f"background:{cycle[r.stint % len(cycle)]};color:white;"
+            f"font:bold 10px sans-serif;display:flex;align-items:center;"
+            f"justify-content:center;border:2px solid {'red' if ret else 'white'}'>"
+            f"{r.order_num}</div>")
+    ).add_to(m)
+
+m.fit_bounds(d[["hist_latitude", "hist_longitude"]].values.tolist())
+display(d.loc[d.return_to.notna(), ["order_num", "wr_workeddatetime", "mi_prev", "return_to"]])
+m
