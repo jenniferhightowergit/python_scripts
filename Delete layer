@@ -1,23 +1,32 @@
-import folium
+import pandas as pd, numpy as np, folium
+import matplotlib.pyplot as plt
 
 TECH, DAY = "U9Z5", "2026-06-18"
-AWAY_MI, NEAR_MI = 1.0, 0.5          # same thresholds as day_returns
+AWAY_MI, NEAR_MI = 1.0, 0.5   # same thresholds as day_returns
 
+def miles(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    a = (np.sin((lat2 - lat1) / 2)**2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2)**2)
+    return 3959 * 2 * np.arcsin(np.sqrt(a))
+
+# one tech, one day, in time order
 d = full_s4e_pop_mapping
 d = d[(d.workedby == TECH) &
       (d.wr_workeddatetime.dt.date == pd.Timestamp(DAY).date())]
 d = (d.drop_duplicates(["hist_meter", "wr_workeddatetime"])
-      .sort_values(["wr_workeddatetime", "hist_meter"])   # tiebreaker for tied timestamps
+      .sort_values(["wr_workeddatetime", "hist_meter"])
       .reset_index(drop=True))
 
-lat, lon = d.hist_latitude.to_numpy(), d.hist_longitude.to_numpy()
+lat = d.hist_latitude.to_numpy(float)
+lon = d.hist_longitude.to_numpy(float)
 d["order_num"] = np.arange(1, len(d) + 1)
 d["gap_min"]   = d.wr_workeddatetime.diff().dt.total_seconds() / 60
 d["stint"]     = (d.gap_min > 20).cumsum()
 d["mi_prev"]   = np.r_[np.nan, miles(lat[:-1], lon[:-1], lat[1:], lon[1:])]
 
-# return = left (>1 mi from prev) and landed near an earlier order,
-# skipping the immediately preceding one
+# return = drove >1 mi, landed within 0.5 mi of an earlier stop
+# (skipping the stop right before it)
 d["return_to"] = np.nan
 for i in range(2, len(d)):
     if d.mi_prev.iat[i] > AWAY_MI:
@@ -26,34 +35,47 @@ for i in range(2, len(d)):
         if dist[j] <= NEAR_MI:
             d.loc[i, "return_to"] = j + 1
 
-cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]   # Gantt colors
-m = folium.Map(tiles="CartoDB positron")
+colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]  # same as Gantt
+m = folium.Map(tiles="OpenStreetMap")
 
+# lines between stops
 for i in range(1, len(d)):
     ret = pd.notna(d.return_to.iat[i])
     new_stint = d.stint.iat[i] != d.stint.iat[i-1]
-    folium.PolyLine([[lat[i-1], lon[i-1]], [lat[i], lon[i]]],
-                    color="red" if ret else "grey", weight=3 if ret else 2,
-                    dash_array="8" if new_stint else None, opacity=0.8).add_to(m)
+    folium.PolyLine(
+        [[lat[i-1], lon[i-1]], [lat[i], lon[i]]],
+        color="red" if ret else "grey",
+        weight=4 if ret else 2,
+        dash_array="8" if new_stint else None,
+        opacity=0.8,
+    ).add_to(m)
 
+# numbered stops
 for r in d.itertuples():
-    ret = pd.notna(r.return_to)
-    popup = (f"<b>#{r.order_num}</b> {r.wr_workeddatetime:%I:%M %p} · stint {r.stint}<br>"
-             f"meter {r.hist_meter} · {r.Harware_Model}<br>"
-             f"{r.gap_min:.0f} min · {r.mi_prev:.2f} mi since prev"
-             + (f"<br><b style='color:red'>RETURN near #{int(r.return_to)}</b>" if ret else ""))
+    ret  = pd.notna(r.return_to)
+    fill = colors[r.stint % len(colors)]
+    ring = "red" if ret else "white"
+    popup = (f"<b>#{r.order_num}</b> {r.wr_workeddatetime:%I:%M %p}, stint {r.stint}<br>"
+             f"meter {r.hist_meter}<br>"
+             f"{r.gap_min:.0f} min, {r.mi_prev:.2f} mi since prev")
+    if ret:
+        popup += f"<br><b style='color:red'>RETURN near #{int(r.return_to)}</b>"
     folium.Marker(
         [r.hist_latitude, r.hist_longitude],
         tooltip=f"#{r.order_num} {r.wr_workeddatetime:%I:%M %p}",
         popup=folium.Popup(popup, max_width=300),
-        icon=folium.DivIcon(icon_size=(22, 22), icon_anchor=(11, 11), html=
-            f"<div style='width:22px;height:22px;border-radius:50%;"
-            f"background:{cycle[r.stint % len(cycle)]};color:white;"
-            f"font:bold 10px sans-serif;display:flex;align-items:center;"
-            f"justify-content:center;border:2px solid {'red' if ret else 'white'}'>"
-            f"{r.order_num}</div>")
+        icon=folium.DivIcon(
+            icon_size=(22, 22), icon_anchor=(11, 11),
+            html=(f"<div style='width:22px;height:22px;border-radius:50%;"
+                  f"background:{fill};color:white;font:bold 10px sans-serif;"
+                  f"display:flex;align-items:center;justify-content:center;"
+                  f"border:2px solid {ring}'>{r.order_num}</div>")),
     ).add_to(m)
 
-m.fit_bounds(d[["hist_latitude", "hist_longitude"]].values.tolist())
-display(d.loc[d.return_to.notna(), ["order_num", "wr_workeddatetime", "mi_prev", "return_to"]])
+m.fit_bounds([[lat.min(), lon.min()], [lat.max(), lon.max()]])
+m.save(f"route_{TECH}_{DAY}.html")
+
+print(f"{len(d)} orders, {d.return_to.notna().sum()} returns")
+display(d.loc[d.return_to.notna(),
+              ["order_num", "wr_workeddatetime", "mi_prev", "return_to"]])
 m
