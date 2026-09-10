@@ -1,81 +1,97 @@
-import pandas as pd, numpy as np, folium
-import matplotlib.pyplot as plt
+# %% setup -- pip install folium osmnx scikit-learn
+import numpy as np, pandas as pd, folium
+from folium.plugins import AntPath
 
-TECH, DAY = "U9Z5", "2026-06-18"
-AWAY_MI, NEAR_MI = 1.0, 0.5   # same thresholds as day_returns
+df = full_s4e_pop_mapping.copy()
+df["wr_workeddatetime"] = pd.to_datetime(df["wr_workeddatetime"])
+df["work_date"] = df["wr_workeddatetime"].dt.date
+df = df.dropna(subset=["workedby", "wr_workeddatetime", "hist_latitude", "hist_longitude"])
+df["is_s4e"] = df["Harware_Model"].str.lower().str.contains("s4e", na=False)
+df.groupby(["workedby", "work_date"]).size().sort_values(ascending=False).head(10)
 
-def miles(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    a = (np.sin((lat2 - lat1) / 2)**2
-         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2)**2)
-    return 3959 * 2 * np.arcsin(np.sqrt(a))
+# %% functions
+OVERPASS = "https://overpass-api.de/api/interpreter"
+DRIVABLE = ("motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|"
+            "motorway_link|trunk_link|primary_link|secondary_link|tertiary_link")
 
-# one tech, one day, in time order
-d = full_s4e_pop_mapping
-d = d[(d.workedby == TECH) &
-      (d.wr_workeddatetime.dt.date == pd.Timestamp(DAY).date())]
-d = (d.drop_duplicates(["hist_meter", "wr_workeddatetime"])
-      .sort_values(["wr_workeddatetime", "hist_meter"])
-      .reset_index(drop=True))
+def _meters(a, b):
+    la1, lo1, la2, lo2 = map(np.radians, (*a, *b))
+    h = np.sin((la2-la1)/2)**2 + np.cos(la1)*np.cos(la2)*np.sin((lo2-lo1)/2)**2
+    return 2 * 6_371_000 * np.arcsin(np.sqrt(h))
 
-lat = d.hist_latitude.to_numpy(float)
-lon = d.hist_longitude.to_numpy(float)
-d["order_num"] = np.arange(1, len(d) + 1)
-d["gap_min"]   = d.wr_workeddatetime.diff().dt.total_seconds() / 60
-d["stint"]     = (d.gap_min > 20).cumsum()
-d["mi_prev"]   = np.r_[np.nan, miles(lat[:-1], lon[:-1], lat[1:], lon[1:])]
+def tech_day(tech, day):
+    d = df[(df["workedby"] == tech) & (df["work_date"] == pd.to_datetime(day).date())]
+    d = d.sort_values("wr_workeddatetime").reset_index(drop=True)
+    d["stop"] = d.index + 1
+    return d
 
-# return = drove >1 mi, landed within 0.5 mi of an earlier stop
-# (skipping the stop right before it)
-d["return_to"] = np.nan
-for i in range(2, len(d)):
-    if d.mi_prev.iat[i] > AWAY_MI:
-        dist = miles(lat[:i-1], lon[:i-1], lat[i], lon[i])
-        j = dist.argmin()
-        if dist[j] <= NEAR_MI:
-            d.loc[i, "return_to"] = j + 1
+def get_road_graph(pts, pad=0.03):
+    import osmnx as ox
+    lats, lons = [p[0] for p in pts], [p[1] for p in pts]
+    s, w, n, e = min(lats)-pad, min(lons)-pad, max(lats)+pad, max(lons)+pad
+    center = ((s+n)/2, (w+e)/2)
+    try:
+        return ox.graph_from_point(center, dist=_meters(center, (n, e)), network_type="drive")
+    except Exception as err:
+        print(f"osmnx download failed ({type(err).__name__}); trying curl...")
+        import subprocess, tempfile, os
+        q = f'[out:xml][timeout:25];(way["highway"~"{DRIVABLE}"]({s},{w},{n},{e});>;);out body;'
+        f = os.path.join(tempfile.gettempdir(), "roads.osm")
+        subprocess.run(["curl", "-s", "-m", "180", "-o", f, OVERPASS,
+                        "--data-urlencode", f"data={q}"], check=True)
+        if "runtime error" in open(f, encoding="utf-8", errors="ignore").read(2000):
+            raise RuntimeError("Overpass busy -- wait a minute and rerun")
+        return ox.graph_from_xml(f)
 
-colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]  # same as Gantt
-m = folium.Map(tiles="OpenStreetMap")
+def road_path(pts, G=None):
+    import osmnx as ox, networkx as nx
+    G = G if G is not None else get_road_graph(pts)
+    G = ox.add_edge_travel_times(ox.add_edge_speeds(G))
+    nodes = ox.distance.nearest_nodes(G, X=[p[1] for p in pts], Y=[p[0] for p in pts])
+    path, meters = [pts[0]], 0.0
+    for u, v, dest in zip(nodes[:-1], nodes[1:], pts[1:]):
+        try:
+            leg = nx.shortest_path(G, u, v, weight="travel_time")
+            path += [(G.nodes[x]["y"], G.nodes[x]["x"]) for x in leg]
+            meters += sum(min(d["length"] for d in G.get_edge_data(a, b).values())
+                          for a, b in zip(leg[:-1], leg[1:]))
+        except nx.NetworkXNoPath:
+            meters += _meters(path[-1], dest)
+        path.append(dest)
+    return path, meters / 1609.34
 
-# lines between stops
-for i in range(1, len(d)):
-    ret = pd.notna(d.return_to.iat[i])
-    new_stint = d.stint.iat[i] != d.stint.iat[i-1]
-    folium.PolyLine(
-        [[lat[i-1], lon[i-1]], [lat[i], lon[i]]],
-        color="red" if ret else "grey",
-        weight=4 if ret else 2,
-        dash_array="8" if new_stint else None,
-        opacity=0.8,
-    ).add_to(m)
+def plot_day(tech, day, roads=False, G=None):
+    d = tech_day(tech, day)
+    if d.empty:
+        print(f"No orders for {tech} on {day}"); return None
+    pts = list(zip(d["hist_latitude"], d["hist_longitude"]))
+    m = folium.Map(location=pts[0], zoom_start=12)
+    straight_mi = sum(_meters(a, b) for a, b in zip(pts[:-1], pts[1:])) / 1609.34
+    if roads and len(pts) > 1:
+        path, road_mi = road_path(pts, G)
+        print(f"{tech} {day}: {len(d)} orders | road ~{road_mi:.1f} mi vs straight {straight_mi:.1f} mi")
+    else:
+        path = pts
+        print(f"{tech} {day}: {len(d)} orders | straight-line {straight_mi:.1f} mi")
+    AntPath(path, color="#1f6feb", weight=4, delay=900).add_to(m)
 
-# numbered stops
-for r in d.itertuples():
-    ret  = pd.notna(r.return_to)
-    fill = colors[r.stint % len(colors)]
-    ring = "red" if ret else "white"
-    popup = (f"<b>#{r.order_num}</b> {r.wr_workeddatetime:%I:%M %p}, stint {r.stint}<br>"
-             f"meter {r.hist_meter}<br>"
-             f"{r.gap_min:.0f} min, {r.mi_prev:.2f} mi since prev")
-    if ret:
-        popup += f"<br><b style='color:red'>RETURN near #{int(r.return_to)}</b>"
-    folium.Marker(
-        [r.hist_latitude, r.hist_longitude],
-        tooltip=f"#{r.order_num} {r.wr_workeddatetime:%I:%M %p}",
-        popup=folium.Popup(popup, max_width=300),
-        icon=folium.DivIcon(
-            icon_size=(22, 22), icon_anchor=(11, 11),
-            html=(f"<div style='width:22px;height:22px;border-radius:50%;"
-                  f"background:{fill};color:white;font:bold 10px sans-serif;"
-                  f"display:flex;align-items:center;justify-content:center;"
-                  f"border:2px solid {ring}'>{r.order_num}</div>")),
-    ).add_to(m)
+    d["spot"] = d["hist_latitude"].round(5).astype(str) + "," + d["hist_longitude"].round(5).astype(str)
+    for _, g in d.groupby("spot", sort=False):
+        label = ",".join(g["stop"].astype(str))
+        color = "#d7263d" if g["is_s4e"].any() else "#444"
+        popup = "<br>".join(f"<b>#{r.stop}</b> {r.wr_workeddatetime:%H:%M} &middot; {r.hist_meter} "
+                            f"&middot; {r.fatype} &middot; {r.Harware_Model}" for r in g.itertuples())
+        folium.Marker(
+            [g["hist_latitude"].iloc[0], g["hist_longitude"].iloc[0]],
+            icon=folium.DivIcon(icon_size=(0, 0), icon_anchor=(0, 0),
+                html=f'<div style="background:{color};color:#fff;border-radius:10px;padding:2px 6px;'
+                     f'font:bold 11px sans-serif;white-space:nowrap;display:inline-block;'
+                     f'transform:translate(-50%,-50%)">{label}</div>'),
+            popup=folium.Popup(popup, max_width=450)).add_to(m)
+    m.fit_bounds(pts)
+    return m
 
-m.fit_bounds([[lat.min(), lon.min()], [lat.max(), lon.max()]])
-m.save(f"route_{TECH}_{DAY}.html")
-
-print(f"{len(d)} orders, {d.return_to.notna().sum()} returns")
-display(d.loc[d.return_to.notna(),
-              ["order_num", "wr_workeddatetime", "mi_prev", "return_to"]])
-m
+# %% run
+m = plot_day("U58L", "2026-01-02")                 # straight lines
+# m = plot_day("U58L", "2026-01-02", roads=True)   # road-snapped
+m    # if blank in VS Code: m.save("map.html") and open in a browser
