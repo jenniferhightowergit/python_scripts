@@ -224,3 +224,256 @@ order by miss_rank;
 --   select total_miss_events, count(*) as meters
 --   from meter_profile group by 1 order by 1 limit 20;
 -- ============================================================================
+
+
+
+-- ============================================================================
+-- Behavior pattern tab -- three Tableau extracts
+--
+--   pattern_cards      one row per behavior pattern      -> the stat cards
+--   pattern_density    one row per pattern x band        -> the bar charts
+--   gantt_segments     one row per stint or drive        -> the four Gantts
+--
+-- WHY CO-PRESENCE IS GEOGRAPHIC: cluster_id is scoped per tech
+-- ({tech}_{week}_{label}), so two techs never share one. "Two techs in the
+-- same area" has to come from neighbor_pairs + distance_feet.
+--
+-- nearby_removal_date doubles as the day that neighbor meter was worked
+-- (work_date is derived from hist_meter_removal_date), so same-day overlap
+-- needs no schema change.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1. Co-presence per tech-week
+--
+--    Distinct from meters_others_changed, which is about meters LEFT BEHIND.
+--    This is simply: was another tech working near you, and how often.
+-- ----------------------------------------------------------------------------
+create or replace view tech_week_copresence as
+with encounters as (
+    select distinct
+        workedby,
+        work_week,
+        cast(work_date as date)             as work_date,
+        nearby_workedby                     as other_tech,
+        cast(nearby_removal_date as date)   as other_tech_date,
+        nearby_meter
+    from neighbor_pairs
+    where nearby_workedby is not null
+      and nearby_workedby <> workedby
+      and distance_feet   <= 2640                        -- NEAR_FEET: 0.5 mi
+      and nearby_removal_date <> date '3001-01-01'       -- actually worked
+      and date_trunc('week', cast(nearby_removal_date as date))
+          = date_trunc('week', cast(work_date as date))  -- same week
+)
+select
+    workedby,
+    work_week,
+
+    -- how many different techs were working in your areas this week
+    count(distinct other_tech)                          as other_techs_nearby,
+
+    -- days you and someone else were both working the same area
+    count(distinct work_date) filter (
+        where other_tech_date = work_date)              as same_day_overlap_days,
+
+    -- distinct tech-day encounters: 2 techs on Monday + 1 on Friday = 3
+    count(distinct (other_tech, work_date))             as copresence_events,
+
+    -- meters involved in those overlaps
+    count(distinct nearby_meter)                        as meters_in_shared_areas
+
+from encounters
+group by workedby, work_week;
+
+
+-- ----------------------------------------------------------------------------
+-- 2. Tech-week with everything attached
+-- ----------------------------------------------------------------------------
+create or replace view tech_week_full as
+select
+    l.*,
+    coalesce(c.other_techs_nearby, 0)       as other_techs_nearby,
+    coalesce(c.same_day_overlap_days, 0)    as same_day_overlap_days,
+    coalesce(c.copresence_events, 0)        as copresence_events,
+    coalesce(c.meters_in_shared_areas, 0)   as meters_in_shared_areas
+from tech_week_labelled l
+left join tech_week_copresence c
+       on c.workedby = l.workedby
+      and c.work_week = l.work_week;
+
+
+-- ============================================================================
+-- EXTRACT 1: pattern_cards
+--   Grain: one row per behavior_pattern (4 rows, 5 with OTHER)
+--   Tableau: text/BAN tiles, one sheet per measure or a single sheet with
+--            measure names on rows and behavior_pattern on columns
+-- ============================================================================
+create or replace view pattern_cards as
+select
+    behavior_pattern,
+
+    -- context for reading the rest
+    count(*)                                as tech_weeks,
+    count(distinct workedby)                as techs,
+    round(100.0 * count(*) / sum(count(*)) over (), 1) as pct_of_weeks,
+
+    -- workload
+    round(avg(meters_changed), 1)           as avg_meters_per_week,
+    round(avg(s4e_changes), 1)              as avg_s4e_per_week,
+    round(avg(clusters_visited), 1)         as avg_clusters_per_week,
+    round(avg(cluster_revisits), 1)         as avg_backtracks_per_week,
+
+    -- pace and distance
+    round(avg(minutes_per_meter), 1)        as avg_minutes_per_meter,
+    round(avg(travel_miles), 1)             as avg_miles_per_week,
+
+    -- overlap with other techs
+    round(avg(other_techs_nearby), 1)       as avg_other_techs_nearby,
+    round(avg(copresence_events), 1)        as avg_copresence_events_per_week,
+    round(avg(same_day_overlap_days), 1)    as avg_same_day_overlap_days,
+    round(avg(meters_others_changed), 1)    as avg_meters_others_changed
+
+from tech_week_full
+group by behavior_pattern;
+
+
+-- ============================================================================
+-- EXTRACT 2: pattern_density
+--   Grain: one row per behavior_pattern x density_band (up to 15 rows)
+--   Tableau: bar chart, density_band on columns, pct_within_pattern on rows,
+--            one sheet per pattern -- or all four with pattern on color
+-- ============================================================================
+create or replace view pattern_density as
+select
+    behavior_pattern,
+    density_band,
+    count(*)                                as tech_weeks,
+    round(100.0 * count(*)
+          / sum(count(*)) over (partition by behavior_pattern), 1)
+                                            as pct_within_pattern
+from tech_week_full
+where density_band is not null
+group by behavior_pattern, density_band;
+
+
+-- ============================================================================
+-- EXTRACT 3: gantt_segments
+--   Grain: one row per segment (a stint worked, or a drive between stints)
+--   Tableau: Gantt Bar mark
+--            Columns = start_minutes   (minutes from midnight)
+--            Rows    = stint_num
+--            Size    = duration_minutes
+--            Color   = segment_type
+--            Filter  = behavior_pattern, one sheet per pattern
+--
+--   density_band travels with each row so the chart title can read
+--   "FRAGMENTED -- representative day (RURAL)".
+-- ============================================================================
+
+-- 3a. day profiles, tagged with the week's pattern
+create or replace view day_profile as
+select
+    v.workedby, v.work_date, v.work_week,
+    l.behavior_pattern,
+    l.density_band,
+    count(*)                            as stints,
+    sum(v.meters_worked)                as meters,
+    sum(v.visit_minutes)                as working_minutes,
+    coalesce(sum(v.travel_miles), 0)    as travel_miles
+from visit_metrics v
+join tech_week_full l
+     on l.workedby = v.workedby and l.work_week = v.work_week
+group by v.workedby, v.work_date, v.work_week,
+         l.behavior_pattern, l.density_band;
+
+-- 3b. the median shape of a day in each pattern
+create or replace view pattern_day_norms as
+select
+    behavior_pattern,
+    count(*)                        as days,
+    median(stints)                  as med_stints,
+    median(meters)                  as med_meters,
+    median(travel_miles)            as med_miles,
+    median(working_minutes)         as med_working_minutes
+from day_profile
+where stints >= 2
+group by behavior_pattern;
+
+-- 3c. the single real day closest to that median
+create or replace view representative_days as
+select * from (
+    select d.*,
+        row_number() over (
+            partition by d.behavior_pattern
+            order by
+                  abs(d.stints          - n.med_stints)
+                      / nullif(n.med_stints, 0)
+                + abs(d.meters          - n.med_meters)
+                      / nullif(n.med_meters, 0)
+                + abs(d.travel_miles    - n.med_miles)
+                      / nullif(n.med_miles, 0)
+                + abs(d.working_minutes - n.med_working_minutes)
+                      / nullif(n.med_working_minutes, 0)
+        ) as rn
+    from day_profile d
+    join pattern_day_norms n using (behavior_pattern)
+    where d.stints >= 2
+) where rn = 1;
+
+-- 3d. the stints of those days
+create or replace view gantt_stints as
+select
+    r.behavior_pattern,
+    r.density_band,
+    r.workedby,
+    r.work_date,
+    v.visit_num                     as stint_num,
+    v.cluster_id,
+    v.visit_start,
+    v.visit_end,
+    greatest(v.visit_minutes, 2)    as duration_minutes,
+    v.meters_worked,
+    v.travel_minutes,
+    v.travel_miles,
+    datediff('minute', cast(v.visit_start as date), v.visit_start)
+                                    as start_minutes
+from representative_days r
+join visit_metrics v
+     on v.workedby = r.workedby and v.work_date = r.work_date;
+
+-- 3e. working bars and driving bars, stacked into one extract
+create or replace view gantt_segments as
+select
+    behavior_pattern, density_band, workedby, work_date, stint_num,
+    'WORKING'                                   as segment_type,
+    start_minutes,
+    start_minutes + duration_minutes            as end_minutes,
+    duration_minutes,
+    meters_worked,
+    travel_miles
+from gantt_stints
+
+union all
+
+select
+    behavior_pattern, density_band, workedby, work_date, stint_num,
+    'DRIVING'                                   as segment_type,
+    start_minutes - travel_minutes              as start_minutes,
+    start_minutes                               as end_minutes,
+    travel_minutes                              as duration_minutes,
+    0                                           as meters_worked,
+    travel_miles
+from gantt_stints
+where travel_minutes > 0;
+
+
+-- ============================================================================
+--   select * from pattern_cards   order by tech_weeks desc;
+--   select * from pattern_density order by behavior_pattern, density_band;
+--   select behavior_pattern, density_band, workedby, work_date, stints, meters
+--   from representative_days order by behavior_pattern;
+--   select behavior_pattern, days from pattern_day_norms;
+-- ============================================================================
+
