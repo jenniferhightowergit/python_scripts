@@ -1,479 +1,254 @@
 -- ============================================================================
--- Meter summary page
+-- ANALYSIS 1 -- meter tech work behavior
 --
--- Grain flips from tech to METER. The unit is nearby_meter, not target_meter.
+-- UNFILTERED SPINE. Sourced from full_s4e_pop_mapping, no neighbor join and
+-- no radius filter, so a work order with no S4e anywhere near it still counts.
+-- That was the bug: the S4e question was filtering the behavior question.
 --
---   meter_near_events -> one row per meter / tech / day a tech was nearby
---   meter_week        -> one row per meter / week
---   meter_profile     -> one row per meter (lifetime, with pulled/in-field status)
---   weekly_summary    -> one row per week (the tiles)
---   meter_rankings    -> two ranked lists for the heat maps
+-- Three layers, each materialized so you can spot check before moving up:
+--   work_sequence   one row per work order, with the gap to the previous one
+--   day_metrics     one row per tech per DAY      <- start here
+--   week_metrics    one row per tech per WEEK
+--   tech_metrics    one row per tech
 --
--- GRAIN TRAP: neighbor_pairs repeats a meter once per nearby target. A tech
--- working 5 targets near meter X on one day puts X on 5 rows. Every count
--- below is distinct on (meter, tech, day) so one pass counts once.
+-- Nothing here depends on clustering.
 -- ============================================================================
 
--- Distance that counts as "in the area". Keep it consistent everywhere.
--- 2640 ft = 0.5 mi. Your bounding-box join tops out around 1.5 mi.
-create or replace macro near_feet() as 2640;
+create or replace macro miles_between(lat1, lon1, lat2, lon2) as
+    round(3959 * 2 * asin(sqrt(
+        power(sin(radians(lat2 - lat1) / 2), 2)
+        + cos(radians(lat1)) * cos(radians(lat2))
+          * power(sin(radians(lon2 - lon1) / 2), 2)
+    )), 2);
+
+create or replace macro minutes_between(t1, t2) as
+    datediff('second', t1, t2) / 60.0;
 
 
 -- ----------------------------------------------------------------------------
--- 1. Meter x tech x day -- the de-duplicated exposure grain
+-- 0. Every real work order
 -- ----------------------------------------------------------------------------
-create or replace table meter_near_events as
+create or replace table work_events_all as
 select distinct
-    nearby_meter                                 as meterno,
-    workedby                                     as passing_tech,
-    work_date,
-    date_trunc('week', cast(work_date as date))  as work_week,
-    nearby_removal_date,
-    nearby_Ticket_Type,
-    -- still installed at the time this tech passed?
-    (nearby_removal_date = date '3001-01-01'
-     or cast(nearby_removal_date as date) > cast(work_date as date))
-                                                 as was_missable
-from neighbor_pairs
-where nearby_meter  is not null
-  and distance_feet <= near_feet()
-  and nearby_workedby is distinct from workedby;   -- someone else's meter
+    workedby,
+    cast(hist_meter_removal_date as date)                     as work_date,
+    date_trunc('week', cast(hist_meter_removal_date as date)) as work_week,
+    hist_meter                                                as meterno,
+    wr_workeddatetime                                         as worked_datetime,
+    hist_latitude                                             as latitude,
+    hist_longitude                                            as longitude,
+    esi_loc,
+    Harware_Model                                             as hardware_model,
+    Ticket_Type                                               as ticket_type,
+    coalesce(pt_flag, 0)                                      as pt_flag,
+    lower(Harware_Model) like '%s4e%'                         as is_s4e
+from full_s4e_pop_mapping
+where workedby          is not null
+  and wr_workeddatetime is not null
+  and hist_latitude     is not null
+  and hist_longitude    is not null
+  and cast(hist_meter_removal_date as date) < date '2900-01-01';
 
 
 -- ----------------------------------------------------------------------------
--- 2. Per meter, per week
+-- 1. Work order sequence -- the gap to the previous order, same tech same day
 --
---    A "miss" is one tech-day where a tech was in the area and the meter was
---    still in the ground. Two techs on the same day = 2 misses. One tech
---    working 5 nearby targets = 1 miss.
+--    minutes_since_prev bundles travel + work + idle. There is only one
+--    timestamp per order, so actual time-on-meter is not recoverable. This
+--    is the honest measure and the name says what it is.
 -- ----------------------------------------------------------------------------
-create or replace view meter_week as
-select
-    meterno,
-    work_week,
-
-    count(*) filter (where was_missable)                    as miss_events,
-    count(distinct passing_tech) filter (where was_missable) as techs_nearby,
-    count(distinct work_date) filter (where was_missable)    as days_nearby,
-
-    -- days where 2+ different techs were in this meter's area
-    count(distinct work_date) filter (
-        where was_missable and techs_that_day >= 2
-    )                                                        as multi_tech_days
-
-from (
-    select *,
-        count(distinct passing_tech) over (
-            partition by meterno, work_date
-        ) as techs_that_day
-    from meter_near_events
-)
-group by meterno, work_week;
-
-
--- ----------------------------------------------------------------------------
--- 3. Per meter -- lifetime profile and current status
--- ----------------------------------------------------------------------------
-create or replace view meter_profile as
-with lifetime as (
-    select
-        meterno,
-        any_value(nearby_removal_date)                       as removal_date,
-        count(*) filter (where was_missable)                 as total_miss_events,
-        count(distinct work_week) filter (where was_missable) as weeks_missed,
-        count(distinct passing_tech) filter (where was_missable) as distinct_techs,
-        min(work_date) filter (where was_missable)           as first_missed,
-        max(work_date) filter (where was_missable)           as last_missed
-    from meter_near_events
-    group by meterno
-)
+create or replace table work_sequence as
 select
     *,
-    case when removal_date = date '3001-01-01'
-         then 'STILL_IN_FIELD' else 'PULLED' end            as meter_status,
-    -- for pulled meters: how long it sat after the first tech passed it by
-    case when removal_date <> date '3001-01-01'
-         then datediff('day', first_missed, cast(removal_date as date))
-    end                                                      as days_missed_to_pull
-from lifetime
-where total_miss_events > 0;
+    row_number() over w                             as order_num,
+    lag(worked_datetime) over w                     as prev_datetime,
+    lag(latitude)        over w                     as prev_lat,
+    lag(longitude)       over w                     as prev_lon,
+    minutes_between(lag(worked_datetime) over w, worked_datetime)
+                                                    as minutes_since_prev,
+    miles_between(lag(latitude) over w, lag(longitude) over w,
+                  latitude, longitude)              as miles_since_prev
+from work_events_all
+window w as (partition by workedby, work_date order by worked_datetime);
 
 
 -- ----------------------------------------------------------------------------
--- 4. Weekly tiles
+-- 2. Backtracking -- returning to an area already worked that day
 --
---    Rates are per-meter-per-week averages over meters that were exposed
---    that week -- not over all meters, which would drown the signal.
+--    A return is: this order is more than RETURN_AWAY_MI from the previous
+--    one (so they genuinely left), AND it lands within RETURN_NEAR_MI of
+--    somewhere they worked earlier that day, skipping the immediately
+--    preceding order.
+--
+--    Matches your description: worked area A, went to B and C, came back to A.
+--    No clustering needed.
 -- ----------------------------------------------------------------------------
-create or replace view weekly_meter_summary as
-with per_week as (
-    select
-        w.work_week,
-        count(distinct w.meterno)                            as meters_exposed,
-        sum(w.miss_events)                                   as total_miss_events,
-        avg(w.miss_events)                                   as avg_misses_per_meter,
-        avg(w.techs_nearby)                                  as avg_techs_per_meter,
-        sum(w.multi_tech_days)                               as multi_tech_day_events,
-        count(distinct w.meterno) filter (where w.multi_tech_days > 0)
-                                                             as meters_seen_by_2plus
-    from meter_week w
-    group by w.work_week
-),
-resolved as (
-    -- previously-missed meters that got pulled during this week
-    select
-        date_trunc('week', cast(p.removal_date as date))     as work_week,
-        count(*)                                             as missed_meters_pulled
-    from meter_profile p
-    where p.meter_status = 'PULLED'
-    group by 1
-),
-work as (
-    -- target-side ticket mix
-    select
-        work_week,
-        count(distinct meterno) filter (where is_s4e)        as s4e_changes,
-        count(distinct meterno) filter (
-            where upper(ticket_type) like '%PERIODIC%')      as periodic_tests
-    from work_events
-    group by work_week
-)
+create or replace table day_returns as
 select
-    w.work_week,
-    w.meters_exposed,
-    w.total_miss_events,
-    round(w.avg_misses_per_meter, 2)                         as avg_misses_per_meter,
-    round(w.avg_techs_per_meter, 2)                          as avg_techs_per_meter,
-    w.multi_tech_day_events,
-    w.meters_seen_by_2plus,
-    coalesce(r.missed_meters_pulled, 0)                      as missed_meters_pulled,
-    coalesce(k.s4e_changes, 0)                               as s4e_changes,
-    coalesce(k.periodic_tests, 0)                            as periodic_tests
-from per_week w
-left join resolved r using (work_week)
-left join work     k using (work_week);
+    a.workedby,
+    a.work_date,
+    count(*)                                        as return_events,
+    count(distinct a.esi_loc)                       as distinct_return_spots
+from work_sequence a
+where a.miles_since_prev > 1.0                      -- RETURN_AWAY_MI
+  and exists (
+      select 1
+      from work_sequence b
+      where b.workedby  = a.workedby
+        and b.work_date = a.work_date
+        and b.order_num < a.order_num - 1
+        and miles_between(b.latitude, b.longitude,
+                          a.latitude, a.longitude) <= 0.5   -- RETURN_NEAR_MI
+  )
+group by a.workedby, a.work_date;
 
--- one-row overall averages for the summary tiles
-create or replace view meter_summary_tiles as
+
+-- ----------------------------------------------------------------------------
+-- 3. DAY METRICS -- spot check here first
+-- ----------------------------------------------------------------------------
+create or replace table day_metrics as
 select
-    count(*)                                         as weeks,
-    round(avg(avg_misses_per_meter), 2)              as avg_misses_per_meter_per_week,
-    round(avg(avg_techs_per_meter), 2)               as avg_techs_per_meter_per_week,
-    round(avg(multi_tech_day_events), 1)             as avg_multi_tech_days_per_week,
-    round(avg(missed_meters_pulled), 1)              as avg_missed_meters_pulled_per_week,
-    round(avg(s4e_changes), 1)                       as avg_s4e_changes_per_week,
-    round(avg(periodic_tests), 1)                    as avg_periodic_tests_per_week,
-    (select count(*) from meter_profile
-     where meter_status = 'STILL_IN_FIELD')          as missed_still_in_field
-from weekly_meter_summary;
+    s.workedby,
+    s.work_date,
+    s.work_week,
+
+    -- volume
+    count(*)                                        as work_orders,
+    count(distinct s.meterno)                       as meters,
+    count(distinct s.meterno) filter (where s.is_s4e)        as s4e_changes,
+    count(distinct s.meterno) filter (where not s.is_s4e)    as non_s4e_changes,
+    count(distinct s.meterno) filter (where s.pt_flag = 1)   as periodic_tests,
+    count(distinct s.esi_loc)                       as distinct_locations,
+
+    -- shape of the day
+    min(s.worked_datetime)                          as first_order,
+    max(s.worked_datetime)                          as last_order,
+    minutes_between(min(s.worked_datetime), max(s.worked_datetime))
+                                                    as minutes_first_to_last,
+
+    -- gaps between orders. median resists the 4-hour outliers that
+    -- would otherwise dominate the mean
+    round(avg(s.minutes_since_prev), 1)             as avg_minutes_between_orders,
+    round(median(s.minutes_since_prev), 1)          as median_minutes_between_orders,
+    round(max(s.minutes_since_prev), 1)             as max_gap_minutes,
+
+    -- distance
+    round(sum(s.miles_since_prev), 1)               as miles_traveled,
+    round(avg(s.miles_since_prev), 2)               as avg_miles_between_orders,
+    round(max(s.miles_since_prev), 1)               as max_leg_miles,
+
+    -- backtracking
+    coalesce(r.return_events, 0)                    as return_events
+
+from work_sequence s
+left join day_returns r
+       on r.workedby = s.workedby and r.work_date = s.work_date
+group by s.workedby, s.work_date, s.work_week, r.return_events;
 
 
 -- ----------------------------------------------------------------------------
--- 5. Rankings for the two heat maps
+-- 4. WEEK METRICS
 --
---    Ranked separately because the two lists mean different things:
---    STILL_IN_FIELD is an actionable work list; PULLED is a retrospective
---    "how long did we walk past this" record.
---
---    Coordinates come from full_s4e_pop_mapping -- neighbor_pairs doesn't
---    carry nearby_lat/lon through. Adjust the join if yours differs.
+--    Sums are per week. Averages of day-level rates are averages ACROSS DAYS,
+--    so avg_minutes_between_orders here is the mean of daily means -- each
+--    day weighted equally regardless of how many orders it had.
 -- ----------------------------------------------------------------------------
-create or replace view meter_rankings as
-select
-    p.*,
-    m.hist_latitude                                  as latitude,
-    m.hist_longitude                                 as longitude,
-    m.esi_loc,
-    rank() over (
-        partition by p.meter_status
-        order by p.total_miss_events desc, p.weeks_missed desc
-    )                                                as miss_rank
-from meter_profile p
-left join (
-    select distinct hist_meter, hist_latitude, hist_longitude, esi_loc
-    from full_s4e_pop_mapping
-) m on m.hist_meter = p.meterno;
-
--- heat map 1: the work list
-create or replace view still_in_field_ranked as
-select * from meter_rankings
-where meter_status = 'STILL_IN_FIELD'
-order by miss_rank;
-
--- heat map 2: the retrospective
-create or replace view pulled_ranked as
-select * from meter_rankings
-where meter_status = 'PULLED'
-order by miss_rank;
-
-
--- ============================================================================
--- Sanity checks before trusting any of it:
---
---   -- should be 1.0; if higher, meter_near_events is still fanned out
---   select count(*) * 1.0 / count(distinct (meterno, passing_tech, work_date))
---   from meter_near_events;
---
---   -- status split; STILL_IN_FIELD is your actionable population
---   select meter_status, count(*), round(avg(total_miss_events), 1)
---   from meter_profile group by 1;
---
---   -- distribution of miss counts. If most meters sit at 1, there is no
---   -- "consistently missed" population to map and the heat map won't show
---   -- anything. Check this before building the viz.
---   select total_miss_events, count(*) as meters
---   from meter_profile group by 1 order by 1 limit 20;
--- ============================================================================
-
-
-
--- ============================================================================
--- Behavior pattern tab -- three Tableau extracts
---
---   pattern_cards      one row per behavior pattern      -> the stat cards
---   pattern_density    one row per pattern x band        -> the bar charts
---   gantt_segments     one row per stint or drive        -> the four Gantts
---
--- WHY CO-PRESENCE IS GEOGRAPHIC: cluster_id is scoped per tech
--- ({tech}_{week}_{label}), so two techs never share one. "Two techs in the
--- same area" has to come from neighbor_pairs + distance_feet.
---
--- nearby_removal_date doubles as the day that neighbor meter was worked
--- (work_date is derived from hist_meter_removal_date), so same-day overlap
--- needs no schema change.
--- ============================================================================
-
-
--- ----------------------------------------------------------------------------
--- 1. Co-presence per tech-week
---
---    Distinct from meters_others_changed, which is about meters LEFT BEHIND.
---    This is simply: was another tech working near you, and how often.
--- ----------------------------------------------------------------------------
-create or replace view tech_week_copresence as
-with encounters as (
-    select distinct
-        workedby,
-        work_week,
-        cast(work_date as date)             as work_date,
-        nearby_workedby                     as other_tech,
-        cast(nearby_removal_date as date)   as other_tech_date,
-        nearby_meter
-    from neighbor_pairs
-    where nearby_workedby is not null
-      and nearby_workedby <> workedby
-      and distance_feet   <= 2640                        -- NEAR_FEET: 0.5 mi
-      and nearby_removal_date <> date '3001-01-01'       -- actually worked
-      and date_trunc('week', cast(nearby_removal_date as date))
-          = date_trunc('week', cast(work_date as date))  -- same week
-)
+create or replace table week_metrics as
 select
     workedby,
     work_week,
 
-    -- how many different techs were working in your areas this week
-    count(distinct other_tech)                          as other_techs_nearby,
+    count(*)                                    as days_worked,
 
-    -- days you and someone else were both working the same area
-    count(distinct work_date) filter (
-        where other_tech_date = work_date)              as same_day_overlap_days,
+    -- weekly totals
+    sum(work_orders)                            as work_orders,
+    sum(meters)                                 as meters_changed,
+    sum(s4e_changes)                            as s4e_changes,
+    sum(non_s4e_changes)                        as non_s4e_changes,
+    sum(periodic_tests)                         as periodic_tests,
+    sum(return_events)                          as return_events,
+    round(sum(miles_traveled), 1)               as miles_traveled,
 
-    -- distinct tech-day encounters: 2 techs on Monday + 1 on Friday = 3
-    count(distinct (other_tech, work_date))             as copresence_events,
+    -- daily shape, averaged across the days of the week
+    round(avg(minutes_first_to_last), 1)        as avg_minutes_first_to_last,
+    round(avg(work_orders), 1)                  as avg_orders_per_day,
+    round(avg(distinct_locations), 1)           as avg_locations_per_day,
+    round(avg(return_events), 2)                as avg_returns_per_day,
 
-    -- meters involved in those overlaps
-    count(distinct nearby_meter)                        as meters_in_shared_areas
+    -- pacing
+    round(avg(avg_minutes_between_orders), 1)   as avg_minutes_between_orders,
+    round(median(median_minutes_between_orders), 1)
+                                                as median_minutes_between_orders,
+    round(avg(avg_miles_between_orders), 2)     as avg_miles_between_orders
 
-from encounters
+from day_metrics
 group by workedby, work_week;
 
 
 -- ----------------------------------------------------------------------------
--- 2. Tech-week with everything attached
+-- 5. TECH METRICS -- the per-tech generalization
 -- ----------------------------------------------------------------------------
-create or replace view tech_week_full as
+create or replace table tech_metrics as
 select
-    l.*,
-    coalesce(c.other_techs_nearby, 0)       as other_techs_nearby,
-    coalesce(c.same_day_overlap_days, 0)    as same_day_overlap_days,
-    coalesce(c.copresence_events, 0)        as copresence_events,
-    coalesce(c.meters_in_shared_areas, 0)   as meters_in_shared_areas
-from tech_week_labelled l
-left join tech_week_copresence c
-       on c.workedby = l.workedby
-      and c.work_week = l.work_week;
+    workedby,
+
+    count(*)                                    as weeks_active,
+    sum(days_worked)                            as days_worked,
+
+    -- your card list, all per week
+    round(avg(meters_changed), 1)               as avg_meters_per_week,
+    round(avg(s4e_changes), 1)                  as avg_s4e_per_week,
+    round(avg(non_s4e_changes), 1)              as avg_non_s4e_per_week,
+    round(avg(periodic_tests), 1)               as avg_periodic_tests_per_week,
+    round(avg(return_events), 1)                as avg_returns_per_week,
+    round(avg(miles_traveled), 1)               as avg_miles_per_week,
+    round(avg(avg_miles_between_orders), 2)     as avg_miles_between_orders,
+    round(avg(avg_minutes_first_to_last), 1)    as avg_minutes_worked_per_day,
+    round(avg(avg_minutes_between_orders), 1)   as avg_minutes_between_orders,
+    round(avg(median_minutes_between_orders), 1)
+                                                as median_minutes_between_orders,
+    round(avg(avg_orders_per_day), 1)           as avg_orders_per_day
+
+from week_metrics
+group by workedby;
 
 
 -- ============================================================================
--- EXTRACT 1: pattern_cards
---   Grain: one row per behavior_pattern (4 rows, 5 with OTHER)
---   Tableau: text/BAN tiles, one sheet per measure or a single sheet with
---            measure names on rows and behavior_pattern on columns
--- ============================================================================
-create or replace view pattern_cards as
-select
-    behavior_pattern,
-
-    -- context for reading the rest
-    count(*)                                as tech_weeks,
-    count(distinct workedby)                as techs,
-    round(100.0 * count(*) / sum(count(*)) over (), 1) as pct_of_weeks,
-
-    -- workload
-    round(avg(meters_changed), 1)           as avg_meters_per_week,
-    round(avg(s4e_changes), 1)              as avg_s4e_per_week,
-    round(avg(clusters_visited), 1)         as avg_clusters_per_week,
-    round(avg(cluster_revisits), 1)         as avg_backtracks_per_week,
-
-    -- pace and distance
-    round(avg(minutes_per_meter), 1)        as avg_minutes_per_meter,
-    round(avg(travel_miles), 1)             as avg_miles_per_week,
-
-    -- overlap with other techs
-    round(avg(other_techs_nearby), 1)       as avg_other_techs_nearby,
-    round(avg(copresence_events), 1)        as avg_copresence_events_per_week,
-    round(avg(same_day_overlap_days), 1)    as avg_same_day_overlap_days,
-    round(avg(meters_others_changed), 1)    as avg_meters_others_changed
-
-from tech_week_full
-group by behavior_pattern;
-
-
--- ============================================================================
--- EXTRACT 2: pattern_density
---   Grain: one row per behavior_pattern x density_band (up to 15 rows)
---   Tableau: bar chart, density_band on columns, pct_within_pattern on rows,
---            one sheet per pattern -- or all four with pattern on color
--- ============================================================================
-create or replace view pattern_density as
-select
-    behavior_pattern,
-    density_band,
-    count(*)                                as tech_weeks,
-    round(100.0 * count(*)
-          / sum(count(*)) over (partition by behavior_pattern), 1)
-                                            as pct_within_pattern
-from tech_week_full
-where density_band is not null
-group by behavior_pattern, density_band;
-
-
--- ============================================================================
--- EXTRACT 3: gantt_segments
---   Grain: one row per segment (a stint worked, or a drive between stints)
---   Tableau: Gantt Bar mark
---            Columns = start_minutes   (minutes from midnight)
---            Rows    = stint_num
---            Size    = duration_minutes
---            Color   = segment_type
---            Filter  = behavior_pattern, one sheet per pattern
+-- SPOT CHECKS
 --
---   density_band travels with each row so the chart title can read
---   "FRAGMENTED -- representative day (RURAL)".
+-- UJC0 on the two days you looked at. Every hardware model on his rows is a
+-- Focus AX variant, so s4e_changes should come back 0 for both.
+--
+--   select * from day_metrics
+--   where workedby = 'UJC0'
+--     and work_date in (date '2026-04-20', date '2026-04-21');
+--
+-- His individual orders, to reconcile against the Gantt by hand:
+--
+--   select order_num, worked_datetime, esi_loc, hardware_model, is_s4e,
+--          round(minutes_since_prev, 0) as gap_min,
+--          miles_since_prev             as leg_mi
+--   from work_sequence
+--   where workedby = 'UJC0' and work_date = date '2026-04-20'
+--   order by order_num;
+--
+-- Did the unfiltered spine recover the orders the radius filter dropped?
+--
+--   select count(*) as all_orders from work_events_all;
+--   select count(distinct target_meter) as filtered_targets from radius_filter;
+--
+-- Sanity on the gap distribution -- mean vs median tells you how skewed:
+--
+--   select round(avg(minutes_since_prev), 1)    as mean_gap,
+--          round(median(minutes_since_prev), 1) as median_gap,
+--          round(quantile_cont(minutes_since_prev, 0.9), 1) as p90_gap,
+--          count(*) filter (where minutes_since_prev > 120) as gaps_over_2h,
+--          count(*)                             as total_gaps
+--   from work_sequence where minutes_since_prev is not null;
+--
+-- Does backtracking actually fire? If return_events is 0 everywhere, loosen
+-- RETURN_AWAY_MI or tighten RETURN_NEAR_MI in day_returns.
+--
+--   select return_events, count(*) as days
+--   from day_metrics group by 1 order by 1;
 -- ============================================================================
-
--- 3a. day profiles, tagged with the week's pattern
-create or replace view day_profile as
-select
-    v.workedby, v.work_date, v.work_week,
-    l.behavior_pattern,
-    l.density_band,
-    count(*)                            as stints,
-    sum(v.meters_worked)                as meters,
-    sum(v.visit_minutes)                as working_minutes,
-    coalesce(sum(v.travel_miles), 0)    as travel_miles
-from visit_metrics v
-join tech_week_full l
-     on l.workedby = v.workedby and l.work_week = v.work_week
-group by v.workedby, v.work_date, v.work_week,
-         l.behavior_pattern, l.density_band;
-
--- 3b. the median shape of a day in each pattern
-create or replace view pattern_day_norms as
-select
-    behavior_pattern,
-    count(*)                        as days,
-    median(stints)                  as med_stints,
-    median(meters)                  as med_meters,
-    median(travel_miles)            as med_miles,
-    median(working_minutes)         as med_working_minutes
-from day_profile
-where stints >= 2
-group by behavior_pattern;
-
--- 3c. the single real day closest to that median
-create or replace view representative_days as
-select * from (
-    select d.*,
-        row_number() over (
-            partition by d.behavior_pattern
-            order by
-                  abs(d.stints          - n.med_stints)
-                      / nullif(n.med_stints, 0)
-                + abs(d.meters          - n.med_meters)
-                      / nullif(n.med_meters, 0)
-                + abs(d.travel_miles    - n.med_miles)
-                      / nullif(n.med_miles, 0)
-                + abs(d.working_minutes - n.med_working_minutes)
-                      / nullif(n.med_working_minutes, 0)
-        ) as rn
-    from day_profile d
-    join pattern_day_norms n using (behavior_pattern)
-    where d.stints >= 2
-) where rn = 1;
-
--- 3d. the stints of those days
-create or replace view gantt_stints as
-select
-    r.behavior_pattern,
-    r.density_band,
-    r.workedby,
-    r.work_date,
-    v.visit_num                     as stint_num,
-    v.cluster_id,
-    v.visit_start,
-    v.visit_end,
-    greatest(v.visit_minutes, 2)    as duration_minutes,
-    v.meters_worked,
-    v.travel_minutes,
-    v.travel_miles,
-    datediff('minute', cast(v.visit_start as date), v.visit_start)
-                                    as start_minutes
-from representative_days r
-join visit_metrics v
-     on v.workedby = r.workedby and v.work_date = r.work_date;
-
--- 3e. working bars and driving bars, stacked into one extract
-create or replace view gantt_segments as
-select
-    behavior_pattern, density_band, workedby, work_date, stint_num,
-    'WORKING'                                   as segment_type,
-    start_minutes,
-    start_minutes + duration_minutes            as end_minutes,
-    duration_minutes,
-    meters_worked,
-    travel_miles
-from gantt_stints
-
-union all
-
-select
-    behavior_pattern, density_band, workedby, work_date, stint_num,
-    'DRIVING'                                   as segment_type,
-    start_minutes - travel_minutes              as start_minutes,
-    start_minutes                               as end_minutes,
-    travel_minutes                              as duration_minutes,
-    0                                           as meters_worked,
-    travel_miles
-from gantt_stints
-where travel_minutes > 0;
-
-
--- ============================================================================
---   select * from pattern_cards   order by tech_weeks desc;
---   select * from pattern_density order by behavior_pattern, density_band;
---   select behavior_pattern, density_band, workedby, work_date, stints, meters
---   from representative_days order by behavior_pattern;
---   select behavior_pattern, days from pattern_day_norms;
--- ============================================================================
-
