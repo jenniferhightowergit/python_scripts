@@ -1,159 +1,33 @@
--- ======================================================================
--- 6. BEHAVIOR + DENSITY BUCKETS -- one label per tech per day
---
---    Work cluster = a run of consecutive orders; a hop longer than
---    cluster_break_mi starts a new one. A return to an earlier area is
---    always a >1 mi hop, so it also starts a new cluster -- which means
---    revisit_rate = returns / cluster moves, a clean 0-1 rate.
---
---    All thresholds live in bucket_params. Starting values are guesses;
---    tune them with the distribution check query.
--- ======================================================================
-create or replace table bucket_params as
-select
-    1.0  as cluster_break_mi,  -- hop > this starts a new cluster (same as RETURN_AWAY_MI)
-    5    as min_orders,        -- fewer orders than this -> not labeled
-    4    as many_clusters,     -- "lots of clusters"
-    3    as few_clusters,      -- "few clusters"
-    5    as lots_mpc,          -- median meters per cluster: "lots"   (Focused)
-    3    as several_mpc,       -- median meters per cluster: "several" (Sequential)
-    2    as few_mpc,           -- median meters per cluster: "few"    (Fragmented)
-    2.0  as close_mi,          -- avg miles between clusters: "close"  (Focused)
-    4.0  as far_mi,            -- avg miles between clusters: "long"   (Fragmented)
-    0.30 as revisit_rate_hi,   -- share of cluster moves that go back to an earlier area
-    2    as min_returns,       -- need at least this many returns to be Revisiting
-    0.01 as grid_deg,          -- density grid cell, ~0.7 x 0.6 mi in DFW
-    2000 as dense_hi,          -- premises within ~1 mi of the stop: Highly dense
-    300  as dense_mid;         -- Moderately dense (below = Not dense)
+{
+    "version": "1.0.0",
+    "base-theme": "smooth",
+    "styles": {
+        "all":                  { "font-color": "#404040", "font-family": "Calibri" },
+        "worksheet":            { "font-color": "#404040", "font-family": "Calibri", "font-size": 9 },
+        "worksheet-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 14 },
+        "dashboard-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 22, "font-weight": "normal" },
+        "story-title":          { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 20 },
+        "header":               { "font-color": "#262626", "font-family": "Calibri" },
+        "tooltip":              { "font-color": "#404040", "font-family": "Calibri", "font-size": 10 },
+        "legend":               { "font-color": "#595959", "font-family": "Calibri", "font-size": 9, "background-color": "#FFFFFF" },
+        "legend-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "filter":               { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "filter-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "parameter-ctrl":       { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "parameter-ctrl-title": { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "highlighter":          { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "highlighter-title":    { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "page-ctrl-title":      { "font-color": "#1F3864", "font-family": "Calibri" },
+        "gridline":             { "line-visibility": "off" },
+        "zeroline":             { "line-visibility": "on", "line-pattern": "solid", "line-width": 1, "line-color": "#BFBFBF" },
+        "mark":                 { "mark-color": "#1F3864" },
+        "view":                 { "background-color": "#FFFFFF" }
+    }
+}
 
 
--- 6a. tag every order with its cluster number
-create or replace table work_clusters as
-select
-    s.*,
-    (s.order_num = 1 or s.miles_since_prev > p.cluster_break_mi)          as is_cluster_break,
-    sum(case when s.order_num = 1 or s.miles_since_prev > p.cluster_break_mi
-             then 1 else 0 end)
-        over (partition by s.workedby, s.work_date order by s.order_num)::int as cluster_num
-from work_sequence s
-cross join bucket_params p;
 
 
--- 6b. density: distinct premises per grid cell, summed over the 3x3 block
---     around each cell (~2 x 1.8 mi). Equality join on offsets, not BETWEEN.
-create or replace table grid_premises as
-select
-    floor(f.hist_latitude  / p.grid_deg)::bigint as gy,
-    floor(f.hist_longitude / p.grid_deg)::bigint as gx,
-    count(distinct f.esi_loc)                    as premises
-from full_s4e_pop_mapping f
-cross join bucket_params p
-where f.hist_latitude is not null
-  and f.hist_longitude is not null
-group by 1, 2;
-
-create or replace table grid_density as
-select
-    g.gy,
-    g.gx,
-    sum(n.premises) as premises_nearby
-from grid_premises g
-cross join range(-1, 2) oy(dy)
-cross join range(-1, 2) ox(dx)
-join grid_premises n
-  on n.gy = g.gy + oy.dy
- and n.gx = g.gx + ox.dx
-group by g.gy, g.gx;
 
 
--- 6c. one row per tech per day, with labels
-create or replace table day_behavior as
-with cluster_sizes as (
-    select workedby, work_date, cluster_num,
-           count(distinct meterno) as cluster_meters
-    from work_clusters
-    group by workedby, work_date, cluster_num
-),
-day_stats as (
-    select
-        c.workedby,
-        c.work_date,
-        c.work_week,
-        count(*)                                                          as orders,
-        count(distinct c.meterno)                                         as meters,
-        max(c.cluster_num)                                                as clusters,
-        round(avg(c.miles_since_prev)
-              filter (where c.is_cluster_break and c.order_num > 1), 2)   as avg_miles_between_clusters,
-        median(d.premises_nearby)                                         as median_premises_nearby,
-        count(*) filter (where c.miles_since_prev
-                               / nullif(c.minutes_since_prev, 0) * 60 > 70) as impossible_legs
-    from work_clusters c
-    cross join bucket_params p
-    left join grid_density d
-      on d.gy = floor(c.latitude  / p.grid_deg)::bigint
-     and d.gx = floor(c.longitude / p.grid_deg)::bigint
-    group by c.workedby, c.work_date, c.work_week
-),
-stats as (
-    select
-        s.*,
-        z.median_meters_per_cluster,
-        coalesce(r.return_events, 0)                                      as return_events,
-        round(coalesce(r.return_events, 0) / nullif(s.clusters - 1, 0), 2) as revisit_rate
-    from day_stats s
-    join (select workedby, work_date,
-                 median(cluster_meters) as median_meters_per_cluster
-          from cluster_sizes group by workedby, work_date) z
-      on z.workedby = s.workedby and z.work_date = s.work_date
-    left join day_returns r
-      on r.workedby = s.workedby and r.work_date = s.work_date
-)
-select
-    t.*,
-    case
-        when t.orders < p.min_orders
-            then 'Too few orders'
-        when t.return_events >= p.min_returns
-         and t.revisit_rate  >= p.revisit_rate_hi
-            then 'Revisiting'
-        when t.clusters <= p.few_clusters
-         and t.median_meters_per_cluster >= p.lots_mpc
-         and coalesce(t.avg_miles_between_clusters, 0) <= p.close_mi
-            then 'Focused'
-        when t.clusters >= p.many_clusters
-         and t.median_meters_per_cluster >= p.several_mpc
-         and t.return_events = 0
-            then 'Sequential'
-        when t.clusters >= p.many_clusters
-         and t.median_meters_per_cluster <= p.few_mpc
-         and t.avg_miles_between_clusters >= p.far_mi
-            then 'Fragmented'
-        else 'Mixed'
-    end as behavior,
-    case
-        when t.median_premises_nearby >= p.dense_hi  then 'Highly dense'
-        when t.median_premises_nearby >= p.dense_mid then 'Moderately dense'
-        else 'Not dense'
-    end as density_band
-from stats t
-cross join bucket_params p;
 
-
--- ----------------------------------------------------------------------
--- CHECK (run in its own cell with .df(), outside the big execute):
---   how the days split, and where the thresholds should sit
--- ----------------------------------------------------------------------
--- select behavior, density_band, count(*) as days,
---        round(100.0 * count(*) / sum(count(*)) over (), 1) as pct_of_days
--- from day_behavior
--- group by behavior, density_band
--- order by behavior, density_band;
---
--- select
---     quantile_cont(clusters,                   [0.25, 0.5, 0.75]) as clusters_q,
---     quantile_cont(median_meters_per_cluster,  [0.25, 0.5, 0.75]) as mpc_q,
---     quantile_cont(avg_miles_between_clusters, [0.25, 0.5, 0.75]) as mi_between_q,
---     quantile_cont(revisit_rate,               [0.50, 0.75, 0.90]) as revisit_q,
---     quantile_cont(median_premises_nearby,     [0.33, 0.67])       as density_q
--- from day_behavior
--- where behavior <> 'Too few orders';
