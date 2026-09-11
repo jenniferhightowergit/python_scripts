@@ -1,0 +1,26 @@
+{
+    "version": "1.0.0",
+    "base-theme": "smooth",
+    "styles": {
+        "all":                  { "font-color": "#404040", "font-family": "Calibri" },
+        "worksheet":            { "font-color": "#404040", "font-family": "Calibri", "font-size": 9 },
+        "worksheet-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 14 },
+        "dashboard-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 22, "font-weight": "normal" },
+        "story-title":          { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 20 },
+        "header":               { "font-color": "#262626", "font-family": "Calibri" },
+        "tooltip":              { "font-color": "#404040", "font-family": "Calibri", "font-size": 10 },
+        "legend":               { "font-color": "#595959", "font-family": "Calibri", "font-size": 9, "background-color": "#FFFFFF" },
+        "legend-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "filter":               { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "filter-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "parameter-ctrl":       { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "parameter-ctrl-title": { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "highlighter":          { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
+        "highlighter-title":    { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
+        "page-ctrl-title":      { "font-color": "#1F3864", "font-family": "Calibri" },
+        "gridline":             { "line-visibility": "off" },
+        "zeroline":             { "line-visibility": "on", "line-pattern": "solid", "line-width": 1, "line-color": "#BFBFBF" },
+        "mark":                 { "mark-color": "#1F3864" },
+        "view":                 { "background-color": "#FFFFFF" }
+    }
+}
