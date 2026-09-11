@@ -1,9 +1,4 @@
-import tempfile, webbrowser
-from pathlib import Path
-
-def show(m, name="map"):
-    f = Path(tempfile.gettempdir()) / f"{name}.html"
-    m.save(str(f))
-    webbrowser.open(f.as_uri())
-
-show(plot_day("U58L", "2026-06-18"), "U58L_2026-06-18")
+m = folium.Map(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri",
+)
