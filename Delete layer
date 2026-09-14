@@ -1,123 +1,123 @@
 -- ======================================================================
--- 7. OPPORTUNITY -- how many S4e meters sat within reach of each stop
+-- 8. S4e CAPTURE BY DENSITY BAND -- does concentration change the rate?
 --
---    "In the vicinity" = within VICINITY_MI of the stop AND still
---    installed on that work date. Point-in-time matters: a meter pulled
---    in March was a live opportunity in February, and one pulled in
---    January was not. Comparing against today's active list would get
---    both backwards.
+--    Grain: one row per S4e meter. Was it ever changed, and how many
+--    other S4e meters sit around it? Two versions, because they answer
+--    different questions:
 --
---    A meter's own change never counts as its own opportunity, but the
---    other S4e meters a tech could have reached that day do.
+--      all_s4e      -- every S4e meter. Program-level progress.
+--      exposed_s4e  -- only meters a tech actually came within reach of.
+--                      Removes "nobody ever went there" from the picture,
+--                      which is what you need to claim deprioritization.
 -- ======================================================================
-create or replace table opp_params as
+create or replace table band_params as
 select
-    0.5   as vicinity_mi,      -- how far the tech could reasonably reach from a stop
-    0.01  as grid_deg;         -- prefilter cell, ~0.7 x 0.6 mi -- must be >= vicinity
+    0.01 as grid_deg,      -- ~0.7 x 0.6 mi cell; 3x3 block ~ 2 x 1.8 mi
+    10   as band_low,      -- S4e neighbors: below this = Low
+    50   as band_mid,      --               below this = Moderate
+    150  as band_high;     --               below this = High, else Very high
 
 
--- 7a. every S4e meter, where it sits and when it left
---     removal_date null (or far-future) = still installed today
-create or replace table s4e_universe as
+-- 8a. per-meter S4e neighbor count (the concentration each meter sits in)
+create or replace table s4e_grid as
 select
-    f.esi_loc,
-    f.hist_meter                                  as meterno,
-    min(f.hist_latitude)                          as latitude,
-    min(f.hist_longitude)                         as longitude,
-    min(cast(f.hist_meter_removal_date as date))  as removed_date
-from full_s4e_pop_mapping f
-where lower(f.Harware_Model) like '%s4e%'
-  and f.hist_latitude  is not null
-  and f.hist_longitude is not null
-group by f.esi_loc, f.hist_meter;
+    floor(latitude  / p.grid_deg)::bigint as gy,
+    floor(longitude / p.grid_deg)::bigint as gx,
+    count(*)                              as s4e_in_cell
+from s4e_universe
+cross join band_params p
+group by 1, 2;
 
-
--- 7b. count reachable S4e meters per work order
---     The grid join keeps this from comparing every stop to every meter:
---     only the 3x3 cells around the stop are candidates, then
---     miles_between does the real test.
-create or replace table order_opportunity as
+create or replace table s4e_neighbors as
 select
-    s.workedby,
-    s.work_date,
-    s.work_week,
-    s.order_num,
-    s.meterno,
-    s.esi_loc,
-    s.is_s4e,
-    count(distinct u.meterno)                                       as s4e_nearby,
-    count(distinct u.esi_loc)                                       as s4e_premises_nearby,
-    count(distinct u.meterno) filter (where u.esi_loc = s.esi_loc)  as s4e_same_premise
-from work_sequence s
-cross join opp_params p
-left join s4e_universe u
-       on floor(u.latitude  / p.grid_deg)::bigint
-          between floor(s.latitude  / p.grid_deg)::bigint - 1
-              and floor(s.latitude  / p.grid_deg)::bigint + 1
-      and floor(u.longitude / p.grid_deg)::bigint
-          between floor(s.longitude / p.grid_deg)::bigint - 1
-              and floor(s.longitude / p.grid_deg)::bigint + 1
-      and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
-      and u.meterno <> s.meterno                                    -- not its own opportunity
-      and (u.removed_date is null or u.removed_date >= s.work_date) -- still installed that day
-group by s.workedby, s.work_date, s.work_week, s.order_num,
-         s.meterno, s.esi_loc, s.is_s4e;
+    u.meterno,
+    u.esi_loc,
+    u.removed_date,
+    (u.removed_date is not null
+     and u.removed_date < date '2900-01-01')      as was_changed,
+    sum(n.s4e_in_cell) - 1                        as s4e_concentration
+from s4e_universe u
+cross join band_params p
+cross join range(-1, 2) oy(dy)
+cross join range(-1, 2) ox(dx)
+join s4e_grid n
+  on n.gy = floor(u.latitude  / p.grid_deg)::bigint + oy.dy
+ and n.gx = floor(u.longitude / p.grid_deg)::bigint + ox.dx
+group by u.meterno, u.esi_loc, u.removed_date;
 
 
--- 7c. the scatter plot grain: one point per tech per week
---     opportunity is de-duplicated -- a meter passed on five stops is
---     one opportunity, not five
-create or replace table week_opportunity as
-with distinct_opp as (
-    select distinct
-        s.workedby,
-        s.work_week,
-        u.meterno
+-- 8b. band it, and mark which meters a tech ever came near
+create or replace table s4e_capture_by_band as
+with exposed as (
+    select distinct u.meterno
     from work_sequence s
-    cross join opp_params p
+    cross join opp_params op
     join s4e_universe u
-      on floor(u.latitude  / p.grid_deg)::bigint
-         between floor(s.latitude  / p.grid_deg)::bigint - 1
-             and floor(s.latitude  / p.grid_deg)::bigint + 1
-     and floor(u.longitude / p.grid_deg)::bigint
-         between floor(s.longitude / p.grid_deg)::bigint - 1
-             and floor(s.longitude / p.grid_deg)::bigint + 1
-     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
-     and (u.removed_date is null or u.removed_date >= s.work_date)
+      on floor(u.latitude  / op.grid_deg)::bigint
+         between floor(s.latitude  / op.grid_deg)::bigint - 1
+             and floor(s.latitude  / op.grid_deg)::bigint + 1
+     and floor(u.longitude / op.grid_deg)::bigint
+         between floor(s.longitude / op.grid_deg)::bigint - 1
+             and floor(s.longitude / op.grid_deg)::bigint + 1
+     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= op.vicinity_mi
 )
 select
-    w.workedby,
-    w.work_week,
-    w.days_worked,
-    w.work_orders,
-    w.meters_changed,
-    w.s4e_changes,
-    w.periodic_tests,
-    count(distinct o.meterno)                                            as s4e_opportunities,
-    round(w.s4e_changes / nullif(count(distinct o.meterno), 0), 3)       as capture_rate,
-    round(count(distinct o.meterno) / nullif(w.work_orders, 0), 2)       as s4e_density_per_order
-from week_metrics w
-left join distinct_opp o
-       on o.workedby = w.workedby
-      and o.work_week = w.work_week
-group by w.workedby, w.work_week, w.days_worked, w.work_orders,
-         w.meters_changed, w.s4e_changes, w.periodic_tests;
+    n.meterno,
+    n.esi_loc,
+    n.s4e_concentration,
+    n.was_changed,
+    (e.meterno is not null) as was_exposed,
+    case
+        when n.s4e_concentration <  p.band_low  then '1. Low (<10)'
+        when n.s4e_concentration <  p.band_mid  then '2. Moderate (10-49)'
+        when n.s4e_concentration <  p.band_high then '3. High (50-149)'
+        else                                         '4. Very high (150+)'
+    end as density_band
+from s4e_neighbors n
+cross join band_params p
+left join exposed e on e.meterno = n.meterno;
+
+
+-- 8c. the visual's data: proportion changed, by band
+--     Read "of exposed" as the fair comparison. "of all" mixes in
+--     meters nobody ever reached, which isn't deprioritization.
+create or replace table band_summary as
+select
+    density_band,
+    count(*)                                                       as s4e_meters,
+    count(*) filter (where was_changed)                            as changed,
+    round(100.0 * count(*) filter (where was_changed) / count(*), 1)
+                                                                   as pct_changed_of_all,
+    count(*) filter (where was_exposed)                            as exposed,
+    count(*) filter (where was_exposed and was_changed)            as changed_of_exposed,
+    round(100.0 * count(*) filter (where was_exposed and was_changed)
+          / nullif(count(*) filter (where was_exposed), 0), 1)     as pct_changed_of_exposed
+from s4e_capture_by_band
+group by density_band
+order by density_band;
 
 
 -- ----------------------------------------------------------------------
--- CHECKS (run in their own cells with .df())
+-- CHECKS (own cells, .df())
 -- ----------------------------------------------------------------------
--- -- 1. did the point-in-time filter do anything? compare to an
--- --    as-of-today version. if these match, removal dates aren't varying.
--- select sum(s4e_nearby) as point_in_time from order_opportunity;
+-- -- 1. where the concentration numbers actually fall -- set the band
+-- --    cutoffs from this, not from my guesses
+-- select quantile_cont(s4e_concentration, [0.1, 0.25, 0.5, 0.75, 0.9, 0.99]) as conc_q,
+--        min(s4e_concentration) as lo, max(s4e_concentration) as hi
+-- from s4e_capture_by_band;
 --
--- -- 2. sanity: capture rate should be <= 1. above 1 means a tech changed
--- --    S4e meters that never appeared as opportunities -- usually
--- --    coordinates missing from s4e_universe.
--- select count(*) as weeks_over_1 from week_opportunity where capture_rate > 1;
+-- -- 2. does exposure itself vary by band? if dense areas are less
+-- --    visited, that's a routing finding, not a priority one
+-- select density_band,
+--        round(100.0 * count(*) filter (where was_exposed) / count(*), 1) as pct_exposed
+-- from s4e_capture_by_band group by density_band order by density_band;
 --
--- -- 3. the scatter itself
--- select workedby, work_week, s4e_opportunities, s4e_changes, capture_rate
--- from week_opportunity
--- where s4e_opportunities >= 5
--- order by s4e_opportunities desc;
+-- -- 3. same-premise passes: tech stood at the premise, S4e was live,
+-- --    no pull. Zero travel cost, so this is the cleanest priority test.
+-- select b.density_band,
+--        count(*)                                   as same_premise_passes,
+--        count(*) filter (where b.was_changed)      as eventually_changed
+-- from order_opportunity o
+-- join s4e_capture_by_band b on b.esi_loc = o.esi_loc
+-- where o.s4e_same_premise > 0 and not o.is_s4e
+-- group by b.density_band order by b.density_band;
