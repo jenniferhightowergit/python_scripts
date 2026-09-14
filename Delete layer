@@ -1,33 +1,123 @@
-{
-    "version": "1.0.0",
-    "base-theme": "smooth",
-    "styles": {
-        "all":                  { "font-color": "#404040", "font-family": "Calibri" },
-        "worksheet":            { "font-color": "#404040", "font-family": "Calibri", "font-size": 9 },
-        "worksheet-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 14 },
-        "dashboard-title":      { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 22, "font-weight": "normal" },
-        "story-title":          { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 20 },
-        "header":               { "font-color": "#262626", "font-family": "Calibri" },
-        "tooltip":              { "font-color": "#404040", "font-family": "Calibri", "font-size": 10 },
-        "legend":               { "font-color": "#595959", "font-family": "Calibri", "font-size": 9, "background-color": "#FFFFFF" },
-        "legend-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
-        "filter":               { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
-        "filter-title":         { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
-        "parameter-ctrl":       { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
-        "parameter-ctrl-title": { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
-        "highlighter":          { "font-color": "#404040", "font-family": "Calibri", "font-size": 9, "background-color": "#F2F2F2" },
-        "highlighter-title":    { "font-color": "#1F3864", "font-family": "Calibri", "font-size": 10 },
-        "page-ctrl-title":      { "font-color": "#1F3864", "font-family": "Calibri" },
-        "gridline":             { "line-visibility": "off" },
-        "zeroline":             { "line-visibility": "on", "line-pattern": "solid", "line-width": 1, "line-color": "#BFBFBF" },
-        "mark":                 { "mark-color": "#1F3864" },
-        "view":                 { "background-color": "#FFFFFF" }
-    }
-}
+-- ======================================================================
+-- 7. OPPORTUNITY -- how many S4e meters sat within reach of each stop
+--
+--    "In the vicinity" = within VICINITY_MI of the stop AND still
+--    installed on that work date. Point-in-time matters: a meter pulled
+--    in March was a live opportunity in February, and one pulled in
+--    January was not. Comparing against today's active list would get
+--    both backwards.
+--
+--    A meter's own change never counts as its own opportunity, but the
+--    other S4e meters a tech could have reached that day do.
+-- ======================================================================
+create or replace table opp_params as
+select
+    0.5   as vicinity_mi,      -- how far the tech could reasonably reach from a stop
+    0.01  as grid_deg;         -- prefilter cell, ~0.7 x 0.6 mi -- must be >= vicinity
 
 
+-- 7a. every S4e meter, where it sits and when it left
+--     removal_date null (or far-future) = still installed today
+create or replace table s4e_universe as
+select
+    f.esi_loc,
+    f.hist_meter                                  as meterno,
+    min(f.hist_latitude)                          as latitude,
+    min(f.hist_longitude)                         as longitude,
+    min(cast(f.hist_meter_removal_date as date))  as removed_date
+from full_s4e_pop_mapping f
+where lower(f.Harware_Model) like '%s4e%'
+  and f.hist_latitude  is not null
+  and f.hist_longitude is not null
+group by f.esi_loc, f.hist_meter;
 
 
+-- 7b. count reachable S4e meters per work order
+--     The grid join keeps this from comparing every stop to every meter:
+--     only the 3x3 cells around the stop are candidates, then
+--     miles_between does the real test.
+create or replace table order_opportunity as
+select
+    s.workedby,
+    s.work_date,
+    s.work_week,
+    s.order_num,
+    s.meterno,
+    s.esi_loc,
+    s.is_s4e,
+    count(distinct u.meterno)                                       as s4e_nearby,
+    count(distinct u.esi_loc)                                       as s4e_premises_nearby,
+    count(distinct u.meterno) filter (where u.esi_loc = s.esi_loc)  as s4e_same_premise
+from work_sequence s
+cross join opp_params p
+left join s4e_universe u
+       on floor(u.latitude  / p.grid_deg)::bigint
+          between floor(s.latitude  / p.grid_deg)::bigint - 1
+              and floor(s.latitude  / p.grid_deg)::bigint + 1
+      and floor(u.longitude / p.grid_deg)::bigint
+          between floor(s.longitude / p.grid_deg)::bigint - 1
+              and floor(s.longitude / p.grid_deg)::bigint + 1
+      and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
+      and u.meterno <> s.meterno                                    -- not its own opportunity
+      and (u.removed_date is null or u.removed_date >= s.work_date) -- still installed that day
+group by s.workedby, s.work_date, s.work_week, s.order_num,
+         s.meterno, s.esi_loc, s.is_s4e;
 
 
+-- 7c. the scatter plot grain: one point per tech per week
+--     opportunity is de-duplicated -- a meter passed on five stops is
+--     one opportunity, not five
+create or replace table week_opportunity as
+with distinct_opp as (
+    select distinct
+        s.workedby,
+        s.work_week,
+        u.meterno
+    from work_sequence s
+    cross join opp_params p
+    join s4e_universe u
+      on floor(u.latitude  / p.grid_deg)::bigint
+         between floor(s.latitude  / p.grid_deg)::bigint - 1
+             and floor(s.latitude  / p.grid_deg)::bigint + 1
+     and floor(u.longitude / p.grid_deg)::bigint
+         between floor(s.longitude / p.grid_deg)::bigint - 1
+             and floor(s.longitude / p.grid_deg)::bigint + 1
+     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
+     and (u.removed_date is null or u.removed_date >= s.work_date)
+)
+select
+    w.workedby,
+    w.work_week,
+    w.days_worked,
+    w.work_orders,
+    w.meters_changed,
+    w.s4e_changes,
+    w.periodic_tests,
+    count(distinct o.meterno)                                            as s4e_opportunities,
+    round(w.s4e_changes / nullif(count(distinct o.meterno), 0), 3)       as capture_rate,
+    round(count(distinct o.meterno) / nullif(w.work_orders, 0), 2)       as s4e_density_per_order
+from week_metrics w
+left join distinct_opp o
+       on o.workedby = w.workedby
+      and o.work_week = w.work_week
+group by w.workedby, w.work_week, w.days_worked, w.work_orders,
+         w.meters_changed, w.s4e_changes, w.periodic_tests;
 
+
+-- ----------------------------------------------------------------------
+-- CHECKS (run in their own cells with .df())
+-- ----------------------------------------------------------------------
+-- -- 1. did the point-in-time filter do anything? compare to an
+-- --    as-of-today version. if these match, removal dates aren't varying.
+-- select sum(s4e_nearby) as point_in_time from order_opportunity;
+--
+-- -- 2. sanity: capture rate should be <= 1. above 1 means a tech changed
+-- --    S4e meters that never appeared as opportunities -- usually
+-- --    coordinates missing from s4e_universe.
+-- select count(*) as weeks_over_1 from week_opportunity where capture_rate > 1;
+--
+-- -- 3. the scatter itself
+-- select workedby, work_week, s4e_opportunities, s4e_changes, capture_rate
+-- from week_opportunity
+-- where s4e_opportunities >= 5
+-- order by s4e_opportunities desc;
