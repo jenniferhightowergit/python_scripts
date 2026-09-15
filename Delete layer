@@ -1,123 +1,73 @@
 -- ======================================================================
--- 8. S4e CAPTURE BY DENSITY BAND -- does concentration change the rate?
+-- 9. PASS COUNTS -- how many times each S4e meter got walked past
 --
---    Grain: one row per S4e meter. Was it ever changed, and how many
---    other S4e meters sit around it? Two versions, because they answer
---    different questions:
+--    One row per S4e meter, with coordinates, so it maps directly.
+--    A "pass" = a tech stop within vicinity_mi while the meter was
+--    still installed. Ten stops near the same meter = 10 passes.
 --
---      all_s4e      -- every S4e meter. Program-level progress.
---      exposed_s4e  -- only meters a tech actually came within reach of.
---                      Removes "nobody ever went there" from the picture,
---                      which is what you need to claim deprioritization.
+--    This is the backlog weighted by missed chances: a meter passed
+--    40 times is a different story from one passed once.
 -- ======================================================================
-create or replace table band_params as
-select
-    0.01 as grid_deg,      -- ~0.7 x 0.6 mi cell; 3x3 block ~ 2 x 1.8 mi
-    10   as band_low,      -- S4e neighbors: below this = Low
-    50   as band_mid,      --               below this = Moderate
-    150  as band_high;     --               below this = High, else Very high
-
-
--- 8a. per-meter S4e neighbor count (the concentration each meter sits in)
-create or replace table s4e_grid as
-select
-    floor(latitude  / p.grid_deg)::bigint as gy,
-    floor(longitude / p.grid_deg)::bigint as gx,
-    count(*)                              as s4e_in_cell
-from s4e_universe
-cross join band_params p
-group by 1, 2;
-
-create or replace table s4e_neighbors as
+create or replace table meter_passes as
 select
     u.meterno,
     u.esi_loc,
+    u.latitude,
+    u.longitude,
     u.removed_date,
-    (u.removed_date is not null
-     and u.removed_date < date '2900-01-01')      as was_changed,
-    sum(n.s4e_in_cell) - 1                        as s4e_concentration
+    (u.removed_date is null or u.removed_date >= date '2900-01-01') as still_active,
+    count(s.order_num)                                              as passes,
+    count(distinct s.workedby)                                      as distinct_techs,
+    count(distinct s.work_date)                                     as distinct_days,
+    count(s.order_num) filter (where s.esi_loc = u.esi_loc)         as same_premise_passes,
+    min(s.work_date)                                                as first_pass,
+    max(s.work_date)                                                as last_pass
 from s4e_universe u
-cross join band_params p
-cross join range(-1, 2) oy(dy)
-cross join range(-1, 2) ox(dx)
-join s4e_grid n
-  on n.gy = floor(u.latitude  / p.grid_deg)::bigint + oy.dy
- and n.gx = floor(u.longitude / p.grid_deg)::bigint + ox.dx
-group by u.meterno, u.esi_loc, u.removed_date;
+cross join opp_params p
+left join work_sequence s
+       on floor(s.latitude  / p.grid_deg)::bigint
+          between floor(u.latitude  / p.grid_deg)::bigint - 1
+              and floor(u.latitude  / p.grid_deg)::bigint + 1
+      and floor(s.longitude / p.grid_deg)::bigint
+          between floor(u.longitude / p.grid_deg)::bigint - 1
+              and floor(u.longitude / p.grid_deg)::bigint + 1
+      and miles_between(u.latitude, u.longitude, s.latitude, s.longitude) <= p.vicinity_mi
+      and s.meterno <> u.meterno
+      and (u.removed_date is null or u.removed_date >= s.work_date)
+group by u.meterno, u.esi_loc, u.latitude, u.longitude, u.removed_date;
 
 
--- 8b. band it, and mark which meters a tech ever came near
-create or replace table s4e_capture_by_band as
-with exposed as (
-    select distinct u.meterno
-    from work_sequence s
-    cross join opp_params op
-    join s4e_universe u
-      on floor(u.latitude  / op.grid_deg)::bigint
-         between floor(s.latitude  / op.grid_deg)::bigint - 1
-             and floor(s.latitude  / op.grid_deg)::bigint + 1
-     and floor(u.longitude / op.grid_deg)::bigint
-         between floor(s.longitude / op.grid_deg)::bigint - 1
-             and floor(s.longitude / op.grid_deg)::bigint + 1
-     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= op.vicinity_mi
-)
+-- 9b. grid rollup -- much lighter for Tableau than plotting every meter.
+--     One row per ~0.7 x 0.6 mi cell, still-active meters only.
+create or replace table missed_grid as
 select
-    n.meterno,
-    n.esi_loc,
-    n.s4e_concentration,
-    n.was_changed,
-    (e.meterno is not null) as was_exposed,
-    case
-        when n.s4e_concentration <  p.band_low  then '1. Low (<10)'
-        when n.s4e_concentration <  p.band_mid  then '2. Moderate (10-49)'
-        when n.s4e_concentration <  p.band_high then '3. High (50-149)'
-        else                                         '4. Very high (150+)'
-    end as density_band
-from s4e_neighbors n
-cross join band_params p
-left join exposed e on e.meterno = n.meterno;
-
-
--- 8c. the visual's data: proportion changed, by band
---     Read "of exposed" as the fair comparison. "of all" mixes in
---     meters nobody ever reached, which isn't deprioritization.
-create or replace table band_summary as
-select
-    density_band,
-    count(*)                                                       as s4e_meters,
-    count(*) filter (where was_changed)                            as changed,
-    round(100.0 * count(*) filter (where was_changed) / count(*), 1)
-                                                                   as pct_changed_of_all,
-    count(*) filter (where was_exposed)                            as exposed,
-    count(*) filter (where was_exposed and was_changed)            as changed_of_exposed,
-    round(100.0 * count(*) filter (where was_exposed and was_changed)
-          / nullif(count(*) filter (where was_exposed), 0), 1)     as pct_changed_of_exposed
-from s4e_capture_by_band
-group by density_band
-order by density_band;
+    round(avg(latitude),  5)  as latitude,      -- cell center for plotting
+    round(avg(longitude), 5)  as longitude,
+    count(*)                  as missed_meters,
+    sum(passes)               as total_passes,
+    round(avg(passes), 1)     as avg_passes_per_meter,
+    max(passes)               as max_passes,
+    sum(same_premise_passes)  as same_premise_passes
+from meter_passes
+cross join opp_params p
+where still_active
+group by floor(latitude / p.grid_deg)::bigint,
+         floor(longitude / p.grid_deg)::bigint;
 
 
 -- ----------------------------------------------------------------------
 -- CHECKS (own cells, .df())
 -- ----------------------------------------------------------------------
--- -- 1. where the concentration numbers actually fall -- set the band
--- --    cutoffs from this, not from my guesses
--- select quantile_cont(s4e_concentration, [0.1, 0.25, 0.5, 0.75, 0.9, 0.99]) as conc_q,
---        min(s4e_concentration) as lo, max(s4e_concentration) as hi
--- from s4e_capture_by_band;
+-- -- how lopsided is the backlog? if the top 10% of meters hold most of
+-- -- the passes, the map will have clear hotspots
+-- select quantile_cont(passes, [0.5, 0.75, 0.9, 0.99]) as pass_q,
+--        max(passes) as worst
+-- from meter_passes where still_active;
 --
--- -- 2. does exposure itself vary by band? if dense areas are less
--- --    visited, that's a routing finding, not a priority one
--- select density_band,
---        round(100.0 * count(*) filter (where was_exposed) / count(*), 1) as pct_exposed
--- from s4e_capture_by_band group by density_band order by density_band;
---
--- -- 3. same-premise passes: tech stood at the premise, S4e was live,
--- --    no pull. Zero travel cost, so this is the cleanest priority test.
--- select b.density_band,
---        count(*)                                   as same_premise_passes,
---        count(*) filter (where b.was_changed)      as eventually_changed
--- from order_opportunity o
--- join s4e_capture_by_band b on b.esi_loc = o.esi_loc
--- where o.s4e_same_premise > 0 and not o.is_s4e
--- group by b.density_band order by b.density_band;
+-- -- the worst offenders, for a table beside the map
+-- select meterno, esi_loc, passes, distinct_techs, distinct_days,
+--        same_premise_passes, first_pass, last_pass
+-- from meter_passes
+-- where still_active
+-- order by passes desc
+-- limit 50;
