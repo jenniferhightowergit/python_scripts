@@ -25,10 +25,19 @@ def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col,
         group["year_index"] = np.arange(len(group))
 
         X = group[["year_index"]]
-        y = group[removed_col]
+
+        # Fit on log(removed) instead of raw removed. Your removal counts
+        # decline by a roughly constant PERCENTAGE each year (198k -> 138k
+        # -> 103k -> 77k -> 64k -> 52k -> 33k, each ~65-90% of the prior
+        # year), not a constant fixed amount. A plain linear fit on the raw
+        # numbers assumes the same fixed-dollar drop continues forever,
+        # which overshoots past zero almost immediately on a steep
+        # declining series. Fitting log(y) = mx + b instead captures the
+        # percentage decline correctly; predictions convert back with exp().
+        y_log = np.log(group[removed_col].clip(lower=1))  # avoid log(0)
 
         model = LinearRegression()
-        model.fit(X, y)
+        model.fit(X, y_log)
 
         year = int(group[year_col].max())
         year_index = len(group)
@@ -39,17 +48,17 @@ def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col,
             year += 1
             years_elapsed += 1
 
-            predicted_removals = model.predict(
+            predicted_log = model.predict(
                 pd.DataFrame({"year_index": [year_index]})
             )[0]
+            predicted_removals = np.exp(predicted_log)
 
-            # Can't remove negative meters
-            predicted_removals = max(0, predicted_removals)
-
-            # THE BUG: if predicted_removals is 0 (declining trend has
-            # flattened out), remaining never decreases and the loop
-            # never exits. Bail out here and flag it instead.
-            if predicted_removals == 0:
+            # An exponential decay curve never actually hits 0 or goes
+            # negative, so it can shrink forever without ever finishing
+            # the job. Treat "less than 1 meter/year" as effectively done
+            # to keep the loop from running to max_horizon_years on a
+            # long tail of near-zero removals.
+            if predicted_removals < 1:
                 results.append({
                     "hardware_type": hardware,
                     "year": year,
