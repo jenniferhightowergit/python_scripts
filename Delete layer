@@ -1,137 +1,62 @@
-"""
-Meter Hardware Depletion Projection
-------------------------------------
-Projects how many years until each hardware type's remaining field inventory
-hits zero, based on the trend in annual removal counts.
-
-ASSUMPTIONS TO ADJUST:
-- `con` points at your existing DuckDB file/connection.
-- `removals_table` has columns: hardware_type, removal_year, num_removed.
-- `inventory` is a static starting count per hardware_type (either a
-  separate lookup table, or a constant you already know — plug in below).
-
-METHOD:
-1. Remaining inventory = static inventory - cumulative removed to date.
-2. Fit a simple linear trend (np.polyfit, degree 1) to num_removed vs. year
-   for each hardware type. With only 5 data points, linear is the right
-   level of complexity — anything higher-order will overfit noise.
-3. Walk forward year by year, subtracting the trend-projected removal count
-   (floored at 0) from remaining inventory, until remaining <= 0.
-4. Also report a naive average-rate estimate (remaining / avg annual
-   removals) as a sanity-check baseline. If it diverges a lot from the
-   trend estimate, that's a sign the removal program is accelerating or
-   decelerating meaningfully — worth calling out in the report.
-"""
-
-import duckdb
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LinearRegression
 
-# --- 1. Connect and pull yearly removals per hardware type ---------------
-con = duckdb.connect("your_database.duckdb")  # <-- adjust path
+def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col):
 
-removals_df = con.execute("""
-    SELECT
-        hardware_type,
-        removal_year,
-        SUM(num_removed) AS num_removed
-    FROM removals_table          -- <-- adjust table name
-    GROUP BY hardware_type, removal_year
-    ORDER BY hardware_type, removal_year
-""").df()
+    results = []
 
-# --- 2. Static starting inventory per hardware type -----------------------
-# Adjust: either query a lookup table, or hardcode if it's a fixed constant
-# you already have on hand (you mentioned ~1M total across both types).
-inventory = {
-    "HW_TYPE_A": 600_000,   # <-- replace with real values
-    "HW_TYPE_B": 400_000,
-}
+    for hardware, group in df.groupby(hardware_col):
 
-# --- 3. Projection logic ---------------------------------------------------
-def project_depletion(hw_type: str, df: pd.DataFrame, starting_inventory: int,
-                       max_horizon_years: int = 50):
-    df = df.sort_values("removal_year")
-    years = df["removal_year"].to_numpy()
-    removals = df["num_removed"].to_numpy()
+        group = group.sort_values(year_col).copy()
 
-    cumulative_removed = removals.sum()
-    remaining = starting_inventory - cumulative_removed
+        # Starting inventory
+        inventory = group[inventory_col].iloc[0]
 
-    if remaining <= 0:
-        return {
-            "hardware_type": hw_type,
-            "remaining_inventory": remaining,
-            "trend_years_to_zero": 0,
-            "trend_zero_year": years.max(),
-            "avg_rate_years_to_zero": 0,
-            "avg_annual_removals": removals.mean(),
-            "trend_slope": None,
-            "note": "Already at or below zero based on current data.",
-        }
+        # Historical cumulative removals
+        group["cumulative_removed"] = group[removed_col].cumsum()
 
-    # --- Linear trend fit: removals as a function of year ---
-    slope, intercept = np.polyfit(years, removals, 1)
+        # Remaining inventory today
+        remaining = inventory - group["cumulative_removed"].iloc[-1]
 
-    # --- Simulate forward year by year using the trend ---
-    last_year = years.max()
-    sim_remaining = remaining
-    sim_year = last_year
-    years_elapsed = 0
-    depleted = False
+        # Create simple year index
+        group["year_index"] = np.arange(len(group))
 
-    while years_elapsed < max_horizon_years:
-        sim_year += 1
-        years_elapsed += 1
-        projected_removals = max(slope * sim_year + intercept, 0)
+        X = group[["year_index"]]
+        y = group[removed_col]
 
-        if projected_removals == 0:
-            # Trend has flattened to zero removals/year — will never
-            # reach zero inventory on this trend. Bail out and flag it.
-            break
+        model = LinearRegression()
+        model.fit(X, y)
 
-        sim_remaining -= projected_removals
-        if sim_remaining <= 0:
-            depleted = True
-            break
+        year = int(group[year_col].max())
+        year_index = len(group)
 
-    trend_years_to_zero = years_elapsed if depleted else None
-    trend_zero_year = last_year + years_elapsed if depleted else None
+        while remaining > 0:
 
-    # --- Naive average-rate baseline ---
-    avg_rate = removals.mean()
-    avg_rate_years_to_zero = remaining / avg_rate if avg_rate > 0 else None
+            year += 1
 
-    note = ""
-    if not depleted:
-        note = (f"Trend projects removals declining to ~0/year before "
-                f"inventory is exhausted — {sim_remaining:,.0f} units would "
-                f"remain permanently stranded at current trend. Program "
-                f"pace would need to increase to fully deplete.")
+            predicted_removals = model.predict(
+                pd.DataFrame({"year_index": [year_index]})
+            )[0]
 
-    return {
-        "hardware_type": hw_type,
-        "remaining_inventory": remaining,
-        "trend_slope_per_year": round(slope, 1),
-        "trend_years_to_zero": trend_years_to_zero,
-        "trend_zero_year": trend_zero_year,
-        "avg_annual_removals": round(avg_rate, 1),
-        "avg_rate_years_to_zero": (round(avg_rate_years_to_zero, 1)
-                                    if avg_rate_years_to_zero else None),
-        "avg_rate_zero_year": (int(last_year + avg_rate_years_to_zero)
-                                if avg_rate_years_to_zero else None),
-        "note": note,
-    }
+            # Can't remove negative meters
+            predicted_removals = max(0, predicted_removals)
 
+            # Can't remove more meters than exist
+            actual_projected_removal = min(
+                predicted_removals,
+                remaining
+            )
 
-# --- 4. Run for each hardware type -----------------------------------------
-results = []
-for hw_type, group in removals_df.groupby("hardware_type"):
-    starting = inventory.get(hw_type)
-    if starting is None:
-        print(f"WARNING: no starting inventory set for {hw_type}, skipping.")
-        continue
-    results.append(project_depletion(hw_type, group, starting))
+            remaining -= actual_projected_removal
 
-results_df = pd.DataFrame(results)
-print(results_df.to_string(index=False))
+            results.append({
+                "hardware_type": hardware,
+                "year": year,
+                "projected_removals": round(actual_projected_removal),
+                "projected_remaining_inventory": round(remaining)
+            })
+
+            year_index += 1
+
+    return pd.DataFrame(results)
