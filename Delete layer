@@ -1,73 +1,137 @@
--- ======================================================================
--- 9. PASS COUNTS -- how many times each S4e meter got walked past
---
---    One row per S4e meter, with coordinates, so it maps directly.
---    A "pass" = a tech stop within vicinity_mi while the meter was
---    still installed. Ten stops near the same meter = 10 passes.
---
---    This is the backlog weighted by missed chances: a meter passed
---    40 times is a different story from one passed once.
--- ======================================================================
-create or replace table meter_passes as
-select
-    u.meterno,
-    u.esi_loc,
-    u.latitude,
-    u.longitude,
-    u.removed_date,
-    (u.removed_date is null or u.removed_date >= date '2900-01-01') as still_active,
-    count(s.order_num)                                              as passes,
-    count(distinct s.workedby)                                      as distinct_techs,
-    count(distinct s.work_date)                                     as distinct_days,
-    count(s.order_num) filter (where s.esi_loc = u.esi_loc)         as same_premise_passes,
-    min(s.work_date)                                                as first_pass,
-    max(s.work_date)                                                as last_pass
-from s4e_universe u
-cross join opp_params p
-left join work_sequence s
-       on floor(s.latitude  / p.grid_deg)::bigint
-          between floor(u.latitude  / p.grid_deg)::bigint - 1
-              and floor(u.latitude  / p.grid_deg)::bigint + 1
-      and floor(s.longitude / p.grid_deg)::bigint
-          between floor(u.longitude / p.grid_deg)::bigint - 1
-              and floor(u.longitude / p.grid_deg)::bigint + 1
-      and miles_between(u.latitude, u.longitude, s.latitude, s.longitude) <= p.vicinity_mi
-      and s.meterno <> u.meterno
-      and (u.removed_date is null or u.removed_date >= s.work_date)
-group by u.meterno, u.esi_loc, u.latitude, u.longitude, u.removed_date;
+"""
+Meter Hardware Depletion Projection
+------------------------------------
+Projects how many years until each hardware type's remaining field inventory
+hits zero, based on the trend in annual removal counts.
+
+ASSUMPTIONS TO ADJUST:
+- `con` points at your existing DuckDB file/connection.
+- `removals_table` has columns: hardware_type, removal_year, num_removed.
+- `inventory` is a static starting count per hardware_type (either a
+  separate lookup table, or a constant you already know — plug in below).
+
+METHOD:
+1. Remaining inventory = static inventory - cumulative removed to date.
+2. Fit a simple linear trend (np.polyfit, degree 1) to num_removed vs. year
+   for each hardware type. With only 5 data points, linear is the right
+   level of complexity — anything higher-order will overfit noise.
+3. Walk forward year by year, subtracting the trend-projected removal count
+   (floored at 0) from remaining inventory, until remaining <= 0.
+4. Also report a naive average-rate estimate (remaining / avg annual
+   removals) as a sanity-check baseline. If it diverges a lot from the
+   trend estimate, that's a sign the removal program is accelerating or
+   decelerating meaningfully — worth calling out in the report.
+"""
+
+import duckdb
+import numpy as np
+import pandas as pd
+
+# --- 1. Connect and pull yearly removals per hardware type ---------------
+con = duckdb.connect("your_database.duckdb")  # <-- adjust path
+
+removals_df = con.execute("""
+    SELECT
+        hardware_type,
+        removal_year,
+        SUM(num_removed) AS num_removed
+    FROM removals_table          -- <-- adjust table name
+    GROUP BY hardware_type, removal_year
+    ORDER BY hardware_type, removal_year
+""").df()
+
+# --- 2. Static starting inventory per hardware type -----------------------
+# Adjust: either query a lookup table, or hardcode if it's a fixed constant
+# you already have on hand (you mentioned ~1M total across both types).
+inventory = {
+    "HW_TYPE_A": 600_000,   # <-- replace with real values
+    "HW_TYPE_B": 400_000,
+}
+
+# --- 3. Projection logic ---------------------------------------------------
+def project_depletion(hw_type: str, df: pd.DataFrame, starting_inventory: int,
+                       max_horizon_years: int = 50):
+    df = df.sort_values("removal_year")
+    years = df["removal_year"].to_numpy()
+    removals = df["num_removed"].to_numpy()
+
+    cumulative_removed = removals.sum()
+    remaining = starting_inventory - cumulative_removed
+
+    if remaining <= 0:
+        return {
+            "hardware_type": hw_type,
+            "remaining_inventory": remaining,
+            "trend_years_to_zero": 0,
+            "trend_zero_year": years.max(),
+            "avg_rate_years_to_zero": 0,
+            "avg_annual_removals": removals.mean(),
+            "trend_slope": None,
+            "note": "Already at or below zero based on current data.",
+        }
+
+    # --- Linear trend fit: removals as a function of year ---
+    slope, intercept = np.polyfit(years, removals, 1)
+
+    # --- Simulate forward year by year using the trend ---
+    last_year = years.max()
+    sim_remaining = remaining
+    sim_year = last_year
+    years_elapsed = 0
+    depleted = False
+
+    while years_elapsed < max_horizon_years:
+        sim_year += 1
+        years_elapsed += 1
+        projected_removals = max(slope * sim_year + intercept, 0)
+
+        if projected_removals == 0:
+            # Trend has flattened to zero removals/year — will never
+            # reach zero inventory on this trend. Bail out and flag it.
+            break
+
+        sim_remaining -= projected_removals
+        if sim_remaining <= 0:
+            depleted = True
+            break
+
+    trend_years_to_zero = years_elapsed if depleted else None
+    trend_zero_year = last_year + years_elapsed if depleted else None
+
+    # --- Naive average-rate baseline ---
+    avg_rate = removals.mean()
+    avg_rate_years_to_zero = remaining / avg_rate if avg_rate > 0 else None
+
+    note = ""
+    if not depleted:
+        note = (f"Trend projects removals declining to ~0/year before "
+                f"inventory is exhausted — {sim_remaining:,.0f} units would "
+                f"remain permanently stranded at current trend. Program "
+                f"pace would need to increase to fully deplete.")
+
+    return {
+        "hardware_type": hw_type,
+        "remaining_inventory": remaining,
+        "trend_slope_per_year": round(slope, 1),
+        "trend_years_to_zero": trend_years_to_zero,
+        "trend_zero_year": trend_zero_year,
+        "avg_annual_removals": round(avg_rate, 1),
+        "avg_rate_years_to_zero": (round(avg_rate_years_to_zero, 1)
+                                    if avg_rate_years_to_zero else None),
+        "avg_rate_zero_year": (int(last_year + avg_rate_years_to_zero)
+                                if avg_rate_years_to_zero else None),
+        "note": note,
+    }
 
 
--- 9b. grid rollup -- much lighter for Tableau than plotting every meter.
---     One row per ~0.7 x 0.6 mi cell, still-active meters only.
-create or replace table missed_grid as
-select
-    round(avg(latitude),  5)  as latitude,      -- cell center for plotting
-    round(avg(longitude), 5)  as longitude,
-    count(*)                  as missed_meters,
-    sum(passes)               as total_passes,
-    round(avg(passes), 1)     as avg_passes_per_meter,
-    max(passes)               as max_passes,
-    sum(same_premise_passes)  as same_premise_passes
-from meter_passes
-cross join opp_params p
-where still_active
-group by floor(latitude / p.grid_deg)::bigint,
-         floor(longitude / p.grid_deg)::bigint;
+# --- 4. Run for each hardware type -----------------------------------------
+results = []
+for hw_type, group in removals_df.groupby("hardware_type"):
+    starting = inventory.get(hw_type)
+    if starting is None:
+        print(f"WARNING: no starting inventory set for {hw_type}, skipping.")
+        continue
+    results.append(project_depletion(hw_type, group, starting))
 
-
--- ----------------------------------------------------------------------
--- CHECKS (own cells, .df())
--- ----------------------------------------------------------------------
--- -- how lopsided is the backlog? if the top 10% of meters hold most of
--- -- the passes, the map will have clear hotspots
--- select quantile_cont(passes, [0.5, 0.75, 0.9, 0.99]) as pass_q,
---        max(passes) as worst
--- from meter_passes where still_active;
---
--- -- the worst offenders, for a table beside the map
--- select meterno, esi_loc, passes, distinct_techs, distinct_days,
---        same_premise_passes, first_pass, last_pass
--- from meter_passes
--- where still_active
--- order by passes desc
--- limit 50;
+results_df = pd.DataFrame(results)
+print(results_df.to_string(index=False))
