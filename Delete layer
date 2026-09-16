@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col):
+
+def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col,
+                        max_horizon_years=50):
 
     results = []
 
@@ -30,10 +32,12 @@ def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col):
 
         year = int(group[year_col].max())
         year_index = len(group)
+        years_elapsed = 0
 
-        while remaining > 0:
+        while remaining > 0 and years_elapsed < max_horizon_years:
 
             year += 1
+            years_elapsed += 1
 
             predicted_removals = model.predict(
                 pd.DataFrame({"year_index": [year_index]})
@@ -42,11 +46,23 @@ def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col):
             # Can't remove negative meters
             predicted_removals = max(0, predicted_removals)
 
+            # THE BUG: if predicted_removals is 0 (declining trend has
+            # flattened out), remaining never decreases and the loop
+            # never exits. Bail out here and flag it instead.
+            if predicted_removals == 0:
+                results.append({
+                    "hardware_type": hardware,
+                    "year": year,
+                    "projected_removals": 0,
+                    "projected_remaining_inventory": round(remaining),
+                    "note": "Trend flattened to 0/year before inventory "
+                            "was exhausted — depletion stalls here at "
+                            "current trend.",
+                })
+                break
+
             # Can't remove more meters than exist
-            actual_projected_removal = min(
-                predicted_removals,
-                remaining
-            )
+            actual_projected_removal = min(predicted_removals, remaining)
 
             remaining -= actual_projected_removal
 
@@ -54,9 +70,24 @@ def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col):
                 "hardware_type": hardware,
                 "year": year,
                 "projected_removals": round(actual_projected_removal),
-                "projected_remaining_inventory": round(remaining)
+                "projected_remaining_inventory": round(remaining),
+                "note": "",
             })
 
             year_index += 1
+
+        else:
+            # while loop exited because remaining hit 0 - nothing extra
+            # needed, but if it exited because max_horizon_years was hit
+            # while remaining is still > 0, flag that too.
+            if remaining > 0:
+                results.append({
+                    "hardware_type": hardware,
+                    "year": year,
+                    "projected_removals": 0,
+                    "projected_remaining_inventory": round(remaining),
+                    "note": f"Did not reach zero within {max_horizon_years} "
+                            f"year horizon at current trend.",
+                })
 
     return pd.DataFrame(results)
