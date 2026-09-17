@@ -1,102 +1,137 @@
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LinearRegression
+-- ======================================================================
+-- 10. BEHAVIOR PROFILE DATASET -- the behavior tab's data (DAY GRAIN)
+--
+--    Everything is per tech per DAY, because that is the grain behavior
+--    is actually assigned at. A week that was Focused three days and
+--    Fragmented two no longer gets flattened into one label, so each
+--    day's metrics sit with the behavior that day really had.
+--
+--    All rates are per-day. Compare them across behaviors directly:
+--    a Focused day vs a Fragmented day, no week-length effects.
+-- ======================================================================
+
+-- 10a. day-level opportunity -- de-duplicated within the day, so a meter
+--      passed on six stops counts once
+create or replace table day_opportunity as
+select
+    s.workedby,
+    s.work_date,
+    count(distinct u.meterno) as s4e_opportunities
+from work_sequence s
+cross join opp_params p
+join s4e_universe u
+  on floor(u.latitude  / p.grid_deg)::bigint
+     between floor(s.latitude  / p.grid_deg)::bigint - 1
+         and floor(s.latitude  / p.grid_deg)::bigint + 1
+ and floor(u.longitude / p.grid_deg)::bigint
+     between floor(s.longitude / p.grid_deg)::bigint - 1
+         and floor(s.longitude / p.grid_deg)::bigint + 1
+ and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
+ and (u.removed_date is null or u.removed_date >= s.work_date)
+group by s.workedby, s.work_date;
 
 
-def forecast_depletion(df, hardware_col, year_col, removed_col, inventory_col,
-                        max_horizon_years=50):
+-- 10b. one row per tech per day -- the Tableau source
+create or replace table tech_day_profile as
+select
+    b.workedby,
+    b.work_date,
+    b.work_week,
+    b.behavior,
+    b.density_band,
 
-    results = []
+    -- volume that day
+    m.work_orders,
+    m.meters                                                        as meters_changed,
+    m.s4e_changes,
+    m.non_s4e_changes,
+    m.periodic_tests,
+    b.return_events                                                 as revisits,
 
-    for hardware, group in df.groupby(hardware_col):
+    -- shape of the day
+    m.miles_traveled                                                as miles_per_day,
+    m.minutes_first_to_last                                         as minutes_per_day,
+    m.avg_miles_between_orders                                      as miles_between_meters,
+    m.avg_minutes_between_orders                                    as minutes_between_meters,
+    m.median_minutes_between_orders                                 as median_minutes_between_meters,
 
-        group = group.sort_values(year_col).copy()
+    -- opportunity that day
+    coalesce(o.s4e_opportunities, 0)                                as s4e_opportunities,
+    greatest(coalesce(o.s4e_opportunities, 0) - m.s4e_changes, 0)   as missed_opportunities,
+    round(m.s4e_changes / nullif(o.s4e_opportunities, 0), 3)        as capture_rate,
+    round(100.0 * m.s4e_changes / nullif(m.meters, 0), 1)           as pct_changes_that_are_s4e,
 
-        # Starting inventory
-        inventory = group[inventory_col].iloc[0]
+    -- carried through so bad days can be filtered out
+    b.clusters,
+    b.median_meters_per_cluster,
+    b.avg_miles_between_clusters,
+    b.impossible_legs
+from day_behavior b
+join day_metrics m
+  on m.workedby  = b.workedby
+ and m.work_date = b.work_date
+left join day_opportunity o
+  on o.workedby  = b.workedby
+ and o.work_date = b.work_date;
 
-        # Historical cumulative removals
-        group["cumulative_removed"] = group[removed_col].cumsum()
 
-        # Remaining inventory today
-        remaining = inventory - group["cumulative_removed"].iloc[-1]
+-- 10c. the summary grid: behavior x density band, all per-day averages
+--      Each tech-day counts once, so a busy tech doesn't dominate.
+create or replace table behavior_profile as
+select
+    behavior,
+    density_band,
+    count(*)                                    as tech_days,
+    count(distinct workedby)                    as techs,
 
-        # Create simple year index
-        group["year_index"] = np.arange(len(group))
+    -- volume per day
+    round(avg(meters_changed), 1)               as avg_meters_per_day,
+    round(avg(non_s4e_changes), 1)              as avg_non_s4e_per_day,
+    round(avg(s4e_changes), 1)                  as avg_s4e_per_day,
+    round(avg(periodic_tests), 1)               as avg_periodic_tests_per_day,
+    round(avg(missed_opportunities), 1)         as avg_missed_per_day,
+    round(avg(revisits), 2)                     as avg_revisits_per_day,
 
-        X = group[["year_index"]]
+    -- shape per day
+    round(avg(miles_per_day), 1)                as avg_miles_per_day,
+    round(avg(minutes_per_day), 1)              as avg_minutes_per_day,
+    round(avg(miles_between_meters), 2)         as avg_miles_between_meters,
+    round(avg(minutes_between_meters), 1)       as avg_minutes_between_meters,
 
-        # Fit on log(removed) instead of raw removed. Your removal counts
-        # decline by a roughly constant PERCENTAGE each year (198k -> 138k
-        # -> 103k -> 77k -> 64k -> 52k -> 33k, each ~65-90% of the prior
-        # year), not a constant fixed amount. A plain linear fit on the raw
-        # numbers assumes the same fixed-dollar drop continues forever,
-        # which overshoots past zero almost immediately on a steep
-        # declining series. Fitting log(y) = mx + b instead captures the
-        # percentage decline correctly; predictions convert back with exp().
-        y_log = np.log(group[removed_col].clip(lower=1))  # avoid log(0)
+    -- capture
+    round(avg(capture_rate), 3)                 as avg_capture_rate,
+    round(avg(pct_changes_that_are_s4e), 1)     as avg_pct_s4e_of_changes
+from tech_day_profile
+group by behavior, density_band
+order by behavior, density_band;
 
-        model = LinearRegression()
-        model.fit(X, y_log)
 
-        year = int(group[year_col].max())
-        year_index = len(group)
-        years_elapsed = 0
-
-        while remaining > 0 and years_elapsed < max_horizon_years:
-
-            year += 1
-            years_elapsed += 1
-
-            predicted_log = model.predict(
-                pd.DataFrame({"year_index": [year_index]})
-            )[0]
-            predicted_removals = np.exp(predicted_log)
-
-            # An exponential decay curve never actually hits 0 or goes
-            # negative, so it can shrink forever without ever finishing
-            # the job. Treat "less than 1 meter/year" as effectively done
-            # to keep the loop from running to max_horizon_years on a
-            # long tail of near-zero removals.
-            if predicted_removals < 1:
-                results.append({
-                    "hardware_type": hardware,
-                    "year": year,
-                    "projected_removals": 0,
-                    "projected_remaining_inventory": round(remaining),
-                    "note": "Trend flattened to 0/year before inventory "
-                            "was exhausted — depletion stalls here at "
-                            "current trend.",
-                })
-                break
-
-            # Can't remove more meters than exist
-            actual_projected_removal = min(predicted_removals, remaining)
-
-            remaining -= actual_projected_removal
-
-            results.append({
-                "hardware_type": hardware,
-                "year": year,
-                "projected_removals": round(actual_projected_removal),
-                "projected_remaining_inventory": round(remaining),
-                "note": "",
-            })
-
-            year_index += 1
-
-        else:
-            # while loop exited because remaining hit 0 - nothing extra
-            # needed, but if it exited because max_horizon_years was hit
-            # while remaining is still > 0, flag that too.
-            if remaining > 0:
-                results.append({
-                    "hardware_type": hardware,
-                    "year": year,
-                    "projected_removals": 0,
-                    "projected_remaining_inventory": round(remaining),
-                    "note": f"Did not reach zero within {max_horizon_years} "
-                            f"year horizon at current trend.",
-                })
-
-    return pd.DataFrame(results)
+-- ----------------------------------------------------------------------
+-- CHECKS (own cells, .df())
+-- ----------------------------------------------------------------------
+-- -- 1. thin cells -- don't read a pattern from 3 tech-days
+-- select behavior, density_band, tech_days, techs
+-- from behavior_profile order by tech_days;
+--
+-- -- 2. do techs stay in one behavior, or move between them day to day?
+-- --    if most techs span 3-4, behavior is a property of the DAY, not
+-- --    the tech, and the profiles should be described that way
+-- select behaviors_used, count(*) as techs from (
+--     select workedby, count(distinct behavior) as behaviors_used
+--     from tech_day_profile
+--     where behavior <> 'Too few orders'
+--     group by workedby
+-- ) group by 1 order by 1;
+--
+-- -- 3. per-tech rollup, for changers vs non-changers
+-- select workedby,
+--        count(*)                          as days_worked,
+--        sum(s4e_changes)                  as s4e_total,
+--        sum(s4e_changes) > 0              as ever_changed_s4e,
+--        sum(work_orders)                  as orders_total,
+--        round(avg(s4e_opportunities), 1)  as avg_opportunity_per_day,
+--        mode(behavior)                    as usual_behavior,
+--        mode(density_band)                as usual_density
+-- from tech_day_profile
+-- group by workedby
+-- order by s4e_total desc;
