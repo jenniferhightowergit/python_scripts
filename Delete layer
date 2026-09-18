@@ -1,184 +1,22 @@
-"""
-Incremental meter hardware load.
-
-Instead of pulling ALL ~5.6M rows from Oracle every run (your old
-120-minute full reload), this:
-
-  1. Reads which meters are already in the parquet file.
-  2. Does a CHEAP query (no joins) for the current full meterno list.
-  3. Diffs the two sets in pandas to find meters that are new.
-  4. Runs your existing heavy join query ONLY for the new meters,
-     in chunks (Oracle IN-lists cap out around 1000 items).
-  5. Appends the new rows to the existing parquet and rewrites it.
-
-First run after switching to this will still be a full load (nothing
-cached yet). Every run after that should be fast.
-
-NOTE: this only detects NEW meters. If you need to catch attribute
-CHANGES on meters you've already loaded, tell me if there's a
-last-modified / last-updated timestamp column on VW_ASSET or
-VW_ASSETSPEC and I'll add a second pass that re-pulls anything
-touched since the last run.
-"""
-
-import time
-import keyring
-import pandas as pd
-from pathlib import Path
-from sqlalchemy import create_engine, text, bindparam
-
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
-CHUNK_SIZE = 1000  # Oracle IN-list practical limit
-
-output_path = Path(
-    r"C:\Users\UIX9\Documents\JensFakeDW\Staging\parquet\hw_asset.parquet"
+WITH params AS (
+    SELECT 
+        69.0 AS mi_per_deg_lat,
+        69.0 * cos(radians(AVG(latitude))) AS mi_per_deg_lon
+    FROM alltown
+),
+gridded AS (
+    SELECT
+        a.meterno,
+        a.hardware_model,
+        a.latitude,
+        a.longitude,
+        FLOOR(a.latitude / (1.0/p.mi_per_deg_lat)) * (1.0/p.mi_per_deg_lat) AS grid_lat,
+        FLOOR(a.longitude / (1.0/p.mi_per_deg_lon)) * (1.0/p.mi_per_deg_lon) AS grid_lon
+    FROM alltown a, params p
 )
-
-# ------------------------------------------------------------
-# CONNECTIONS
-# ------------------------------------------------------------
-conn_string = keyring.get_password("edw_sqlalchemy", "connection_string")
-edw_alchemy_engine = create_engine(conn_string)
-
-conn_string = keyring.get_password("ods_sqlalchemy", "connection_string")
-ods_alchemy_engine = create_engine(conn_string)
-
-# ------------------------------------------------------------
-# helper: same column-de-duping logic you already had
-# ------------------------------------------------------------
-def make_unique_columns(columns):
-    counts = {}
-    new_columns = []
-    for col in columns:
-        col = str(col)
-        if col not in counts:
-            counts[col] = 0
-            new_columns.append(col)
-        else:
-            counts[col] += 1
-            new_columns.append(f"{col}_{counts[col]}")
-    return new_columns
-
-
-# ------------------------------------------------------------
-# STEP 1: what meters do we already have?
-# ------------------------------------------------------------
-if output_path.exists():
-    existing = pd.read_parquet(output_path, columns=["meterno"])
-    existing_keys = set(existing["meterno"].astype(str))
-    print(f"Existing parquet already has {len(existing_keys):,} meters.")
-else:
-    existing_keys = set()
-    print("No existing parquet found — this run will be a full first load.")
-
-# ------------------------------------------------------------
-# STEP 2: cheap pull of the CURRENT full meterno list (no joins)
-# ------------------------------------------------------------
-all_meters_query = text("""
-    SELECT DISTINCT
-        TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) AS meterno
-    FROM MXRADS.VW_ASSET a
-    WHERE a.MANUFACTURER IN ('LG')
-""")
-
-with edw_alchemy_engine.connect() as sql_connection:
-    current_meters_df = pd.read_sql_query(all_meters_query, sql_connection)
-
-current_keys = set(current_meters_df["meterno"].astype(str))
-new_keys = sorted(current_keys - existing_keys)
-
-print(f"Source currently has {len(current_keys):,} meters total.")
-print(f"{len(new_keys):,} are new since your last run.")
-
-# ------------------------------------------------------------
-# STEP 3: for NEW meters only, run your existing heavy join query
-# ------------------------------------------------------------
-if not new_keys:
-    print("Nothing new — parquet is already up to date. Exiting.")
-else:
-    # -----------------------------------------------------------------
-    # PASTE YOUR EXISTING WORKING `hw` CTE + `asset_data` CTE HERE.
-    # Only change needed: in asset_data's WHERE clause, filter on
-    #   TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) IN :meter_chunk
-    # instead of the >= / <= batch_first_meter / batch_last_meter filter.
-    # -----------------------------------------------------------------
-    query = text("""
-        WITH
-        hw AS (
-            -- <<< your full 8-way ASSETSPEC left-join SELECT goes here >>>
-            SELECT DISTINCT
-                a.assetnum
-                -- ... rev.ALNVALUE AS HARDWARE_MODEL, reg.ALNVALUE AS RegisterType, etc.
-            FROM MXRADS.VW_ASSETSPEC a
-            -- ... your left joins ...
-            WHERE 1=1
-        ),
-        asset_data AS (
-            SELECT DISTINCT
-                assetnum,
-                CG_PURCHASEDATE,
-                MANUFACTURER,
-                TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) AS meterno,
-                INITIAL_INSTALL_DT
-            FROM MXRADS.VW_ASSET a
-            WHERE a.MANUFACTURER IN ('LG')
-              AND TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) IN :meter_chunk
-        )
-        SELECT * FROM hw
-        JOIN asset_data d ON hw.assetnum = d.assetnum
-    """).bindparams(bindparam("meter_chunk", expanding=True))
-
-    all_results = []
-    overall_start = time.perf_counter()
-    n_chunks = -(-len(new_keys) // CHUNK_SIZE)  # ceil division
-
-    with edw_alchemy_engine.connect() as sql_connection:
-        for i in range(0, len(new_keys), CHUNK_SIZE):
-            chunk = new_keys[i:i + CHUNK_SIZE]
-            chunk_num = i // CHUNK_SIZE + 1
-            batch_start = time.perf_counter()
-
-            batch_result = pd.read_sql_query(
-                query,
-                sql_connection,
-                params={"meter_chunk": chunk},
-            )
-            batch_result.columns = batch_result.columns.str.strip().str.lower()
-            all_results.append(batch_result)
-
-            elapsed = time.perf_counter() - batch_start
-            print(
-                f"Chunk {chunk_num}/{n_chunks}: {len(chunk)} meters -> "
-                f"{len(batch_result)} rows, {elapsed:.1f}s"
-            )
-
-    new_hw_assets = (
-        pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
-    )
-
-    # ------------------------------------------------------------
-    # STEP 4: append to what's already on disk and rewrite parquet
-    # ------------------------------------------------------------
-    if output_path.exists():
-        old = pd.read_parquet(output_path)
-        combined = pd.concat([old, new_hw_assets], ignore_index=True)
-    else:
-        combined = new_hw_assets
-
-    combined.columns = make_unique_columns(combined.columns)
-    for col in combined.select_dtypes(include=["object", "string"]).columns:
-        combined[col] = combined[col].astype("string")
-
-    combined.to_parquet(
-        output_path,
-        engine="pyarrow",
-        compression="snappy",
-        index=False,
-    )
-
-    overall_elapsed = time.perf_counter() - overall_start
-    print(f"\nDone. Added {len(new_hw_assets):,} new rows "
-          f"in {overall_elapsed / 60:.2f} minutes.")
-    print(f"Parquet now has {len(combined):,} total rows.")
+SELECT
+    grid_lat, grid_lon,
+    COUNT(*) AS meter_count,
+    COUNT(*) FILTER (WHERE hardware_model LIKE '%Enhanced%') AS enhanced_count
+FROM gridded
+GROUP BY grid_lat, grid_lon
