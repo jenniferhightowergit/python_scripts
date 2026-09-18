@@ -1,137 +1,184 @@
--- ======================================================================
--- 10. BEHAVIOR PROFILE DATASET -- the behavior tab's data (DAY GRAIN)
---
---    Everything is per tech per DAY, because that is the grain behavior
---    is actually assigned at. A week that was Focused three days and
---    Fragmented two no longer gets flattened into one label, so each
---    day's metrics sit with the behavior that day really had.
---
---    All rates are per-day. Compare them across behaviors directly:
---    a Focused day vs a Fragmented day, no week-length effects.
--- ======================================================================
+"""
+Incremental meter hardware load.
 
--- 10a. day-level opportunity -- de-duplicated within the day, so a meter
---      passed on six stops counts once
-create or replace table day_opportunity as
-select
-    s.workedby,
-    s.work_date,
-    count(distinct u.meterno) as s4e_opportunities
-from work_sequence s
-cross join opp_params p
-join s4e_universe u
-  on floor(u.latitude  / p.grid_deg)::bigint
-     between floor(s.latitude  / p.grid_deg)::bigint - 1
-         and floor(s.latitude  / p.grid_deg)::bigint + 1
- and floor(u.longitude / p.grid_deg)::bigint
-     between floor(s.longitude / p.grid_deg)::bigint - 1
-         and floor(s.longitude / p.grid_deg)::bigint + 1
- and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
- and (u.removed_date is null or u.removed_date >= s.work_date)
-group by s.workedby, s.work_date;
+Instead of pulling ALL ~5.6M rows from Oracle every run (your old
+120-minute full reload), this:
 
+  1. Reads which meters are already in the parquet file.
+  2. Does a CHEAP query (no joins) for the current full meterno list.
+  3. Diffs the two sets in pandas to find meters that are new.
+  4. Runs your existing heavy join query ONLY for the new meters,
+     in chunks (Oracle IN-lists cap out around 1000 items).
+  5. Appends the new rows to the existing parquet and rewrites it.
 
--- 10b. one row per tech per day -- the Tableau source
-create or replace table tech_day_profile as
-select
-    b.workedby,
-    b.work_date,
-    b.work_week,
-    b.behavior,
-    b.density_band,
+First run after switching to this will still be a full load (nothing
+cached yet). Every run after that should be fast.
 
-    -- volume that day
-    m.work_orders,
-    m.meters                                                        as meters_changed,
-    m.s4e_changes,
-    m.non_s4e_changes,
-    m.periodic_tests,
-    b.return_events                                                 as revisits,
+NOTE: this only detects NEW meters. If you need to catch attribute
+CHANGES on meters you've already loaded, tell me if there's a
+last-modified / last-updated timestamp column on VW_ASSET or
+VW_ASSETSPEC and I'll add a second pass that re-pulls anything
+touched since the last run.
+"""
 
-    -- shape of the day
-    m.miles_traveled                                                as miles_per_day,
-    m.minutes_first_to_last                                         as minutes_per_day,
-    m.avg_miles_between_orders                                      as miles_between_meters,
-    m.avg_minutes_between_orders                                    as minutes_between_meters,
-    m.median_minutes_between_orders                                 as median_minutes_between_meters,
+import time
+import keyring
+import pandas as pd
+from pathlib import Path
+from sqlalchemy import create_engine, text, bindparam
 
-    -- opportunity that day
-    coalesce(o.s4e_opportunities, 0)                                as s4e_opportunities,
-    greatest(coalesce(o.s4e_opportunities, 0) - m.s4e_changes, 0)   as missed_opportunities,
-    round(m.s4e_changes / nullif(o.s4e_opportunities, 0), 3)        as capture_rate,
-    round(100.0 * m.s4e_changes / nullif(m.meters, 0), 1)           as pct_changes_that_are_s4e,
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+CHUNK_SIZE = 1000  # Oracle IN-list practical limit
 
-    -- carried through so bad days can be filtered out
-    b.clusters,
-    b.median_meters_per_cluster,
-    b.avg_miles_between_clusters,
-    b.impossible_legs
-from day_behavior b
-join day_metrics m
-  on m.workedby  = b.workedby
- and m.work_date = b.work_date
-left join day_opportunity o
-  on o.workedby  = b.workedby
- and o.work_date = b.work_date;
+output_path = Path(
+    r"C:\Users\UIX9\Documents\JensFakeDW\Staging\parquet\hw_asset.parquet"
+)
+
+# ------------------------------------------------------------
+# CONNECTIONS
+# ------------------------------------------------------------
+conn_string = keyring.get_password("edw_sqlalchemy", "connection_string")
+edw_alchemy_engine = create_engine(conn_string)
+
+conn_string = keyring.get_password("ods_sqlalchemy", "connection_string")
+ods_alchemy_engine = create_engine(conn_string)
+
+# ------------------------------------------------------------
+# helper: same column-de-duping logic you already had
+# ------------------------------------------------------------
+def make_unique_columns(columns):
+    counts = {}
+    new_columns = []
+    for col in columns:
+        col = str(col)
+        if col not in counts:
+            counts[col] = 0
+            new_columns.append(col)
+        else:
+            counts[col] += 1
+            new_columns.append(f"{col}_{counts[col]}")
+    return new_columns
 
 
--- 10c. the summary grid: behavior x density band, all per-day averages
---      Each tech-day counts once, so a busy tech doesn't dominate.
-create or replace table behavior_profile as
-select
-    behavior,
-    density_band,
-    count(*)                                    as tech_days,
-    count(distinct workedby)                    as techs,
+# ------------------------------------------------------------
+# STEP 1: what meters do we already have?
+# ------------------------------------------------------------
+if output_path.exists():
+    existing = pd.read_parquet(output_path, columns=["meterno"])
+    existing_keys = set(existing["meterno"].astype(str))
+    print(f"Existing parquet already has {len(existing_keys):,} meters.")
+else:
+    existing_keys = set()
+    print("No existing parquet found — this run will be a full first load.")
 
-    -- volume per day
-    round(avg(meters_changed), 1)               as avg_meters_per_day,
-    round(avg(non_s4e_changes), 1)              as avg_non_s4e_per_day,
-    round(avg(s4e_changes), 1)                  as avg_s4e_per_day,
-    round(avg(periodic_tests), 1)               as avg_periodic_tests_per_day,
-    round(avg(missed_opportunities), 1)         as avg_missed_per_day,
-    round(avg(revisits), 2)                     as avg_revisits_per_day,
+# ------------------------------------------------------------
+# STEP 2: cheap pull of the CURRENT full meterno list (no joins)
+# ------------------------------------------------------------
+all_meters_query = text("""
+    SELECT DISTINCT
+        TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) AS meterno
+    FROM MXRADS.VW_ASSET a
+    WHERE a.MANUFACTURER IN ('LG')
+""")
 
-    -- shape per day
-    round(avg(miles_per_day), 1)                as avg_miles_per_day,
-    round(avg(minutes_per_day), 1)              as avg_minutes_per_day,
-    round(avg(miles_between_meters), 2)         as avg_miles_between_meters,
-    round(avg(minutes_between_meters), 1)       as avg_minutes_between_meters,
+with edw_alchemy_engine.connect() as sql_connection:
+    current_meters_df = pd.read_sql_query(all_meters_query, sql_connection)
 
-    -- capture
-    round(avg(capture_rate), 3)                 as avg_capture_rate,
-    round(avg(pct_changes_that_are_s4e), 1)     as avg_pct_s4e_of_changes
-from tech_day_profile
-group by behavior, density_band
-order by behavior, density_band;
+current_keys = set(current_meters_df["meterno"].astype(str))
+new_keys = sorted(current_keys - existing_keys)
 
+print(f"Source currently has {len(current_keys):,} meters total.")
+print(f"{len(new_keys):,} are new since your last run.")
 
--- ----------------------------------------------------------------------
--- CHECKS (own cells, .df())
--- ----------------------------------------------------------------------
--- -- 1. thin cells -- don't read a pattern from 3 tech-days
--- select behavior, density_band, tech_days, techs
--- from behavior_profile order by tech_days;
---
--- -- 2. do techs stay in one behavior, or move between them day to day?
--- --    if most techs span 3-4, behavior is a property of the DAY, not
--- --    the tech, and the profiles should be described that way
--- select behaviors_used, count(*) as techs from (
---     select workedby, count(distinct behavior) as behaviors_used
---     from tech_day_profile
---     where behavior <> 'Too few orders'
---     group by workedby
--- ) group by 1 order by 1;
---
--- -- 3. per-tech rollup, for changers vs non-changers
--- select workedby,
---        count(*)                          as days_worked,
---        sum(s4e_changes)                  as s4e_total,
---        sum(s4e_changes) > 0              as ever_changed_s4e,
---        sum(work_orders)                  as orders_total,
---        round(avg(s4e_opportunities), 1)  as avg_opportunity_per_day,
---        mode(behavior)                    as usual_behavior,
---        mode(density_band)                as usual_density
--- from tech_day_profile
--- group by workedby
--- order by s4e_total desc;
+# ------------------------------------------------------------
+# STEP 3: for NEW meters only, run your existing heavy join query
+# ------------------------------------------------------------
+if not new_keys:
+    print("Nothing new — parquet is already up to date. Exiting.")
+else:
+    # -----------------------------------------------------------------
+    # PASTE YOUR EXISTING WORKING `hw` CTE + `asset_data` CTE HERE.
+    # Only change needed: in asset_data's WHERE clause, filter on
+    #   TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) IN :meter_chunk
+    # instead of the >= / <= batch_first_meter / batch_last_meter filter.
+    # -----------------------------------------------------------------
+    query = text("""
+        WITH
+        hw AS (
+            -- <<< your full 8-way ASSETSPEC left-join SELECT goes here >>>
+            SELECT DISTINCT
+                a.assetnum
+                -- ... rev.ALNVALUE AS HARDWARE_MODEL, reg.ALNVALUE AS RegisterType, etc.
+            FROM MXRADS.VW_ASSETSPEC a
+            -- ... your left joins ...
+            WHERE 1=1
+        ),
+        asset_data AS (
+            SELECT DISTINCT
+                assetnum,
+                CG_PURCHASEDATE,
+                MANUFACTURER,
+                TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) AS meterno,
+                INITIAL_INSTALL_DT
+            FROM MXRADS.VW_ASSET a
+            WHERE a.MANUFACTURER IN ('LG')
+              AND TRIM(to_char(SERIALNUM)) || TRIM(to_char(MANUFACTURER)) IN :meter_chunk
+        )
+        SELECT * FROM hw
+        JOIN asset_data d ON hw.assetnum = d.assetnum
+    """).bindparams(bindparam("meter_chunk", expanding=True))
+
+    all_results = []
+    overall_start = time.perf_counter()
+    n_chunks = -(-len(new_keys) // CHUNK_SIZE)  # ceil division
+
+    with edw_alchemy_engine.connect() as sql_connection:
+        for i in range(0, len(new_keys), CHUNK_SIZE):
+            chunk = new_keys[i:i + CHUNK_SIZE]
+            chunk_num = i // CHUNK_SIZE + 1
+            batch_start = time.perf_counter()
+
+            batch_result = pd.read_sql_query(
+                query,
+                sql_connection,
+                params={"meter_chunk": chunk},
+            )
+            batch_result.columns = batch_result.columns.str.strip().str.lower()
+            all_results.append(batch_result)
+
+            elapsed = time.perf_counter() - batch_start
+            print(
+                f"Chunk {chunk_num}/{n_chunks}: {len(chunk)} meters -> "
+                f"{len(batch_result)} rows, {elapsed:.1f}s"
+            )
+
+    new_hw_assets = (
+        pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    )
+
+    # ------------------------------------------------------------
+    # STEP 4: append to what's already on disk and rewrite parquet
+    # ------------------------------------------------------------
+    if output_path.exists():
+        old = pd.read_parquet(output_path)
+        combined = pd.concat([old, new_hw_assets], ignore_index=True)
+    else:
+        combined = new_hw_assets
+
+    combined.columns = make_unique_columns(combined.columns)
+    for col in combined.select_dtypes(include=["object", "string"]).columns:
+        combined[col] = combined[col].astype("string")
+
+    combined.to_parquet(
+        output_path,
+        engine="pyarrow",
+        compression="snappy",
+        index=False,
+    )
+
+    overall_elapsed = time.perf_counter() - overall_start
+    print(f"\nDone. Added {len(new_hw_assets):,} new rows "
+          f"in {overall_elapsed / 60:.2f} minutes.")
+    print(f"Parquet now has {len(combined):,} total rows.")
