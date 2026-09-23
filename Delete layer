@@ -1,22 +1,25 @@
-WITH params AS (
-    SELECT 
-        69.0 AS mi_per_deg_lat,
-        69.0 * cos(radians(AVG(latitude))) AS mi_per_deg_lon
-    FROM alltown
-),
-gridded AS (
-    SELECT
-        a.meterno,
-        a.hardware_model,
-        a.latitude,
-        a.longitude,
-        FLOOR(a.latitude / (1.0/p.mi_per_deg_lat)) * (1.0/p.mi_per_deg_lat) AS grid_lat,
-        FLOOR(a.longitude / (1.0/p.mi_per_deg_lon)) * (1.0/p.mi_per_deg_lon) AS grid_lon
-    FROM alltown a, params p
-)
-SELECT
-    grid_lat, grid_lon,
-    COUNT(*) AS meter_count,
-    COUNT(*) FILTER (WHERE hardware_model LIKE '%Enhanced%') AS enhanced_count
-FROM gridded
-GROUP BY grid_lat, grid_lon
+def add_training_data(db, category_id):
+    """
+    Add newly categorized orders to the training dataset
+    for the specified category.
+    """
+
+    training_data = db.selectdf(f"""
+        SELECT
+            ct.order_id,
+            ct.cleaned_comments,
+            oc.category_id
+        FROM cleaned_text ct
+
+        JOIN order_category oc
+            ON ct.order_id = oc.order_id
+
+        LEFT JOIN training_data td
+            ON ct.order_id = td.order_id
+            AND oc.category_id = td.category_id
+
+        WHERE oc.category_id = {category_id}
+          AND td.order_id IS NULL
+    """)
+
+    return training_data
