@@ -1,140 +1,22 @@
-'''
-append_training_orders pipeline  (PLACEHOLDER - assumptions marked TODO)
+create or replace table missed_grid as
+select
+    dgroup,
+    round(avg(latitude),  5)                          as latitude,
+    round(avg(longitude), 5)                          as longitude,
 
-Copies work orders from the live tables into the training tables,
-so they survive the 3-hour retention on orders / cleaned_text.
+    count(*)                                          as s4e_meters,
+    count(*) filter (where not still_active)          as changed_meters,
+    count(*) filter (where still_active)              as missed_meters,
+    round(100.0 * count(*) filter (where not still_active)
+          / nullif(count(*), 0), 1)                   as pct_changed,
 
-    orders        --> training_orders
-    cleaned_text  --> training_orders_cleaned_text
-
-1. find orders that have cleaned text but are not in training_orders yet
-2. write them to training_orders
-3. find cleaned text for training orders not yet in training_orders_cleaned_text
-4. write it to training_orders_cleaned_text
-
-Training tables are keyed on wr_id: one row per work request.
-No retention: training tables only grow.
-The labeling pipeline then picks up training orders with no label yet.
-
-NOTE: this must run more often than the orders retention window (3h),
-or orders will be deleted before they get copied.
-
-run from src/:
->>> python main.py pipelines run -n append-training-orders
-'''
-
-import logging
-
-import pandas as pd
-
-from amslib.database.orm import Tables
-from database import init_tables
-from settings import get_settings
-
-
-# Key used to match live orders against the training tables
-KEY_COL = 'wr_id'
-
-# Columns left out of the training tables.
-# To keep one again, just remove it from this list.
-# NOTE: every column listed must exist in the source table, or DuckDB errors.
-EXCLUDE_COLS = ['order_id', 'fa_id']
-
-# Max new orders appended per run (None = no cap)
-DEFAULT_N = 100
-
-
-def star_except(alias: str, cols: list) -> str:
-    '''
-    builds "o.* exclude (col1, col2)", or just "o.*" if cols is empty
-    '''
-    if not cols:
-        return f'{alias}.*'
-    return f'{alias}.* exclude ({", ".join(cols)})'
-
-
-def query_new_training_orders(tables: Tables, n: int | None = None) -> pd.DataFrame:
-    '''
-    Orders whose wr_id is not in training_orders yet.
-
-    - inner join to cleaned_text: only fully processed orders are copied;
-      anything not cleaned yet gets picked up on the next run
-    - one WR can have several field activities, so keep only the most
-      recently updated row per wr_id (the "qualify" line)
-    '''
-    limit = f'limit {int(n)}' if n else ''
-    sql = f'''
-    select {star_except('o', EXCLUDE_COLS)}
-    from orders o
-    join cleaned_text ct on ct.order_id = o.order_id
-    left join training_orders t on t.{KEY_COL} = o.{KEY_COL}
-    where t.{KEY_COL} is null
-      and o.{KEY_COL} is not null
-    qualify row_number() over (
-        partition by o.{KEY_COL}
-        order by o.wr_status_upd_dttm desc, o.order_id desc
-    ) = 1
-    {limit}
-    '''
-    return tables.select(sql)
-
-
-def query_new_training_text(tables: Tables) -> pd.DataFrame:
-    '''
-    Cleaned text for wr_ids already in training_orders
-    that are not in training_orders_cleaned_text yet.
-
-    TODO: assumes cleaned_text carries wr_id (data_intake selects it before
-    preprocessing). Confirm with: describe cleaned_text
-    '''
-    sql = f'''
-    select {star_except('ct', EXCLUDE_COLS)}
-    from cleaned_text ct
-    join orders o on o.order_id = ct.order_id
-    join training_orders t on t.{KEY_COL} = ct.{KEY_COL}
-    left join training_orders_cleaned_text tc on tc.{KEY_COL} = ct.{KEY_COL}
-    where tc.{KEY_COL} is null
-    qualify row_number() over (
-        partition by ct.{KEY_COL}
-        order by o.wr_status_upd_dttm desc, o.order_id desc
-    ) = 1
-    '''
-    return tables.select(sql)
-
-
-def append_training_orders(tables: Tables, n: int | None = None) -> int:
-    df = query_new_training_orders(tables, n)
-    if df.empty:
-        logging.info('no new orders to append to "training_orders"')
-        return 0
-    tables.training_orders.insert(df)
-    logging.info(f'inserted: {len(df):,} records to "training_orders"')
-    return len(df)
-
-
-def append_training_text(tables: Tables) -> int:
-    df = query_new_training_text(tables)
-    if df.empty:
-        logging.info('no new text to append to "training_orders_cleaned_text"')
-        return 0
-    tables.training_orders_cleaned_text.insert(df)
-    logging.info(f'inserted: {len(df):,} records to "training_orders_cleaned_text"')
-    return len(df)
-
-
-def run(n: int | None = DEFAULT_N):
-    '''
-    n: cap on how many new orders to append per run.
-       None means append everything new.
-    '''
-    logging.info('started: append_training_orders_pipeline')
-
-    settings = get_settings()
-    # TODO: training_orders and training_orders_cleaned_text must be added
-    # to settings.tables_config, or tables.training_orders won't exist.
-    tables = init_tables(settings)
-
-    append_training_orders(tables, n)
-    append_training_text(tables)
-
-    logging.info('finished: append_training_orders_pipeline')
+    sum(passes) filter (where still_active)           as total_passes,
+    round(avg(passes) filter (where still_active), 1) as avg_passes_per_meter,
+    max(passes) filter (where still_active)           as max_passes,
+    sum(same_premise_passes) filter (where still_active)
+                                                      as same_premise_passes
+from meter_passes
+cross join opp_params p
+group by dgroup,
+         floor(latitude  / p.grid_deg)::bigint,
+         floor(longitude / p.grid_deg)::bigint;
