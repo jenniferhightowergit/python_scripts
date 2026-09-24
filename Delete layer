@@ -1,93 +1,113 @@
+'''
+append_training_orders pipeline  (PLACEHOLDER - assumptions marked TODO)
+
+Copies work orders from the live tables into the training tables,
+so they survive the 3-hour retention on orders / cleaned_text.
+
+    orders        --> training_orders
+    cleaned_text  --> training_orders_cleaned_text
+
+1. find orders that have cleaned text but are not in training_orders yet
+2. write them to training_orders
+3. find cleaned text for training orders not yet in training_orders_cleaned_text
+4. write it to training_orders_cleaned_text
+
+No retention: training tables only grow.
+The labeling pipeline then picks up training orders with no label yet.
+
+NOTE: this must run more often than the orders retention window (3h),
+or orders will be deleted before they get copied.
+
+run from src/:
+>>> python main.py pipelines run -n append-training-orders
+'''
+
+import logging
+
+import pandas as pd
+
+from amslib.database.orm import Tables
+from database import init_tables
+from settings import get_settings
 
 
--- ======================================================================
--- 11. DISTRICT DAY SCORECARD -- changed vs missed, per district per day
---
---    Overlap is handled: the coverage of every stop in the district that
---    day is unioned, then meters are counted once. Two techs working the
---    same block produce one opportunity, not two.
---
---    "Available" = S4e meters within vicinity_mi of at least one stop
---    that district made that day, and still installed as of that date.
---    A meter changed that day IS available (the tech stood on it), so
---    changed + missed = available, with no leftovers.
--- ======================================================================
-create or replace table district_day_reach as
-select distinct
-    s.dgroup,
-    s.work_date,
-    u.meterno,
-    u.removed_date
-from work_sequence s
-cross join opp_params p
-join s4e_universe u
-  on floor(u.latitude  / p.grid_deg)::bigint
-     between floor(s.latitude  / p.grid_deg)::bigint - 1
-         and floor(s.latitude  / p.grid_deg)::bigint + 1
- and floor(u.longitude / p.grid_deg)::bigint
-     between floor(s.longitude / p.grid_deg)::bigint - 1
-         and floor(s.longitude / p.grid_deg)::bigint + 1
- and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
- and (u.removed_date is null or u.removed_date >= s.work_date);
+# TODO: confirm the matching key with Erik.
+# One WR can have several field activities (fa_id), so wr_id may not be
+# unique in orders. order_id (or wr_id + fa_id) may be the safer key.
+KEY_COL = 'wr_id'
 
 
-create or replace table district_day as
-with crew as (
-    select
-        dgroup,
-        work_date,
-        count(distinct workedby)                                  as techs,
-        count(*)                                                  as work_orders,
-        count(distinct meterno) filter (where is_s4e)             as s4e_changes_logged
-    from work_sequence
-    group by dgroup, work_date
-),
-reach as (
-    select
-        dgroup,
-        work_date,
-        count(*)                                                  as s4e_available,
-        count(*) filter (where removed_date = work_date)          as s4e_changed,
-        count(*) filter (where removed_date is null
-                            or removed_date <> work_date)         as s4e_missed
-    from district_day_reach
-    group by dgroup, work_date
-)
-select
-    c.dgroup,
-    c.work_date,
-    date_trunc('week', c.work_date)                               as work_week,
-    c.techs,
-    c.work_orders,
-    coalesce(r.s4e_available, 0)                                  as s4e_available,
-    coalesce(r.s4e_changed, 0)                                    as s4e_changed,
-    coalesce(r.s4e_missed, 0)                                     as s4e_missed,
-    round(100.0 * r.s4e_changed / nullif(r.s4e_available, 0), 2)  as pct_captured,
-    round(r.s4e_available / nullif(c.techs, 0), 1)                as available_per_tech,
-    c.s4e_changes_logged                                          as s4e_changes_logged
-from crew c
-left join reach r
-       on r.dgroup = c.dgroup and r.work_date = c.work_date
-order by c.dgroup, c.work_date;
+def query_new_training_orders(tables: Tables, n: int | None = None) -> pd.DataFrame:
+    '''
+    Orders that are not in training_orders yet.
+
+    Inner join to cleaned_text so only fully processed orders are copied.
+    Anything not cleaned yet gets picked up on the next run.
+    '''
+    limit = f'limit {int(n)}' if n else ''
+    sql = f'''
+    select o.*
+    from orders o
+    join cleaned_text ct on ct.order_id = o.order_id
+    left join training_orders t on t.{KEY_COL} = o.{KEY_COL}
+    where t.{KEY_COL} is null
+      and o.{KEY_COL} is not null
+    {limit}
+    '''
+    return tables.select(sql)
 
 
--- ----------------------------------------------------------------------
--- CHECKS (own cells, .df())
--- ----------------------------------------------------------------------
--- -- 1. s4e_changed (from the reach set) should match s4e_changes_logged
--- --    (counted straight off the work orders). A gap means some changed
--- --    meters aren't in s4e_universe -- usually missing coordinates.
--- select dgroup, sum(s4e_changed) as from_reach,
---        sum(s4e_changes_logged) as from_orders
--- from district_day group by dgroup;
---
--- -- 2. how much overlap the de-duplication removed
--- select d.dgroup, d.work_date,
---        d.s4e_available                     as deduped,
---        sum(t.s4e_opportunities)            as summed_per_tech
--- from district_day d
--- join tech_day_profile t
---   on t.dgroup = d.dgroup and t.work_date = d.work_date
--- group by d.dgroup, d.work_date, d.s4e_available
--- order by summed_per_tech - deduped desc
--- limit 20;
+def query_new_training_text(tables: Tables) -> pd.DataFrame:
+    '''
+    Cleaned text for orders already in training_orders
+    that is not in training_orders_cleaned_text yet.
+
+    TODO: assumes training_orders keeps the original order_id from orders.
+    Confirm against Caleb's DDL.
+    '''
+    sql = '''
+    select ct.*
+    from cleaned_text ct
+    join training_orders t on t.order_id = ct.order_id
+    left join training_orders_cleaned_text tc on tc.order_id = ct.order_id
+    where tc.order_id is null
+    '''
+    return tables.select(sql)
+
+
+def append_training_orders(tables: Tables, n: int | None = None) -> int:
+    df = query_new_training_orders(tables, n)
+    if df.empty:
+        logging.info('no new orders to append to "training_orders"')
+        return 0
+    tables.training_orders.insert(df)
+    logging.info(f'inserted: {len(df):,} records to "training_orders"')
+    return len(df)
+
+
+def append_training_text(tables: Tables) -> int:
+    df = query_new_training_text(tables)
+    if df.empty:
+        logging.info('no new text to append to "training_orders_cleaned_text"')
+        return 0
+    tables.training_orders_cleaned_text.insert(df)
+    logging.info(f'inserted: {len(df):,} records to "training_orders_cleaned_text"')
+    return len(df)
+
+
+def run(n: int | None = None):
+    '''
+    n: optional cap on how many new orders to append per run.
+       None means append everything new.
+    '''
+    logging.info('started: append_training_orders_pipeline')
+
+    settings = get_settings()
+    # TODO: training_orders and training_orders_cleaned_text must be added
+    # to settings.tables_config, or tables.training_orders won't exist.
+    tables = init_tables(settings)
+
+    append_training_orders(tables, n)
+    append_training_text(tables)
+
+    logging.info('finished: append_training_orders_pipeline')
