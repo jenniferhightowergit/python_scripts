@@ -1,563 +1,23 @@
+
+
 -- ======================================================================
--- S4eX BEHAVIOR ANALYSIS -- full pipeline, dgroup wired through
+-- 11. DISTRICT DAY SCORECARD -- changed vs missed, per district per day
 --
--- dgroup travels two separate paths and they mean different things:
---   work-order side: full_s4e_pop_mapping -> work_events_all ->
---                    work_sequence -> work_clusters -> day_behavior ->
---                    tech_day_profile -> behavior_profile
---                    (= the district the TECH worked that day)
---   meter side:      full_s4e_pop_mapping -> s4e_universe ->
---                    s4e_neighbors -> s4e_capture_by_band -> band_summary
---                    (= the district the METER sits in)
--- Don't join the two on dgroup; they answer different questions.
+--    Overlap is handled: the coverage of every stop in the district that
+--    day is unioned, then meters are counted once. Two techs working the
+--    same block produce one opportunity, not two.
+--
+--    "Available" = S4e meters within vicinity_mi of at least one stop
+--    that district made that day, and still installed as of that date.
+--    A meter changed that day IS available (the tech stood on it), so
+--    changed + missed = available, with no leftovers.
 -- ======================================================================
-
-create or replace macro miles_between(lat1, lon1, lat2, lon2) as
-    round(3959 * 2 * asin(sqrt(
-        power(sin(radians(lat2 - lat1) / 2), 2)
-      + cos(radians(lat1)) * cos(radians(lat2))
-      * power(sin(radians(lon2 - lon1) / 2), 2)
-    )), 2);
-
-create or replace macro minutes_between(t1, t2) as
-    datediff('second', t1, t2) / 60.0;
-
-
--- ----------------------------------------------------------------------
--- 0. Every real work order                                    [+ dgroup]
--- ----------------------------------------------------------------------
-create or replace table work_events_all as
+create or replace table district_day_reach as
 select distinct
-    workedby,
-    dgroup,
-    cast(hist_meter_removal_date as date)                        as work_date,
-    date_trunc('week', cast(hist_meter_removal_date as date))    as work_week,
-    hist_meter                                                   as meterno,
-    wr_workeddatetime                                            as worked_datetime,
-    hist_latitude                                                as latitude,
-    hist_longitude                                               as longitude,
-    esi_loc,
-    Harware_Model                                                as hardware_model,
-    Ticket_Type                                                  as ticket_type,
-    coalesce(pt_flag, 0)                                         as pt_flag,
-    lower(Harware_Model) like '%s4e%'                            as is_s4e
-from full_s4e_pop_mapping
-where workedby         is not null
-  and wr_workeddatetime is not null
-  and hist_latitude    is not null
-  and hist_longitude   is not null;
-
-
--- ----------------------------------------------------------------------
--- 1. Work order sequence -- gap to the previous order, same tech same day
--- ----------------------------------------------------------------------
-create or replace table work_sequence as
-select
-    *,
-    row_number() over w                                          as order_num,
-    lag(worked_datetime) over w                                  as prev_datetime,
-    lag(latitude)  over w                                        as prev_lat,
-    lag(longitude) over w                                        as prev_lon,
-    minutes_between(lag(worked_datetime) over w, worked_datetime) as minutes_since_prev,
-    miles_between(lag(latitude) over w, lag(longitude) over w,
-                  latitude, longitude)                            as miles_since_prev
-from work_events_all
-window w as (partition by workedby, work_date order by worked_datetime);
-
-
--- ----------------------------------------------------------------------
--- 2. Backtracking -- returning to an area already worked that day
--- ----------------------------------------------------------------------
-create or replace table day_returns as
-select
-    a.workedby,
-    a.work_date,
-    count(*)                    as return_events,
-    count(distinct a.esi_loc)   as distinct_return_spots
-from work_sequence a
-where a.miles_since_prev > 1.0
-  and exists (
-      select 1
-      from work_sequence b
-      where b.workedby  = a.workedby
-        and b.work_date = a.work_date
-        and b.order_num < a.order_num - 1
-        and miles_between(b.latitude, b.longitude,
-                          a.latitude, a.longitude) <= 0.5
-  )
-group by a.workedby, a.work_date;
-
-
--- ----------------------------------------------------------------------
--- 3. DAY METRICS
--- ----------------------------------------------------------------------
-create or replace table day_metrics as
-select
-    s.workedby,
-    s.work_date,
-    s.work_week,
-
-    count(*)                                                     as work_orders,
-    count(distinct s.meterno)                                    as meters,
-    count(distinct s.meterno) filter (where s.is_s4e)            as s4e_changes,
-    count(distinct s.meterno) filter (where not s.is_s4e)        as non_s4e_changes,
-    count(distinct s.meterno) filter (where s.pt_flag = 1)       as periodic_tests,
-    count(distinct s.esi_loc)                                    as distinct_locations,
-
-    min(s.worked_datetime)                                       as first_order,
-    max(s.worked_datetime)                                       as last_order,
-    minutes_between(min(s.worked_datetime), max(s.worked_datetime))
-                                                                 as minutes_first_to_last,
-
-    round(avg(s.minutes_since_prev), 1)                          as avg_minutes_between_orders,
-    round(median(s.minutes_since_prev), 1)                       as median_minutes_between_orders,
-    round(max(s.minutes_since_prev), 1)                          as max_gap_minutes,
-
-    round(sum(s.miles_since_prev), 1)                            as miles_traveled,
-    round(avg(s.miles_since_prev), 2)                            as avg_miles_between_orders,
-    round(max(s.miles_since_prev), 1)                            as max_leg_miles,
-
-    coalesce(r.return_events, 0)                                 as return_events
-from work_sequence s
-left join day_returns r
-       on r.workedby = s.workedby and r.work_date = s.work_date
-group by s.workedby, s.work_date, s.work_week, r.return_events;
-
-
--- ----------------------------------------------------------------------
--- 4. WEEK METRICS
--- ----------------------------------------------------------------------
-create or replace table week_metrics as
-select
-    workedby,
-    work_week,
-    count(*)                                                     as days_worked,
-
-    sum(work_orders)                                             as work_orders,
-    sum(meters)                                                  as meters_changed,
-    sum(s4e_changes)                                             as s4e_changes,
-    sum(non_s4e_changes)                                         as non_s4e_changes,
-    sum(periodic_tests)                                          as periodic_tests,
-    sum(return_events)                                           as return_events,
-    round(sum(miles_traveled), 1)                                as miles_traveled,
-
-    round(avg(minutes_first_to_last), 1)                         as avg_minutes_first_to_last,
-    round(avg(work_orders), 1)                                   as avg_orders_per_day,
-    round(avg(distinct_locations), 1)                            as avg_locations_per_day,
-    round(avg(return_events), 2)                                 as avg_returns_per_day,
-
-    round(avg(avg_minutes_between_orders), 1)                    as avg_minutes_between_orders,
-    round(median(median_minutes_between_orders), 1)              as median_minutes_between_orders,
-    round(avg(avg_miles_between_orders), 2)                      as avg_miles_between_orders
-from day_metrics
-group by workedby, work_week;
-
-
--- ----------------------------------------------------------------------
--- 5. TECH METRICS
--- ----------------------------------------------------------------------
-create or replace table tech_metrics as
-select
-    workedby,
-    count(*)                                                     as weeks_active,
-    sum(days_worked)                                             as days_worked,
-
-    round(avg(meters_changed), 1)                                as avg_meters_per_week,
-    round(avg(s4e_changes), 1)                                   as avg_s4e_per_week,
-    round(avg(non_s4e_changes), 1)                               as avg_non_s4e_per_week,
-    round(avg(periodic_tests), 1)                                as avg_periodic_tests_per_week,
-    round(avg(return_events), 1)                                 as avg_returns_per_week,
-    round(avg(miles_traveled), 1)                                as avg_miles_per_week,
-    round(avg(avg_miles_between_orders), 2)                      as avg_miles_between_orders,
-    round(avg(avg_minutes_first_to_last), 1)                     as avg_minutes_worked_per_day,
-    round(avg(avg_minutes_between_orders), 1)                    as avg_minutes_between_orders,
-    round(avg(median_minutes_between_orders), 1)                 as median_minutes_between_orders,
-    round(avg(avg_orders_per_day), 1)                            as avg_orders_per_day
-from week_metrics
-group by workedby;
-
-
--- ======================================================================
--- 6. BEHAVIOR + DENSITY BUCKETS -- one label per tech per day  [+ dgroup]
--- ======================================================================
-create or replace table bucket_params as
-select
-    1.5  as cluster_break_mi,  -- hop > this starts a new cluster
-    2    as min_orders,        -- fewer orders than this -> not labeled
-    4    as many_clusters,
-    3    as few_clusters,
-    5    as lots_mpc,          -- median meters per cluster: "lots"    (Focused)
-    3    as several_mpc,       -- median meters per cluster: "several" (Sequential)
-    2    as few_mpc,           -- median meters per cluster: "few"     (Fragmented)
-    2.0  as close_mi,
-    4.0  as far_mi,
-    0.30 as revisit_rate_hi,
-    2    as min_returns,
-    0.01 as grid_deg,
-    2000 as dense_hi,
-    300  as dense_mid;
-
-
--- 6a. tag every order with its cluster number
-create or replace table work_clusters as
-select
-    s.*,
-    (s.order_num = 1 or s.miles_since_prev > p.cluster_break_mi)  as is_cluster_break,
-    sum(case when s.order_num = 1 or s.miles_since_prev > p.cluster_break_mi
-             then 1 else 0 end)
-        over (partition by s.workedby, s.work_date order by s.order_num)::int
-                                                                  as cluster_num
-from work_sequence s
-cross join bucket_params p;
-
-
--- 6b. density: distinct premises per grid cell, summed over the 3x3 block
-create or replace table grid_premises as
-select
-    floor(f.hist_latitude  / p.grid_deg)::bigint                  as gy,
-    floor(f.hist_longitude / p.grid_deg)::bigint                  as gx,
-    count(distinct f.esi_loc)                                     as premises
-from full_s4e_pop_mapping f
-cross join bucket_params p
-where f.hist_latitude  is not null
-  and f.hist_longitude is not null
-group by 1, 2;
-
-create or replace table grid_density as
-select
-    g.gy,
-    g.gx,
-    sum(n.premises)                                               as premises_nearby
-from grid_premises g
-cross join range(-1, 2) oy(dy)
-cross join range(-1, 2) ox(dx)
-join grid_premises n
-  on n.gy = g.gy + oy.dy
- and n.gx = g.gx + ox.dx
-group by g.gy, g.gx;
-
-
--- 6c. one row per tech per day, with labels
---     mode(c.dgroup) = the district most of that day's orders were in
-create or replace table day_behavior as
-with cluster_sizes as (
-    select workedby, work_date, cluster_num,
-           count(distinct meterno)                               as cluster_meters
-    from work_clusters
-    group by workedby, work_date, cluster_num
-),
-day_stats as (
-    select
-        c.workedby,
-        c.work_date,
-        c.work_week,
-        mode(c.dgroup)                                            as dgroup,
-        count(distinct c.dgroup)                                  as districts_touched,
-        count(*)                                                  as orders,
-        count(distinct c.meterno)                                 as meters,
-        max(c.cluster_num)                                        as clusters,
-        round(avg(c.miles_since_prev)
-              filter (where c.is_cluster_break and c.order_num > 1), 2)
-                                                                  as avg_miles_between_clusters,
-        median(d.premises_nearby)                                 as median_premises_nearby,
-        count(*) filter (where c.miles_since_prev
-                               / nullif(c.minutes_since_prev, 0) * 60 > 70)
-                                                                  as impossible_legs
-    from work_clusters c
-    cross join bucket_params p
-    left join grid_density d
-      on d.gy = floor(c.latitude  / p.grid_deg)::bigint
-     and d.gx = floor(c.longitude / p.grid_deg)::bigint
-    group by c.workedby, c.work_date, c.work_week
-),
-stats as (
-    select
-        s.*,
-        z.median_meters_per_cluster,
-        coalesce(r.return_events, 0)                              as return_events,
-        round(coalesce(r.return_events, 0)
-              / nullif(s.clusters - 1, 0), 2)                     as revisit_rate
-    from day_stats s
-    join (select workedby, work_date,
-                 median(cluster_meters) as median_meters_per_cluster
-          from cluster_sizes group by workedby, work_date) z
-      on z.workedby = s.workedby and z.work_date = s.work_date
-    left join day_returns r
-      on r.workedby = s.workedby and r.work_date = s.work_date
-)
-select
-    t.*,
-    case
-        when t.orders < p.min_orders
-            then 'Too few orders'
-        when t.return_events >= p.min_returns
-         and t.revisit_rate  >= p.revisit_rate_hi
-            then 'Revisiting'
-        when t.clusters <= p.few_clusters
-         and t.median_meters_per_cluster >= p.lots_mpc
-         and coalesce(t.avg_miles_between_clusters, 0) <= p.close_mi
-            then 'Focused'
-        when t.clusters >= p.many_clusters
-         and t.median_meters_per_cluster >= p.several_mpc
-         and t.return_events = 0
-            then 'Sequential'
-        when t.clusters >= p.many_clusters
-         and t.median_meters_per_cluster <= p.few_mpc
-         and t.avg_miles_between_clusters >= p.far_mi
-            then 'Fragmented'
-        else 'Mixed'
-    end                                                           as behavior,
-    case
-        when t.median_premises_nearby >= p.dense_hi  then 'Highly dense'
-        when t.median_premises_nearby >= p.dense_mid then 'Moderately dense'
-        else 'Not dense'
-    end                                                           as density_band
-from stats t
-cross join bucket_params p;
-
-
--- ======================================================================
--- 7. OPPORTUNITY -- S4e meters within reach of each stop       [+ dgroup]
--- ======================================================================
-create or replace table opp_params as
-select
-    0.5   as vicinity_mi,
-    0.01  as grid_deg;
-
--- 7a. every S4e meter, where it sits, when it left, whose district
-create or replace table s4e_universe as
-select
-    f.esi_loc,
-    f.hist_meter                                                  as meterno,
-    min(f.dgroup)                                                 as dgroup,
-    min(f.hist_latitude)                                          as latitude,
-    min(f.hist_longitude)                                         as longitude,
-    min(cast(f.hist_meter_removal_date as date))                  as removed_date
-from full_s4e_pop_mapping f
-where lower(f.Harware_Model) like '%s4e%'
-  and f.hist_latitude  is not null
-  and f.hist_longitude is not null
-group by f.esi_loc, f.hist_meter;
-
-
--- 7b. count reachable S4e meters per work order
-create or replace table order_opportunity as
-select
-    s.workedby,
     s.dgroup,
     s.work_date,
-    s.work_week,
-    s.order_num,
-    s.meterno,
-    s.esi_loc,
-    s.is_s4e,
-    count(distinct u.meterno)                                     as s4e_nearby,
-    count(distinct u.esi_loc)                                     as s4e_premises_nearby,
-    count(distinct u.meterno) filter (where u.esi_loc = s.esi_loc) as s4e_same_premise
-from work_sequence s
-cross join opp_params p
-left join s4e_universe u
-       on floor(u.latitude  / p.grid_deg)::bigint
-          between floor(s.latitude  / p.grid_deg)::bigint - 1
-              and floor(s.latitude  / p.grid_deg)::bigint + 1
-      and floor(u.longitude / p.grid_deg)::bigint
-          between floor(s.longitude / p.grid_deg)::bigint - 1
-              and floor(s.longitude / p.grid_deg)::bigint + 1
-      and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
-      and u.meterno <> s.meterno
-      and (u.removed_date is null or u.removed_date >= s.work_date)
-group by s.workedby, s.dgroup, s.work_date, s.work_week, s.order_num,
-         s.meterno, s.esi_loc, s.is_s4e;
-
-
--- 7c. scatter grain: one point per tech per week
-create or replace table week_opportunity as
-with distinct_opp as (
-    select distinct s.workedby, s.work_week, u.meterno
-    from work_sequence s
-    cross join opp_params p
-    join s4e_universe u
-      on floor(u.latitude  / p.grid_deg)::bigint
-         between floor(s.latitude  / p.grid_deg)::bigint - 1
-             and floor(s.latitude  / p.grid_deg)::bigint + 1
-     and floor(u.longitude / p.grid_deg)::bigint
-         between floor(s.longitude / p.grid_deg)::bigint - 1
-             and floor(s.longitude / p.grid_deg)::bigint + 1
-     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
-     and (u.removed_date is null or u.removed_date >= s.work_date)
-)
-select
-    w.workedby,
-    w.work_week,
-    w.days_worked,
-    w.work_orders,
-    w.meters_changed,
-    w.s4e_changes,
-    w.periodic_tests,
-    count(distinct o.meterno)                                     as s4e_opportunities,
-    round(w.s4e_changes / nullif(count(distinct o.meterno), 0), 3) as capture_rate,
-    round(count(distinct o.meterno) / nullif(w.work_orders, 0), 2) as s4e_density_per_order
-from week_metrics w
-left join distinct_opp o
-       on o.workedby  = w.workedby
-      and o.work_week = w.work_week
-group by w.workedby, w.work_week, w.days_worked, w.work_orders,
-         w.meters_changed, w.s4e_changes, w.periodic_tests;
-
-
--- ======================================================================
--- 8. S4e CAPTURE BY DENSITY BAND                               [+ dgroup]
--- ======================================================================
-create or replace table band_params as
-select
-    0.01 as grid_deg,
-    10   as band_low,
-    50   as band_mid,
-    150  as band_high;
-
--- 8a. per-meter S4e neighbor count (concentration it sits in)
-create or replace table s4e_grid as
-select
-    floor(latitude  / p.grid_deg)::bigint                         as gy,
-    floor(longitude / p.grid_deg)::bigint                         as gx,
-    count(*)                                                      as s4e_in_cell
-from s4e_universe
-cross join band_params p
-group by 1, 2;
-
-create or replace table s4e_neighbors as
-select
     u.meterno,
-    u.esi_loc,
-    u.dgroup,
-    u.removed_date,
-    (u.removed_date is not null
-     and u.removed_date < date '2900-01-01')                      as was_changed,
-    sum(n.s4e_in_cell) - 1                                        as s4e_concentration
-from s4e_universe u
-cross join band_params p
-cross join range(-1, 2) oy(dy)
-cross join range(-1, 2) ox(dx)
-join s4e_grid n
-  on n.gy = floor(u.latitude  / p.grid_deg)::bigint + oy.dy
- and n.gx = floor(u.longitude / p.grid_deg)::bigint + ox.dx
-group by u.meterno, u.esi_loc, u.dgroup, u.removed_date;
-
-
--- 8b. band it, and mark which meters a tech ever came near
-create or replace table s4e_capture_by_band as
-with exposed as (
-    select distinct u.meterno
-    from work_sequence s
-    cross join opp_params op
-    join s4e_universe u
-      on floor(u.latitude  / op.grid_deg)::bigint
-         between floor(s.latitude  / op.grid_deg)::bigint - 1
-             and floor(s.latitude  / op.grid_deg)::bigint + 1
-     and floor(u.longitude / op.grid_deg)::bigint
-         between floor(s.longitude / op.grid_deg)::bigint - 1
-             and floor(s.longitude / op.grid_deg)::bigint + 1
-     and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= op.vicinity_mi
-)
-select
-    n.meterno,
-    n.esi_loc,
-    n.dgroup,
-    n.s4e_concentration,
-    n.was_changed,
-    (e.meterno is not null)                                       as was_exposed,
-    case
-        when n.s4e_concentration <  p.band_low  then '1. Low (<10)'
-        when n.s4e_concentration <  p.band_mid  then '2. Moderate (10-49)'
-        when n.s4e_concentration <  p.band_high then '3. High (50-149)'
-        else                                         '4. Very high (150+)'
-    end                                                           as density_band
-from s4e_neighbors n
-cross join band_params p
-left join exposed e on e.meterno = n.meterno;
-
-
--- 8c. the visual's data: proportion changed, by band and district
-create or replace table band_summary as
-select
-    density_band,
-    dgroup,
-    count(*)                                                      as s4e_meters,
-    count(*) filter (where was_changed)                           as changed,
-    round(100.0 * count(*) filter (where was_changed) / count(*), 1)
-                                                                  as pct_changed_of_all,
-    count(*) filter (where was_exposed)                           as exposed,
-    count(*) filter (where was_exposed and not was_changed)       as missed,
-    round(100.0 * count(*) filter (where was_exposed and was_changed)
-          / nullif(count(*) filter (where was_exposed or was_changed), 0), 1)
-                                                                  as pct_changed_of_exposed
-from s4e_capture_by_band
-group by density_band, dgroup
-order by density_band, dgroup;
-
-
--- ======================================================================
--- 9. PASS COUNTS -- how many times each S4e meter got walked past
--- ======================================================================
-create or replace table meter_passes as
-select
-    u.meterno,
-    u.esi_loc,
-    u.dgroup,
-    u.latitude,
-    u.longitude,
-    u.removed_date,
-    (u.removed_date is null or u.removed_date >= date '2900-01-01') as still_active,
-    count(s.order_num)                                            as passes,
-    count(distinct s.workedby)                                    as distinct_techs,
-    count(distinct s.work_date)                                   as distinct_days,
-    count(s.order_num) filter (where s.esi_loc = u.esi_loc)       as same_premise_passes,
-    min(s.work_date)                                              as first_pass,
-    max(s.work_date)                                              as last_pass
-from s4e_universe u
-cross join opp_params p
-left join work_sequence s
-       on floor(s.latitude  / p.grid_deg)::bigint
-          between floor(u.latitude  / p.grid_deg)::bigint - 1
-              and floor(u.latitude  / p.grid_deg)::bigint + 1
-      and floor(s.longitude / p.grid_deg)::bigint
-          between floor(u.longitude / p.grid_deg)::bigint - 1
-              and floor(u.longitude / p.grid_deg)::bigint + 1
-      and miles_between(u.latitude, u.longitude, s.latitude, s.longitude) <= p.vicinity_mi
-      and s.meterno <> u.meterno
-      and (u.removed_date is null or u.removed_date >= s.work_date)
-group by u.meterno, u.esi_loc, u.dgroup, u.latitude, u.longitude, u.removed_date;
-
-
--- 9b. grid rollup for the heat map -- still-active meters only
-create or replace table missed_grid as
-select
-    dgroup,
-    round(avg(latitude),  5)                                      as latitude,
-    round(avg(longitude), 5)                                      as longitude,
-    count(*)                                                      as missed_meters,
-    sum(passes)                                                   as total_passes,
-    round(avg(passes), 1)                                         as avg_passes_per_meter,
-    max(passes)                                                   as max_passes,
-    sum(same_premise_passes)                                      as same_premise_passes
-from meter_passes
-cross join opp_params p
-where still_active
-group by dgroup,
-         floor(latitude  / p.grid_deg)::bigint,
-         floor(longitude / p.grid_deg)::bigint;
-
-
--- ======================================================================
--- 10. BEHAVIOR PROFILE DATASET -- day grain                    [+ dgroup]
--- ======================================================================
-
--- 10a. day-level opportunity, de-duplicated within the day
-create or replace table day_opportunity as
-select
-    s.workedby,
-    s.work_date,
-    count(distinct u.meterno)                                     as s4e_opportunities
+    u.removed_date
 from work_sequence s
 cross join opp_params p
 join s4e_universe u
@@ -568,75 +28,66 @@ join s4e_universe u
      between floor(s.longitude / p.grid_deg)::bigint - 1
          and floor(s.longitude / p.grid_deg)::bigint + 1
  and miles_between(s.latitude, s.longitude, u.latitude, u.longitude) <= p.vicinity_mi
- and (u.removed_date is null or u.removed_date >= s.work_date)
-group by s.workedby, s.work_date;
+ and (u.removed_date is null or u.removed_date >= s.work_date);
 
 
--- 10b. one row per tech per day -- the Tableau source
-create or replace table tech_day_profile as
+create or replace table district_day as
+with crew as (
+    select
+        dgroup,
+        work_date,
+        count(distinct workedby)                                  as techs,
+        count(*)                                                  as work_orders,
+        count(distinct meterno) filter (where is_s4e)             as s4e_changes_logged
+    from work_sequence
+    group by dgroup, work_date
+),
+reach as (
+    select
+        dgroup,
+        work_date,
+        count(*)                                                  as s4e_available,
+        count(*) filter (where removed_date = work_date)          as s4e_changed,
+        count(*) filter (where removed_date is null
+                            or removed_date <> work_date)         as s4e_missed
+    from district_day_reach
+    group by dgroup, work_date
+)
 select
-    b.workedby,
-    b.work_date,
-    b.work_week,
-    b.behavior,
-    b.density_band,
-    b.dgroup,
-    b.districts_touched,
-
-    m.work_orders,
-    m.meters                                                      as meters_changed,
-    m.s4e_changes,
-    m.non_s4e_changes,
-    m.periodic_tests,
-    b.return_events                                               as revisits,
-
-    m.miles_traveled                                              as miles_per_day,
-    m.minutes_first_to_last                                       as minutes_per_day,
-    m.avg_miles_between_orders                                    as miles_between_meters,
-    m.avg_minutes_between_orders                                  as minutes_between_meters,
-    m.median_minutes_between_orders                               as median_minutes_between_meters,
-
-    coalesce(o.s4e_opportunities, 0)                              as s4e_opportunities,
-    greatest(coalesce(o.s4e_opportunities, 0) - m.s4e_changes, 0) as missed_opportunities,
-    round(m.s4e_changes / nullif(o.s4e_opportunities, 0), 3)      as capture_rate,
-    round(100.0 * m.s4e_changes / nullif(m.meters, 0), 1)         as pct_changes_that_are_s4e,
-
-    b.clusters,
-    b.median_meters_per_cluster,
-    b.avg_miles_between_clusters,
-    b.impossible_legs
-from day_behavior b
-join day_metrics m
-  on m.workedby  = b.workedby
- and m.work_date = b.work_date
-left join day_opportunity o
-  on o.workedby  = b.workedby
- and o.work_date = b.work_date;
+    c.dgroup,
+    c.work_date,
+    date_trunc('week', c.work_date)                               as work_week,
+    c.techs,
+    c.work_orders,
+    coalesce(r.s4e_available, 0)                                  as s4e_available,
+    coalesce(r.s4e_changed, 0)                                    as s4e_changed,
+    coalesce(r.s4e_missed, 0)                                     as s4e_missed,
+    round(100.0 * r.s4e_changed / nullif(r.s4e_available, 0), 2)  as pct_captured,
+    round(r.s4e_available / nullif(c.techs, 0), 1)                as available_per_tech,
+    c.s4e_changes_logged                                          as s4e_changes_logged
+from crew c
+left join reach r
+       on r.dgroup = c.dgroup and r.work_date = c.work_date
+order by c.dgroup, c.work_date;
 
 
--- 10c. summary grid: behavior x density band x district, per-day averages
-create or replace table behavior_profile as
-select
-    behavior,
-    density_band,
-    dgroup,
-    count(*)                                                      as tech_days,
-    count(distinct workedby)                                      as techs,
-
-    round(avg(meters_changed), 1)                                 as avg_meters_per_day,
-    round(avg(non_s4e_changes), 1)                                as avg_non_s4e_per_day,
-    round(avg(s4e_changes), 1)                                    as avg_s4e_per_day,
-    round(avg(periodic_tests), 1)                                 as avg_periodic_tests_per_day,
-    round(avg(missed_opportunities), 1)                           as avg_missed_per_day,
-    round(avg(revisits), 2)                                       as avg_revisits_per_day,
-
-    round(avg(miles_per_day), 1)                                  as avg_miles_per_day,
-    round(avg(minutes_per_day), 1)                                as avg_minutes_per_day,
-    round(avg(miles_between_meters), 2)                           as avg_miles_between_meters,
-    round(avg(minutes_between_meters), 1)                         as avg_minutes_between_meters,
-
-    round(avg(capture_rate), 3)                                   as avg_capture_rate,
-    round(avg(pct_changes_that_are_s4e), 1)                       as avg_pct_s4e_of_changes
-from tech_day_profile
-group by behavior, density_band, dgroup
-order by behavior, density_band, dgroup;
+-- ----------------------------------------------------------------------
+-- CHECKS (own cells, .df())
+-- ----------------------------------------------------------------------
+-- -- 1. s4e_changed (from the reach set) should match s4e_changes_logged
+-- --    (counted straight off the work orders). A gap means some changed
+-- --    meters aren't in s4e_universe -- usually missing coordinates.
+-- select dgroup, sum(s4e_changed) as from_reach,
+--        sum(s4e_changes_logged) as from_orders
+-- from district_day group by dgroup;
+--
+-- -- 2. how much overlap the de-duplication removed
+-- select d.dgroup, d.work_date,
+--        d.s4e_available                     as deduped,
+--        sum(t.s4e_opportunities)            as summed_per_tech
+-- from district_day d
+-- join tech_day_profile t
+--   on t.dgroup = d.dgroup and t.work_date = d.work_date
+-- group by d.dgroup, d.work_date, d.s4e_available
+-- order by summed_per_tech - deduped desc
+-- limit 20;
