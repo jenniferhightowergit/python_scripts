@@ -1,67 +1,37 @@
 
 
 -- ======================================================================
--- 12. BURN-DOWN -- cumulative changed vs S4e remaining, by week
+-- 13. DISTRICT SCORECARD -- the four headline numbers, per district
 --
---    Changed is a flow: each meter counts once, in the week it left.
---    Remaining is a stock: the population minus everything changed so
---    far. These two are safe to put on one chart; changed vs missed
---    was not, because missed re-counts the same meter every day.
---
---    The population is every S4e meter in s4e_universe: those changed
---    inside your window plus those still installed. Meters changed
---    before the window aren't in it, so this is "remaining as of the
---    window start," not all-time.
+--    Reads the last week of s4e_burndown, so it always reflects the
+--    latest data with no extra date logic. Pace is the trailing 8-week
+--    average, converted to months at 4.33 weeks per month.
 -- ======================================================================
-create or replace table s4e_burndown as
-with pop as (
-    select
-        dgroup,
-        count(*)                                                  as total_s4e
-    from s4e_universe
-    group by dgroup
-),
-week_spine as (
-    select distinct date_trunc('week', work_date)::date           as work_week
-    from work_sequence
-),
-grid as (
-    select p.dgroup, p.total_s4e, w.work_week
-    from pop p
-    cross join week_spine w
-),
-changed as (
-    select
-        dgroup,
-        date_trunc('week', removed_date)::date                    as work_week,
-        count(*)                                                  as changed_this_week
-    from s4e_universe
-    where removed_date is not null
-      and removed_date < date '2900-01-01'
-    group by 1, 2
-)
+create or replace table district_scorecard as
 select
-    g.dgroup,
-    g.work_week,
-    g.total_s4e,
-    coalesce(c.changed_this_week, 0)                              as changed_this_week,
-    sum(coalesce(c.changed_this_week, 0))
-        over (partition by g.dgroup order by g.work_week)         as changed_cumulative,
-    g.total_s4e - sum(coalesce(c.changed_this_week, 0))
-        over (partition by g.dgroup order by g.work_week)         as remaining_active,
-    round(100.0 * sum(coalesce(c.changed_this_week, 0))
-          over (partition by g.dgroup order by g.work_week)
-          / nullif(g.total_s4e, 0), 2)                            as pct_complete,
-    round(avg(coalesce(c.changed_this_week, 0))
-          over (partition by g.dgroup order by g.work_week
-                rows between 7 preceding and current row), 1)     as avg_per_week_8wk,
-    round((g.total_s4e - sum(coalesce(c.changed_this_week, 0))
-            over (partition by g.dgroup order by g.work_week))
-          / nullif(avg(coalesce(c.changed_this_week, 0))
-            over (partition by g.dgroup order by g.work_week
-                  rows between 7 preceding and current row), 0), 0)
-                                                                  as weeks_to_zero_at_pace
-from grid g
-left join changed c
-       on c.dgroup = g.dgroup and c.work_week = g.work_week
-order by g.dgroup, g.work_week;
+    dgroup,
+    work_week                                                     as as_of_week,
+    total_s4e,
+    changed_cumulative                                            as changed_ytd,
+    remaining_active                                              as remaining,
+    pct_complete,
+    avg_per_week_8wk                                              as avg_changed_per_week,
+    round(avg_per_week_8wk * 4.33, 1)                             as avg_changed_per_month,
+    round(remaining_active / nullif(avg_per_week_8wk * 4.33, 0), 1)
+                                                                  as months_to_zero_at_pace
+from s4e_burndown
+qualify row_number() over (partition by dgroup order by work_week desc) = 1
+order by months_to_zero_at_pace desc;
+
+
+-- 13b. one row for the whole program, for the top-of-dashboard numbers
+create or replace table program_scorecard as
+select
+    sum(total_s4e)                                                as total_s4e,
+    sum(changed_ytd)                                              as changed_ytd,
+    sum(remaining)                                                as remaining,
+    round(100.0 * sum(changed_ytd) / nullif(sum(total_s4e), 0), 1) as pct_complete,
+    round(sum(avg_changed_per_month), 1)                          as avg_changed_per_month,
+    round(sum(remaining) / nullif(sum(avg_changed_per_month), 0), 1)
+                                                                  as months_to_zero_at_pace
+from district_scorecard;
