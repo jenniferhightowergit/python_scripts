@@ -12,6 +12,7 @@ so they survive the 3-hour retention on orders / cleaned_text.
 3. find cleaned text for training orders not yet in training_orders_cleaned_text
 4. write it to training_orders_cleaned_text
 
+Training tables are keyed on wr_id: one row per work request.
 No retention: training tables only grow.
 The labeling pipeline then picks up training orders with no label yet.
 
@@ -31,27 +32,48 @@ from database import init_tables
 from settings import get_settings
 
 
-# TODO: confirm the matching key with Erik.
-# One WR can have several field activities (fa_id), so wr_id may not be
-# unique in orders. order_id (or wr_id + fa_id) may be the safer key.
+# Key used to match live orders against the training tables
 KEY_COL = 'wr_id'
+
+# Columns left out of the training tables.
+# To keep one again, just remove it from this list.
+# NOTE: every column listed must exist in the source table, or DuckDB errors.
+EXCLUDE_COLS = ['order_id', 'fa_id']
+
+# Max new orders appended per run (None = no cap)
+DEFAULT_N = 100
+
+
+def star_except(alias: str, cols: list) -> str:
+    '''
+    builds "o.* exclude (col1, col2)", or just "o.*" if cols is empty
+    '''
+    if not cols:
+        return f'{alias}.*'
+    return f'{alias}.* exclude ({", ".join(cols)})'
 
 
 def query_new_training_orders(tables: Tables, n: int | None = None) -> pd.DataFrame:
     '''
-    Orders that are not in training_orders yet.
+    Orders whose wr_id is not in training_orders yet.
 
-    Inner join to cleaned_text so only fully processed orders are copied.
-    Anything not cleaned yet gets picked up on the next run.
+    - inner join to cleaned_text: only fully processed orders are copied;
+      anything not cleaned yet gets picked up on the next run
+    - one WR can have several field activities, so keep only the most
+      recently updated row per wr_id (the "qualify" line)
     '''
     limit = f'limit {int(n)}' if n else ''
     sql = f'''
-    select o.*
+    select {star_except('o', EXCLUDE_COLS)}
     from orders o
     join cleaned_text ct on ct.order_id = o.order_id
     left join training_orders t on t.{KEY_COL} = o.{KEY_COL}
     where t.{KEY_COL} is null
       and o.{KEY_COL} is not null
+    qualify row_number() over (
+        partition by o.{KEY_COL}
+        order by o.wr_status_upd_dttm desc, o.order_id desc
+    ) = 1
     {limit}
     '''
     return tables.select(sql)
@@ -59,18 +81,23 @@ def query_new_training_orders(tables: Tables, n: int | None = None) -> pd.DataFr
 
 def query_new_training_text(tables: Tables) -> pd.DataFrame:
     '''
-    Cleaned text for orders already in training_orders
-    that is not in training_orders_cleaned_text yet.
+    Cleaned text for wr_ids already in training_orders
+    that are not in training_orders_cleaned_text yet.
 
-    TODO: assumes training_orders keeps the original order_id from orders.
-    Confirm against Caleb's DDL.
+    TODO: assumes cleaned_text carries wr_id (data_intake selects it before
+    preprocessing). Confirm with: describe cleaned_text
     '''
-    sql = '''
-    select ct.*
+    sql = f'''
+    select {star_except('ct', EXCLUDE_COLS)}
     from cleaned_text ct
-    join training_orders t on t.order_id = ct.order_id
-    left join training_orders_cleaned_text tc on tc.order_id = ct.order_id
-    where tc.order_id is null
+    join orders o on o.order_id = ct.order_id
+    join training_orders t on t.{KEY_COL} = ct.{KEY_COL}
+    left join training_orders_cleaned_text tc on tc.{KEY_COL} = ct.{KEY_COL}
+    where tc.{KEY_COL} is null
+    qualify row_number() over (
+        partition by ct.{KEY_COL}
+        order by o.wr_status_upd_dttm desc, o.order_id desc
+    ) = 1
     '''
     return tables.select(sql)
 
@@ -95,9 +122,9 @@ def append_training_text(tables: Tables) -> int:
     return len(df)
 
 
-def run(n: int | None = None):
+def run(n: int | None = DEFAULT_N):
     '''
-    n: optional cap on how many new orders to append per run.
+    n: cap on how many new orders to append per run.
        None means append everything new.
     '''
     logging.info('started: append_training_orders_pipeline')
