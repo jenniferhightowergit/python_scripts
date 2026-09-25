@@ -21,14 +21,58 @@ The labeling pipeline fills in training_order_category.
 NOTE: this must run more often than the orders retention window (3h),
 or orders will be deleted before they get copied.
 
+PORTABILITY: the SQL avoids DuckDB-only features (pivot, qualify, exclude,
+create or replace, using-joins) so it also runs on SQL Server.
+The only differences are handled by the helpers below, switched by DIALECT.
+
 run from src/:
 >>> python main.py pipelines run -n append-training-orders
 '''
 
 import logging
 
+# 'duckdb' now; switch to 'mssql' when the app moves to SQL Server
+# TODO: could be read from settings instead of hard-coded
+DIALECT = 'duckdb'
+
 # Max new orders appended per run (None = no cap)
 DEFAULT_N = 100
+
+
+# --------------------------------------------------------------------------
+# dialect helpers: the only places DuckDB and SQL Server differ
+# --------------------------------------------------------------------------
+
+def top_clause(n: int | None) -> str:
+    '''SQL Server caps rows with "select top (n)"'''
+    return f'top ({int(n)})' if n and DIALECT == 'mssql' else ''
+
+
+def limit_clause(n: int | None) -> str:
+    '''DuckDB caps rows with "limit n" at the end'''
+    return f'limit {int(n)}' if n and DIALECT == 'duckdb' else ''
+
+
+def quote_ident(name: str) -> str:
+    '''
+    quote a column name, e.g. a category code -> "MC"
+    double quotes work in both DuckDB and SQL Server
+    '''
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def create_table_as(tables, name: str, select_sql: str):
+    '''drop and recreate a table from a select'''
+    tables.execute(f'drop table if exists {name}')
+    if DIALECT == 'mssql':
+        tables.execute(f'select * into {name} from ({select_sql}) as src')
+    else:
+        tables.execute(f'create table {name} as {select_sql}')
+
+
+def count_rows(tables, sql: str) -> int:
+    df = tables.select(f'select count(*) as n from ({sql}) as q')
+    return int(df.iloc[0, 0])
 
 
 # --------------------------------------------------------------------------
@@ -38,40 +82,54 @@ DEFAULT_N = 100
 # Rows from orders that are ready to copy:
 #   - have cleaned text already (anything not cleaned yet gets picked up next run)
 #   - (wr_id, fa_id) not in training_orders yet
-#   - one row per (wr_id, fa_id), latest update wins, so the
+#   - one row per (wr_id, fa_id), latest update wins (rn = 1), so the
 #     uq_order_business_key constraint can't be violated
 # comments / instructions are NOT NULL in training_orders, and Oracle turns
 # blank text into NULL, so blanks are stored as '' instead of being dropped.
 NEW_ORDERS_SQL = '''
-select
-    o.wr_id,
-    o.fa_id,
-    o.wr_status_upd_dttm,
-    coalesce(o.comments, '')     as comments,
-    coalesce(o.instructions, '') as instructions
-from orders o
-where o.wr_id is not null
-  and o.fa_id is not null
-  and exists (
-      select 1 from cleaned_text ct where ct.order_id = o.order_id
-  )
-  and not exists (
-      select 1 from training_orders t
-      where t.wr_id = o.wr_id
-        and t.fa_id = o.fa_id
-  )
-qualify row_number() over (
-    partition by o.wr_id, o.fa_id
-    order by o.wr_status_upd_dttm desc, o.order_id desc
-) = 1
-order by o.wr_status_upd_dttm
+select {top}
+    wr_id,
+    fa_id,
+    wr_status_upd_dttm,
+    comments,
+    instructions
+from (
+    select
+        o.wr_id,
+        o.fa_id,
+        o.wr_status_upd_dttm,
+        coalesce(o.comments, '')     as comments,
+        coalesce(o.instructions, '') as instructions,
+        row_number() over (
+            partition by o.wr_id, o.fa_id
+            order by o.wr_status_upd_dttm desc, o.order_id desc
+        ) as rn
+    from orders o
+    where o.wr_id is not null
+      and o.fa_id is not null
+      and exists (
+          select 1 from cleaned_text ct where ct.order_id = o.order_id
+      )
+      and not exists (
+          select 1 from training_orders t
+          where t.wr_id = o.wr_id
+            and t.fa_id = o.fa_id
+      )
+) as candidates
+where rn = 1
+{order_by}
 {limit}
 '''
 
 
+def new_orders_sql(n: int | None) -> str:
+    # oldest first, only needed when capping so the cap is predictable
+    order_by = 'order by wr_status_upd_dttm' if n else ''
+    return NEW_ORDERS_SQL.format(top=top_clause(n), order_by=order_by, limit=limit_clause(n))
+
+
 def append_training_orders(tables, n: int | None = None) -> int:
-    limit = f'limit {int(n)}' if n else ''
-    sql = NEW_ORDERS_SQL.format(limit=limit)
+    sql = new_orders_sql(n)
 
     n_new = count_rows(tables, sql)
     if n_new == 0:
@@ -97,23 +155,30 @@ def append_training_orders(tables, n: int | None = None) -> int:
 #       Confirm with: describe cleaned_text
 NEW_TEXT_SQL = '''
 select
-    t.training_order_id,
-    coalesce(ct.cleaned_comments, '')     as cleaned_comments,
-    coalesce(ct.cleaned_instructions, '') as cleaned_instructions
-from training_orders t
-join orders o
-  on o.wr_id = t.wr_id
- and o.fa_id = t.fa_id
-join cleaned_text ct
-  on ct.order_id = o.order_id
-where not exists (
-    select 1 from training_cleaned_text tc
-    where tc.training_order_id = t.training_order_id
-)
-qualify row_number() over (
-    partition by t.training_order_id
-    order by o.order_id desc
-) = 1
+    training_order_id,
+    cleaned_comments,
+    cleaned_instructions
+from (
+    select
+        t.training_order_id,
+        coalesce(ct.cleaned_comments, '')     as cleaned_comments,
+        coalesce(ct.cleaned_instructions, '') as cleaned_instructions,
+        row_number() over (
+            partition by t.training_order_id
+            order by o.order_id desc
+        ) as rn
+    from training_orders t
+    join orders o
+      on o.wr_id = t.wr_id
+     and o.fa_id = t.fa_id
+    join cleaned_text ct
+      on ct.order_id = o.order_id
+    where not exists (
+        select 1 from training_cleaned_text tc
+        where tc.training_order_id = t.training_order_id
+    )
+) as candidates
+where rn = 1
 '''
 
 
@@ -135,56 +200,70 @@ def append_training_text(tables) -> int:
 # 4. wide training dataset: one column per category
 # --------------------------------------------------------------------------
 
-# Every training order x every category, with the label where one exists.
-# The cross join means a brand-new category shows up as a column of nulls
-# before anyone has labeled it.
-LABEL_GRID_SQL = '''
-select
-    t.training_order_id,
-    c.code,
-    l.manual_label
-from training_orders t
-cross join category c
-left join training_order_category l
-       on l.training_order_id = t.training_order_id
-      and l.category_id = c.category_id
-'''
-
-
-def build_training_dataset(tables) -> int:
+def training_dataset_sql(tables) -> str:
     '''
-    Rebuilds training_dataset from scratch.
+    Builds the select for training_dataset.
 
-    Tables, not views: DuckDB can't save a view whose pivot columns
-    come from the data, since the column list changes as categories are added.
+    Instead of PIVOT (different in every database), Python reads the category
+    table and writes one "max(case when ...)" column per category.
+    A new category = a new row in category = a new column next run.
+
+    For each order, the case picks out the label for one category
+    (null for the others) and max() collapses them to a single value.
+    Orders with no labels at all still appear, with every label null.
     '''
-    if count_rows(tables, LABEL_GRID_SQL) == 0:
-        logging.info('no training orders or no categories yet: skipped "training_dataset"')
-        return 0
+    cats = tables.select('select category_id, code from category order by category_id')
 
-    tables.execute(f'''
-    create or replace table training_labels_wide as
-    with grid as ({LABEL_GRID_SQL})
-    pivot grid
-    on code
-    using first(manual_label)
-    group by training_order_id
-    ''')
+    label_aggs = []   # inside the subquery: max(case ...) as "MC"
+    label_cols = []   # outer select:        w."MC"
+    for category_id, code in cats.itertuples(index=False):
+        col = quote_ident(code)
+        label_aggs.append(
+            f'max(case when l.category_id = {int(category_id)} '
+            f'then l.manual_label end) as {col}'
+        )
+        label_cols.append(f'w.{col}')
 
-    tables.execute('''
-    create or replace table training_dataset as
+    base = '''
     select
         t.training_order_id,
         t.wr_id,
         t.fa_id,
         tc.cleaned_comments,
-        tc.cleaned_instructions,
-        w.* exclude (training_order_id)
+        tc.cleaned_instructions{label_cols}
     from training_orders t
-    join training_cleaned_text tc using (training_order_id)
-    join training_labels_wide w using (training_order_id)
-    order by t.training_order_id
-    ''')
+    join training_cleaned_text tc
+      on tc.training_order_id = t.training_order_id
+    {labels_join}
+    '''
+
+    if not label_aggs:
+        # no categories yet: just the text
+        return base.format(label_cols='', labels_join='')
+
+    labels_join = '''left join (
+        select
+            l.training_order_id,
+            {aggs}
+        from training_order_category l
+        group by l.training_order_id
+    ) as w
+      on w.training_order_id = t.training_order_id'''.format(
+        aggs=',\n            '.join(label_aggs)
+    )
+
+    return base.format(
+        label_cols=',\n        ' + ',\n        '.join(label_cols),
+        labels_join=labels_join,
+    )
+
+
+def build_training_dataset(tables) -> int:
+    '''
+    Rebuilds training_dataset from scratch.
+    Rebuilt (not a view) because its columns change as categories are added.
+    '''
+    create_table_as(tables, 'training_dataset', training_dataset_sql(tables))
 
     n = count_rows(tables, 'select * from training_dataset')
     logging.info(f'rebuilt "training_dataset": {n:,} records')
@@ -192,13 +271,8 @@ def build_training_dataset(tables) -> int:
 
 
 # --------------------------------------------------------------------------
-# helpers + entrypoint
+# entrypoint
 # --------------------------------------------------------------------------
-
-def count_rows(tables, sql: str) -> int:
-    df = tables.select(f'select count(*) as n from ({sql})')
-    return int(df.iloc[0, 0])
-
 
 def run(n: int | None = DEFAULT_N):
     '''
