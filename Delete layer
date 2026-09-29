@@ -1,93 +1,104 @@
-create or replace table district_scorecard as
-select
-    dgroup,
-    work_week as as_of_week,
-    total_s4e,
-    changed_cumulative as changed_ytd,
-    remaining_active as remaining,
-    pct_complete,
+report.index = [
+    "Annual Goal",
+    "Removed YTD",
+    "Remaining Annual Goal",
+    "% Annual Goal Complete",
+    "Monthly Target",
+    "Removed This Month",
+    "Remaining Monthly Target",
+    "Avg Needed Per Remaining Month"
+]
 
-    -- YTD average per week
-    round(
-        changed_cumulative /
-        nullif(
-            date_diff(
-                'day',
-                date_trunc('year', current_date),
-                current_date
-            ) / 7.0,
-            0
-        ),
-        1
-    ) as avg_changed_per_week,
+display_report = report.copy()
 
-    -- YTD average per month
-    round(
-        changed_cumulative /
-        nullif(month(current_date), 0),
-        1
-    ) as avg_changed_per_month,
+# Counts
+count_rows = [
+    "Annual Goal",
+    "Removed YTD",
+    "Remaining Annual Goal",
+    "Monthly Target",
+    "Removed This Month",
+    "Remaining Monthly Target",
+    "Avg Needed Per Remaining Month"
+]
 
-    -- months remaining at the YTD monthly pace
-    round(
-        remaining_active /
-        nullif(
-            changed_cumulative /
-            nullif(month(current_date), 0),
-            0
-        ),
-        1
-    ) as months_to_zero_at_pace
+for row in count_rows:
+    display_report.loc[row] = display_report.loc[row].apply(
+        lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
+    )
 
-from s4e_burndown
+# Percentage
+display_report.loc["% Annual Goal Complete"] = (
+    report.loc["% Annual Goal Complete"]
+    .apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+)
 
-qualify row_number() over (
-    partition by dgroup
-    order by work_week desc
-) = 1
+display_report
 
-order by months_to_zero_at_pace desc;
+html = f"""
+<html>
+<head>
+<style>
+    body {{
+        font-family: Arial, sans-serif;
+        color: #333333;
+    }}
+
+    h2 {{
+        margin-bottom: 5px;
+    }}
+
+    .subtitle {{
+        color: #666666;
+        margin-bottom: 20px;
+    }}
+
+    table {{
+        border-collapse: collapse;
+        width: 100%;
+        max-width: 1000px;
+    }}
+
+    th {{
+        background-color: #2f5597;
+        color: white;
+        padding: 10px;
+        border: 1px solid #dddddd;
+        text-align: center;
+    }}
+
+    td {{
+        padding: 9px;
+        border: 1px solid #dddddd;
+        text-align: center;
+    }}
+
+    td:first-child {{
+        text-align: left;
+        font-weight: bold;
+        background-color: #f2f2f2;
+    }}
+</style>
+</head>
+
+<body>
+
+<h2>Project Ranger – S4E Meter Removal Progress</h2>
+
+<div class="subtitle">
+    Updated through {pd.Timestamp.today().strftime("%B %d, %Y")}
+</div>
+
+{display_report.to_html(border=0)}
+
+</body>
+</html>
+"""
+
+from IPython.display import HTML
+
+HTML(html)
 
 
-create or replace table program_scorecard as
-select
-    sum(total_s4e) as total_s4e,
-    sum(changed_ytd) as changed_ytd,
-    sum(remaining) as remaining,
 
-    round(
-        100.0 * sum(changed_ytd) /
-        nullif(sum(total_s4e), 0),
-        1
-    ) as pct_complete,
 
-    round(
-        sum(changed_ytd) /
-        nullif(
-            date_diff(
-                'day',
-                date_trunc('year', current_date),
-                current_date
-            ) / 7.0,
-            0
-        ),
-        1
-    ) as avg_changed_per_week,
-
-    round(
-        sum(changed_ytd) /
-        nullif(month(current_date), 0),
-        1
-    ) as avg_changed_per_month,
-
-    round(
-        sum(remaining) /
-        nullif(
-            sum(changed_ytd) /
-            nullif(month(current_date), 0),
-            0
-        ),
-        1
-    ) as months_to_zero_at_pace
-
-from district_scorecard;
