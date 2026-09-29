@@ -1,104 +1,16 @@
-report.index = [
-    "Annual Goal",
-    "Removed YTD",
-    "Remaining Annual Goal",
-    "% Annual Goal Complete",
-    "Monthly Target",
-    "Removed This Month",
-    "Remaining Monthly Target",
-    "Avg Needed Per Remaining Month"
-]
-
-display_report = report.copy()
-
-# Counts
-count_rows = [
-    "Annual Goal",
-    "Removed YTD",
-    "Remaining Annual Goal",
-    "Monthly Target",
-    "Removed This Month",
-    "Remaining Monthly Target",
-    "Avg Needed Per Remaining Month"
-]
-
-for row in count_rows:
-    display_report.loc[row] = display_report.loc[row].apply(
-        lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
-    )
-
-# Percentage
-display_report.loc["% Annual Goal Complete"] = (
-    report.loc["% Annual Goal Complete"]
-    .apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+display(
+    overall.style
+        .set_properties(**{
+            "background-color": "white",
+            "color": "black"
+        })
+        .set_table_styles([
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#f2f2f2"),
+                    ("color", "black")
+                ]
+            }
+        ])
 )
-
-display_report
-
-html = f"""
-<html>
-<head>
-<style>
-    body {{
-        font-family: Arial, sans-serif;
-        color: #333333;
-    }}
-
-    h2 {{
-        margin-bottom: 5px;
-    }}
-
-    .subtitle {{
-        color: #666666;
-        margin-bottom: 20px;
-    }}
-
-    table {{
-        border-collapse: collapse;
-        width: 100%;
-        max-width: 1000px;
-    }}
-
-    th {{
-        background-color: #2f5597;
-        color: white;
-        padding: 10px;
-        border: 1px solid #dddddd;
-        text-align: center;
-    }}
-
-    td {{
-        padding: 9px;
-        border: 1px solid #dddddd;
-        text-align: center;
-    }}
-
-    td:first-child {{
-        text-align: left;
-        font-weight: bold;
-        background-color: #f2f2f2;
-    }}
-</style>
-</head>
-
-<body>
-
-<h2>Project Ranger – S4E Meter Removal Progress</h2>
-
-<div class="subtitle">
-    Updated through {pd.Timestamp.today().strftime("%B %d, %Y")}
-</div>
-
-{display_report.to_html(border=0)}
-
-</body>
-</html>
-"""
-
-from IPython.display import HTML
-
-HTML(html)
-
-
-
-
