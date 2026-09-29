@@ -1,16 +1,64 @@
-display(
-    overall.style
-        .set_properties(**{
-            "background-color": "white",
-            "color": "black"
-        })
-        .set_table_styles([
-            {
-                "selector": "th",
-                "props": [
-                    ("background-color", "#f2f2f2"),
-                    ("color", "black")
-                ]
-            }
-        ])
-)
+kpi_html = f"""
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+       style="max-width:1000px; margin-bottom:20px;">
+    <tr>
+
+        <td style="
+            padding:15px;
+            text-align:center;
+            border:1px solid #dddddd;
+        ">
+            <div style="font-size:13px; color:#666666;">
+                TOTAL S4Es
+            </div>
+
+            <div style="font-size:26px; font-weight:bold;">
+                {total_s4e:,}
+            </div>
+        </td>
+
+        <td style="
+            padding:15px;
+            text-align:center;
+            border:1px solid #dddddd;
+        ">
+            <div style="font-size:13px; color:#666666;">
+                TOTAL REMOVED
+            </div>
+
+            <div style="font-size:26px; font-weight:bold;">
+                {total_removed:,}
+            </div>
+        </td>
+
+        <td style="
+            padding:15px;
+            text-align:center;
+            border:1px solid #dddddd;
+        ">
+            <div style="font-size:13px; color:#666666;">
+                TOTAL REMAINING
+            </div>
+
+            <div style="font-size:26px; font-weight:bold;">
+                {total_remaining:,}
+            </div>
+        </td>
+
+        <td style="
+            padding:15px;
+            text-align:center;
+            border:1px solid #dddddd;
+        ">
+            <div style="font-size:13px; color:#666666;">
+                % COMPLETE
+            </div>
+
+            <div style="font-size:26px; font-weight:bold;">
+                {total_pct_complete:.1%}
+            </div>
+        </td>
+
+    </tr>
+</table>
+"""
