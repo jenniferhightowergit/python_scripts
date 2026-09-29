@@ -62,3 +62,8 @@ kpi_html = f"""
     </tr>
 </table>
 """
+
+
+from IPython.display import HTML
+
+HTML(kpi_html)
