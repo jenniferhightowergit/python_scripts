@@ -1,3 +1,26 @@
+
+category_df = pd.DataFrame({
+    "code": [
+        "BAD_LCD",
+        "METER_CHANGE",
+        "BATTERY_CHANGE"
+    ],
+    "name": [
+        "Bad LCD",
+        "Meter Change",
+        "Battery Change"
+    ],
+    "description": [
+        "Bad LCD display",
+        "Meter replacement",
+        "Battery replacement"
+    ]
+})
+
+display(category_df)
+
+tables.category.insert(category_df)
+
 # Extract unique categories
 category_df = (
     df[["CATEGORY"]]
