@@ -1,24 +1,197 @@
-import duckdb
-from pathlib import Path
+# Extract unique categories
+category_df = (
+    df[["CATEGORY"]]
+    .dropna()
+    .drop_duplicates()
+    .rename(columns={"CATEGORY": "code"})
+    .reset_index(drop=True)
+)
 
-# Existing local database
-db_path = project_root / "data" / "database" / "dev.db"
+# Use category code as display name for now
+category_df["name"] = category_df["code"]
 
-# DDL script
-ddl_path = project_root / "src" / "sql" / "app.admin.ddl.sql"
+# Match database columns
+category_df = category_df[["code", "name"]]
 
-# Read SQL
-ddl = ddl_path.read_text(encoding="utf-8")
+display(category_df)
 
-# Execute against local database
-con = duckdb.connect(str(db_path))
+existing = tables.select("""
+    SELECT code FROM category
+""")
 
-try:
-    con.execute(ddl)
-    print("DDL executed successfully!")
+category_df = category_df[
+    ~category_df["code"].isin(existing["code"])
+]
 
-    # Verify tables
-    print(con.execute("SHOW TABLES").fetchall())
+if not category_df.empty:
+    tables.category.insert(category_df)
 
-finally:
-    con.close()
+
+training_orders_df = df.rename(columns={
+    "WR_ID": "wr_id",
+    "FA_ID": "fa_id",
+    "WR_STATUS_UPD_DTTM": "wr_status_upd_dttm",
+    "COMMENTS": "comments",
+    "INSTRUCTIONS": "instructions"
+}).copy()
+
+# Select database columns
+training_orders_df = training_orders_df[
+    [
+        "wr_id",
+        "fa_id",
+        "wr_status_upd_dttm",
+        "comments",
+        "instructions"
+    ]
+]
+
+# Clean required fields
+training_orders_df["wr_id"] = training_orders_df["wr_id"].astype("string")
+training_orders_df["fa_id"] = training_orders_df["fa_id"].astype("string")
+
+training_orders_df["wr_status_upd_dttm"] = pd.to_datetime(
+    training_orders_df["wr_status_upd_dttm"],
+    errors="coerce"
+)
+
+training_orders_df["comments"] = (
+    training_orders_df["comments"].fillna("")
+)
+
+training_orders_df["instructions"] = (
+    training_orders_df["instructions"].fillna("")
+)
+
+# Business key must be unique
+training_orders_df = training_orders_df.drop_duplicates(
+    subset=["wr_id", "fa_id"]
+)
+
+display(training_orders_df.head())
+
+
+existing_orders = tables.select("""
+    SELECT wr_id, fa_id
+    FROM training_orders
+""")
+
+new_orders = training_orders_df.merge(
+    existing_orders,
+    on=["wr_id", "fa_id"],
+    how="left",
+    indicator=True
+)
+
+new_orders = new_orders[
+    new_orders["_merge"] == "left_only"
+].drop(columns="_merge")
+
+if not new_orders.empty:
+    tables.training_orders.insert(new_orders)
+
+print(f"Inserted {len(new_orders):,} training orders")
+
+# Retrieve generated IDs
+category_lookup = tables.select("""
+    SELECT category_id, code
+    FROM category
+""")
+
+order_lookup = tables.select("""
+    SELECT training_order_id, wr_id, fa_id
+    FROM training_orders
+""")
+
+# Start with original Excel data
+labels_df = df.rename(columns={
+    "WR_ID": "wr_id",
+    "FA_ID": "fa_id",
+    "CATEGORY": "code"
+}).copy()
+
+labels_df["wr_id"] = labels_df["wr_id"].astype("string")
+labels_df["fa_id"] = labels_df["fa_id"].astype("string")
+
+# Match generated training_order_id
+labels_df = labels_df.merge(
+    order_lookup,
+    on=["wr_id", "fa_id"],
+    how="left",
+    validate="many_to_one"
+)
+
+# Match generated category_id
+labels_df = labels_df.merge(
+    category_lookup,
+    on="code",
+    how="left",
+    validate="many_to_one"
+)
+
+# Assigned category = positive label
+labels_df["manual_label"] = 1
+
+# Keep database columns
+training_order_category_df = labels_df[
+    [
+        "training_order_id",
+        "category_id",
+        "manual_label"
+    ]
+].drop_duplicates()
+
+# Check IDs before inserting
+assert training_order_category_df[
+    ["training_order_id", "category_id"]
+].notna().all().all(), "Some records could not be matched to an ID."
+
+# Check for conflicting labels on the same order/category
+assert not training_order_category_df.duplicated(
+    ["training_order_id", "category_id"]
+).any(), "Duplicate order/category combinations found."
+
+display(training_order_category_df.head())
+
+existing_labels = tables.select("""
+    SELECT training_order_id, category_id
+    FROM training_order_category
+""")
+
+new_labels = training_order_category_df.merge(
+    existing_labels,
+    on=["training_order_id", "category_id"],
+    how="left",
+    indicator=True
+)
+
+new_labels = new_labels[
+    new_labels["_merge"] == "left_only"
+].drop(columns="_merge")
+
+if not new_labels.empty:
+    tables.training_order_category.insert(new_labels)
+
+print(f"Inserted {len(new_labels):,} labels")
+
+
+tables.select("""
+    SELECT 'category' AS table_name, COUNT(*) AS records
+    FROM category
+
+    UNION ALL
+
+    SELECT 'training_orders', COUNT(*)
+    FROM training_orders
+
+    UNION ALL
+
+    SELECT 'training_order_category', COUNT(*)
+    FROM training_order_category
+""")
+
+
+
+
+
+
