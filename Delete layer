@@ -1,56 +1,24 @@
-import pandas as pd
+import duckdb
+from pathlib import Path
 
-from settings import get_settings
-from database import init_tables
+# Existing local database
+db_path = project_root / "data" / "database" / "dev.db"
 
-settings = get_settings()
-tables = init_tables(settings)
+# DDL script
+ddl_path = project_root / "src" / "sql" / "app.admin.ddl.sql"
 
+# Read SQL
+ddl = ddl_path.read_text(encoding="utf-8")
 
-file_path = r"PATH_TO_CALEBS_EXCEL_FILE.xlsx"
+# Execute against local database
+con = duckdb.connect(str(db_path))
 
-df = pd.read_excel(
-    file_path,
-    dtype={
-        "WR_ID": str,
-        "FA_ID": str,
-        "METERNO": str
-    }
-)
+try:
+    con.execute(ddl)
+    print("DDL executed successfully!")
 
-print(df.shape)
-print(df.columns.tolist())
+    # Verify tables
+    print(con.execute("SHOW TABLES").fetchall())
 
-display(df.head())
-
-categories = pd.DataFrame({
-    "code": [
-        "METER_CHANGE",
-        "BATTERY_CHANGE",
-        "BAD_LCD"
-    ],
-    "name": [
-        "Meter Change",
-        "Battery Change",
-        "Bad LCD"
-    ],
-    "description": [
-        "Manual training category",
-        "Manual training category",
-        "Manual training category"
-    ]
-})
-
-tables.category.insert(categories)
-
-category_df = tables.select("""
-    SELECT category_id, code, name
-    FROM category
-    ORDER BY category_id
-""")
-
-display(category_df)
-
-
-
-
+finally:
+    con.close()
