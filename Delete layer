@@ -1,4 +1,56 @@
-print(f"Total S4Es: {total_s4e:,}")
-print(f"Total Removed: {total_removed:,}")
-print(f"Total Remaining: {total_remaining:,}")
-print(f"Total Complete: {total_pct_complete:.1%}")
+import pandas as pd
+
+from settings import get_settings
+from database import init_tables
+
+settings = get_settings()
+tables = init_tables(settings)
+
+
+file_path = r"PATH_TO_CALEBS_EXCEL_FILE.xlsx"
+
+df = pd.read_excel(
+    file_path,
+    dtype={
+        "WR_ID": str,
+        "FA_ID": str,
+        "METERNO": str
+    }
+)
+
+print(df.shape)
+print(df.columns.tolist())
+
+display(df.head())
+
+categories = pd.DataFrame({
+    "code": [
+        "METER_CHANGE",
+        "BATTERY_CHANGE",
+        "BAD_LCD"
+    ],
+    "name": [
+        "Meter Change",
+        "Battery Change",
+        "Bad LCD"
+    ],
+    "description": [
+        "Manual training category",
+        "Manual training category",
+        "Manual training category"
+    ]
+})
+
+tables.category.insert(categories)
+
+category_df = tables.select("""
+    SELECT category_id, code, name
+    FROM category
+    ORDER BY category_id
+""")
+
+display(category_df)
+
+
+
+
