@@ -1,220 +1,404 @@
 
-category_df = pd.DataFrame({
-    "code": [
-        "BAD_LCD",
-        "METER_CHANGE",
-        "BATTERY_CHANGE"
-    ],
-    "name": [
-        "Bad LCD",
-        "Meter Change",
-        "Battery Change"
-    ],
-    "description": [
-        "Bad LCD display",
-        "Meter replacement",
-        "Battery replacement"
-    ]
-})
+import pandas as pd
+from html import escape
+from IPython.display import HTML, display
 
-display(category_df)
+# ==========================================
+# PROJECT RANGER - EMAIL REPORT
+# ==========================================
 
-tables.category.insert(category_df)
+# 1. Formatting helpers
 
-# Extract unique categories
-category_df = (
-    df[["CATEGORY"]]
-    .dropna()
-    .drop_duplicates()
-    .rename(columns={"CATEGORY": "code"})
-    .reset_index(drop=True)
+def fmt_num(value):
+    if pd.isna(value):
+        return "—"
+    return f"{float(value):,.0f}"
+
+def fmt_pct(value):
+    if pd.isna(value):
+        return "—"
+    return f"{float(value):,.1f}%"
+
+def fmt_text(value):
+    if pd.isna(value):
+        return "—"
+    return escape(str(value))
+
+
+# 2. Report date
+
+report_date = pd.Timestamp.today().strftime("%B %d, %Y")
+
+
+# 3. KPI cards
+
+kpis = [
+    ("TOTAL S4Es", fmt_num(total_s4e)),
+    ("TOTAL REMOVED", fmt_num(total_removed)),
+    ("TOTAL REMAINING", fmt_num(total_remaining)),
+    ("% COMPLETE", fmt_pct(total_pct_complete))
+]
+
+kpi_cells = ""
+
+for label, value in kpis:
+    kpi_cells += f"""
+    <td width="25%" valign="top"
+        style="padding:12px 8px;
+               border:1px solid #D9E2EA;
+               text-align:center;
+               background-color:#FFFFFF;">
+
+        <div style="font-size:11px;
+                    color:#526477;
+                    font-weight:bold;">
+            {label}
+        </div>
+
+        <div style="font-size:24px;
+                    color:#173B59;
+                    font-weight:bold;
+                    padding-top:8px;">
+            {value}
+        </div>
+    </td>
+    """
+
+kpi_html = f"""
+<table role="presentation" width="100%"
+       cellpadding="0" cellspacing="0"
+       style="border-collapse:collapse;">
+    <tr>{kpi_cells}</tr>
+</table>
+"""
+
+
+# 4. Five-year tracker
+
+tracker = report1.copy()
+
+# Format only for display, not the source DataFrame
+tracker.index = tracker.index.map(fmt_text)
+tracker.columns = tracker.columns.map(fmt_text)
+
+count_rows = [
+    "Annual Goal",
+    "Removed YTD",
+    "Remaining Annual Goal",
+    "Monthly Target",
+    "Removed This Month",
+    "Remaining Monthly Target",
+    "Avg Needed Per Remaining Month"
+]
+
+for row in tracker.index:
+    if row == "% Annual Goal Complete":
+        tracker.loc[row] = tracker.loc[row].map(fmt_pct)
+
+    elif row in count_rows:
+        tracker.loc[row] = tracker.loc[row].map(fmt_num)
+
+tracker_html = tracker.to_html(
+    index=True,
+    border=0,
+    escape=True,
+    na_rep="—"
 )
 
-# Use category code as display name for now
-category_df["name"] = category_df["code"]
 
-# Match database columns
-category_df = category_df[["code", "name"]]
+# 5. Inventory tracker
 
-display(category_df)
+inventory = stock.copy()
 
-existing = tables.select("""
-    SELECT code FROM category
-""")
+inventory.columns = (
+    inventory.columns
+    .str.strip()
+    .str.lower()
+)
 
-category_df = category_df[
-    ~category_df["code"].isin(existing["code"])
-]
+inventory = inventory[
+    ["class", "form", "volt", "stock_amount"]
+].copy()
 
-if not category_df.empty:
-    tables.category.insert(category_df)
-
-
-training_orders_df = df.rename(columns={
-    "WR_ID": "wr_id",
-    "FA_ID": "fa_id",
-    "WR_STATUS_UPD_DTTM": "wr_status_upd_dttm",
-    "COMMENTS": "comments",
-    "INSTRUCTIONS": "instructions"
-}).copy()
-
-# Select database columns
-training_orders_df = training_orders_df[
-    [
-        "wr_id",
-        "fa_id",
-        "wr_status_upd_dttm",
-        "comments",
-        "instructions"
-    ]
-]
-
-# Clean required fields
-training_orders_df["wr_id"] = training_orders_df["wr_id"].astype("string")
-training_orders_df["fa_id"] = training_orders_df["fa_id"].astype("string")
-
-training_orders_df["wr_status_upd_dttm"] = pd.to_datetime(
-    training_orders_df["wr_status_upd_dttm"],
+inventory["stock_amount"] = pd.to_numeric(
+    inventory["stock_amount"],
     errors="coerce"
+).fillna(0)
+
+inventory = (
+    inventory
+    .groupby(
+        ["class", "form", "volt"],
+        dropna=False,
+        as_index=False
+    )["stock_amount"]
+    .sum()
 )
 
-training_orders_df["comments"] = (
-    training_orders_df["comments"].fillna("")
+inventory = inventory.sort_values(
+    ["class", "form", "volt"],
+    key=lambda col: col.astype(str)
 )
 
-training_orders_df["instructions"] = (
-    training_orders_df["instructions"].fillna("")
+total_stock = inventory["stock_amount"].sum()
+
+inventory["stock_amount"] = inventory["stock_amount"].map(fmt_num)
+
+inventory.columns = [
+    "Class",
+    "Form",
+    "Voltage",
+    "Available Stock"
+]
+
+inventory_html = inventory.to_html(
+    index=False,
+    border=0,
+    escape=True
 )
 
-# Business key must be unique
-training_orders_df = training_orders_df.drop_duplicates(
-    subset=["wr_id", "fa_id"]
+
+# 6. Shared table styling
+
+table_css = """
+    border-collapse:collapse;
+    width:100%;
+    font-family:Arial,sans-serif;
+    font-size:12px;
+    color:#243746;
+"""
+
+# Apply inline styles to pandas-generated tables
+def style_table(html):
+    html = html.replace(
+        '<table border="0" class="dataframe">',
+        f'<table role="presentation" style="{table_css}">'
+    )
+
+    html = html.replace(
+        "<th>",
+        '<th style="background-color:#E8EFF5;'
+        'color:#173B59;padding:10px 7px;'
+        'border:1px solid #D5DFE8;'
+        'text-align:center;">'
+    )
+
+    html = html.replace(
+        "<td>",
+        '<td style="padding:9px 7px;'
+        'border:1px solid #D5DFE8;'
+        'background-color:#FFFFFF;'
+        'color:#243746;text-align:center;">'
+    )
+
+    return html
+
+tracker_html = style_table(tracker_html)
+inventory_html = style_table(inventory_html)
+
+
+# 7. Final email body
+
+email_html = f"""
+<html>
+<body style="margin:0;padding:0;
+             font-family:Arial,sans-serif;
+             color:#243746;
+             background-color:#FFFFFF;">
+
+<table role="presentation" width="100%"
+       cellpadding="0" cellspacing="0"
+       style="border-collapse:collapse;
+              background-color:#FFFFFF;">
+
+<tr>
+<td align="center">
+
+<table role="presentation" width="900"
+       cellpadding="0" cellspacing="0"
+       style="width:100%;max-width:900px;
+              border-collapse:collapse;">
+
+<!-- HEADER -->
+<tr>
+<td style="background-color:#173B59;
+           padding:22px 20px;
+           border-bottom:4px solid #287E9A;">
+
+    <div style="font-size:22px;
+                font-weight:bold;
+                color:#FFFFFF;">
+        PROJECT RANGER
+    </div>
+
+    <div style="font-size:13px;
+                color:#E0EBF4;
+                padding-top:5px;">
+        S4E Meter Removal Progress
+    </div>
+
+    <div style="font-size:11px;
+                color:#E0EBF4;
+                padding-top:8px;">
+        Updated through {report_date}
+    </div>
+
+</td>
+</tr>
+
+<!-- KPI HEADER -->
+<tr>
+<td style="padding:22px 0;">
+    {kpi_html}
+</td>
+</tr>
+
+<!-- FIVE-YEAR TRACKER -->
+<tr>
+<td style="padding:8px 0 24px 0;">
+
+    <h2 style="font-size:17px;
+               color:#173B59;
+               margin:0 0 6px 0;">
+        Five-Year Removal Tracker
+    </h2>
+
+    <p style="font-size:12px;
+              color:#526477;
+              margin:0 0 14px 0;">
+        Annual removal target: 13,000 S4E meters.
+        Progress is measured against each year's goal.
+    </p>
+
+    {tracker_html}
+
+</td>
+</tr>
+
+<!-- INVENTORY SECTION -->
+<tr>
+<td style="padding:12px 0 24px 0;
+           border-top:2px solid #D9E2EA;">
+
+    <h2 style="font-size:17px;
+               color:#173B59;
+               margin:0 0 6px 0;">
+        Replacement Meter Inventory
+    </h2>
+
+    <p style="font-size:12px;
+              color:#526477;
+              margin:0 0 14px 0;">
+        Current available stock by meter class,
+        form and voltage.
+    </p>
+
+    <table role="presentation" width="100%"
+           style="border-collapse:collapse;
+                  margin-bottom:14px;">
+        <tr>
+            <td style="padding:12px;
+                       border:1px solid #D9E2EA;
+                       background-color:#E8EFF5;">
+
+                <span style="font-size:12px;
+                             color:#526477;">
+                    TOTAL AVAILABLE INVENTORY
+                </span>
+
+                <br>
+
+                <strong style="font-size:22px;
+                               color:#173B59;">
+                    {fmt_num(total_stock)}
+                </strong>
+
+            </td>
+        </tr>
+    </table>
+
+    {inventory_html}
+
+</td>
+</tr>
+
+<!-- FOOTER -->
+<tr>
+<td style="border-top:1px solid #D9E2EA;
+           padding:15px 0;
+           font-size:11px;
+           color:#526477;">
+
+    Project Ranger | S4E Removal Progress Report
+    <br>
+    Inventory reflects the latest available stock snapshot.
+    <br>
+    This is an automated reporting summary.
+
+</td>
+</tr>
+
+</table>
+</td>
+</tr>
+</table>
+
+</body>
+</html>
+"""
+
+# 8. Preview inside Jupyter
+
+display(HTML(email_html))
+
+from pathlib import Path
+
+Path("project_ranger_email.html").write_text(
+    email_html,
+    encoding="utf-8"
 )
 
-display(training_orders_df.head())
+from email.message import EmailMessage
 
+msg = EmailMessage()
 
-existing_orders = tables.select("""
-    SELECT wr_id, fa_id
-    FROM training_orders
-""")
-
-new_orders = training_orders_df.merge(
-    existing_orders,
-    on=["wr_id", "fa_id"],
-    how="left",
-    indicator=True
+msg["Subject"] = (
+    f"Project Ranger | S4E Removal Progress | {report_date}"
 )
 
-new_orders = new_orders[
-    new_orders["_merge"] == "left_only"
-].drop(columns="_merge")
-
-if not new_orders.empty:
-    tables.training_orders.insert(new_orders)
-
-print(f"Inserted {len(new_orders):,} training orders")
-
-# Retrieve generated IDs
-category_lookup = tables.select("""
-    SELECT category_id, code
-    FROM category
-""")
-
-order_lookup = tables.select("""
-    SELECT training_order_id, wr_id, fa_id
-    FROM training_orders
-""")
-
-# Start with original Excel data
-labels_df = df.rename(columns={
-    "WR_ID": "wr_id",
-    "FA_ID": "fa_id",
-    "CATEGORY": "code"
-}).copy()
-
-labels_df["wr_id"] = labels_df["wr_id"].astype("string")
-labels_df["fa_id"] = labels_df["fa_id"].astype("string")
-
-# Match generated training_order_id
-labels_df = labels_df.merge(
-    order_lookup,
-    on=["wr_id", "fa_id"],
-    how="left",
-    validate="many_to_one"
+msg.set_content(
+    "Please view this email in an HTML-compatible email client."
 )
 
-# Match generated category_id
-labels_df = labels_df.merge(
-    category_lookup,
-    on="code",
-    how="left",
-    validate="many_to_one"
-)
-
-# Assigned category = positive label
-labels_df["manual_label"] = 1
-
-# Keep database columns
-training_order_category_df = labels_df[
-    [
-        "training_order_id",
-        "category_id",
-        "manual_label"
-    ]
-].drop_duplicates()
-
-# Check IDs before inserting
-assert training_order_category_df[
-    ["training_order_id", "category_id"]
-].notna().all().all(), "Some records could not be matched to an ID."
-
-# Check for conflicting labels on the same order/category
-assert not training_order_category_df.duplicated(
-    ["training_order_id", "category_id"]
-).any(), "Duplicate order/category combinations found."
-
-display(training_order_category_df.head())
-
-existing_labels = tables.select("""
-    SELECT training_order_id, category_id
-    FROM training_order_category
-""")
-
-new_labels = training_order_category_df.merge(
-    existing_labels,
-    on=["training_order_id", "category_id"],
-    how="left",
-    indicator=True
-)
-
-new_labels = new_labels[
-    new_labels["_merge"] == "left_only"
-].drop(columns="_merge")
-
-if not new_labels.empty:
-    tables.training_order_category.insert(new_labels)
-
-print(f"Inserted {len(new_labels):,} labels")
-
-
-tables.select("""
-    SELECT 'category' AS table_name, COUNT(*) AS records
-    FROM category
-
-    UNION ALL
-
-    SELECT 'training_orders', COUNT(*)
-    FROM training_orders
-
-    UNION ALL
-
-    SELECT 'training_order_category', COUNT(*)
-    FROM training_order_category
-""")
+msg.add_alternative(email_html, subtype="html")
 
 
 
+import win32com.client as win32
+import pandas as pd
+
+# Connect to your installed Outlook application
+outlook = win32.Dispatch("Outlook.Application")
+
+# Create a new email
+mail = outlook.CreateItem(0)
+
+# Email recipients
+mail.To = "recipient@oncor.com"
+
+# Optional CC
+mail.CC = ""
+
+# Email subject
+report_date = pd.Timestamp.today().strftime("%B %d, %Y")
+
+mail.Subject = f"Project Ranger | S4E Removal Progress | {report_date}"
+
+# Insert the HTML report we created
+mail.HTMLBody = email_html
+
+# Open the email in Outlook for review
+mail.Display()
 
 
 
