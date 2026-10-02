@@ -1,404 +1,66 @@
 
-import pandas as pd
-from html import escape
-from IPython.display import HTML, display
+def style_table(html):
 
-# ==========================================
-# PROJECT RANGER - EMAIL REPORT
-# ==========================================
-
-# 1. Formatting helpers
-
-def fmt_num(value):
-    if pd.isna(value):
-        return "—"
-    return f"{float(value):,.0f}"
-
-def fmt_pct(value):
-    if pd.isna(value):
-        return "—"
-    return f"{float(value):,.1f}%"
-
-def fmt_text(value):
-    if pd.isna(value):
-        return "—"
-    return escape(str(value))
-
-
-# 2. Report date
-
-report_date = pd.Timestamp.today().strftime("%B %d, %Y")
-
-
-# 3. KPI cards
-
-kpis = [
-    ("TOTAL S4Es", fmt_num(total_s4e)),
-    ("TOTAL REMOVED", fmt_num(total_removed)),
-    ("TOTAL REMAINING", fmt_num(total_remaining)),
-    ("% COMPLETE", fmt_pct(total_pct_complete))
-]
-
-kpi_cells = ""
-
-for label, value in kpis:
-    kpi_cells += f"""
-    <td width="25%" valign="top"
-        style="padding:12px 8px;
-               border:1px solid #D9E2EA;
-               text-align:center;
-               background-color:#FFFFFF;">
-
-        <div style="font-size:11px;
-                    color:#526477;
-                    font-weight:bold;">
-            {label}
-        </div>
-
-        <div style="font-size:24px;
-                    color:#173B59;
-                    font-weight:bold;
-                    padding-top:8px;">
-            {value}
-        </div>
-    </td>
+    table_css = """
+        width:100%;
+        max-width:900px;
+        border-collapse:collapse;
+        table-layout:fixed;
+        margin:0 auto;
+        font-family:Arial,sans-serif;
+        font-size:12px;
+        color:#243746;
     """
 
-kpi_html = f"""
-<table role="presentation" width="100%"
-       cellpadding="0" cellspacing="0"
-       style="border-collapse:collapse;">
-    <tr>{kpi_cells}</tr>
-</table>
-"""
-
-
-# 4. Five-year tracker
-
-tracker = report1.copy()
-
-# Format only for display, not the source DataFrame
-tracker.index = tracker.index.map(fmt_text)
-tracker.columns = tracker.columns.map(fmt_text)
-
-count_rows = [
-    "Annual Goal",
-    "Removed YTD",
-    "Remaining Annual Goal",
-    "Monthly Target",
-    "Removed This Month",
-    "Remaining Monthly Target",
-    "Avg Needed Per Remaining Month"
-]
-
-for row in tracker.index:
-    if row == "% Annual Goal Complete":
-        tracker.loc[row] = tracker.loc[row].map(fmt_pct)
-
-    elif row in count_rows:
-        tracker.loc[row] = tracker.loc[row].map(fmt_num)
-
-tracker_html = tracker.to_html(
-    index=True,
-    border=0,
-    escape=True,
-    na_rep="—"
-)
-
-
-# 5. Inventory tracker
-
-inventory = stock.copy()
-
-inventory.columns = (
-    inventory.columns
-    .str.strip()
-    .str.lower()
-)
-
-inventory = inventory[
-    ["class", "form", "volt", "stock_amount"]
-].copy()
-
-inventory["stock_amount"] = pd.to_numeric(
-    inventory["stock_amount"],
-    errors="coerce"
-).fillna(0)
-
-inventory = (
-    inventory
-    .groupby(
-        ["class", "form", "volt"],
-        dropna=False,
-        as_index=False
-    )["stock_amount"]
-    .sum()
-)
-
-inventory = inventory.sort_values(
-    ["class", "form", "volt"],
-    key=lambda col: col.astype(str)
-)
-
-total_stock = inventory["stock_amount"].sum()
-
-inventory["stock_amount"] = inventory["stock_amount"].map(fmt_num)
-
-inventory.columns = [
-    "Class",
-    "Form",
-    "Voltage",
-    "Available Stock"
-]
-
-inventory_html = inventory.to_html(
-    index=False,
-    border=0,
-    escape=True
-)
-
-
-# 6. Shared table styling
-
-table_css = """
-    border-collapse:collapse;
-    width:100%;
-    font-family:Arial,sans-serif;
-    font-size:12px;
-    color:#243746;
-"""
-
-# Apply inline styles to pandas-generated tables
-def style_table(html):
     html = html.replace(
         '<table border="0" class="dataframe">',
-        f'<table role="presentation" style="{table_css}">'
+        f'<table role="presentation" width="100%" '
+        f'align="center" style="{table_css}">'
     )
 
     html = html.replace(
         "<th>",
         '<th style="background-color:#E8EFF5;'
-        'color:#173B59;padding:10px 7px;'
+        'color:#173B59;'
+        'padding:10px 7px;'
         'border:1px solid #D5DFE8;'
-        'text-align:center;">'
+        'text-align:center;'
+        'vertical-align:middle;'
+        'overflow-wrap:break-word;">'
     )
 
     html = html.replace(
         "<td>",
-        '<td style="padding:9px 7px;'
+        '<td style="padding:10px 7px;'
         'border:1px solid #D5DFE8;'
         'background-color:#FFFFFF;'
-        'color:#243746;text-align:center;">'
+        'color:#243746;'
+        'text-align:center;'
+        'vertical-align:middle;">'
     )
 
     return html
 
-tracker_html = style_table(tracker_html)
+
+def style_tracker(html):
+
+    html = html.replace(
+        "<table ",
+        '<table ',
+        1
+    )
+
+    # Give the first column more room
+    html = html.replace(
+        '<th style="',
+        '<th width="30%" style="',
+        1
+    )
+
+    return html
+
+tracker_html = style_tracker(
+    style_table(tracker_html)
+)
+
 inventory_html = style_table(inventory_html)
-
-
-# 7. Final email body
-
-email_html = f"""
-<html>
-<body style="margin:0;padding:0;
-             font-family:Arial,sans-serif;
-             color:#243746;
-             background-color:#FFFFFF;">
-
-<table role="presentation" width="100%"
-       cellpadding="0" cellspacing="0"
-       style="border-collapse:collapse;
-              background-color:#FFFFFF;">
-
-<tr>
-<td align="center">
-
-<table role="presentation" width="900"
-       cellpadding="0" cellspacing="0"
-       style="width:100%;max-width:900px;
-              border-collapse:collapse;">
-
-<!-- HEADER -->
-<tr>
-<td style="background-color:#173B59;
-           padding:22px 20px;
-           border-bottom:4px solid #287E9A;">
-
-    <div style="font-size:22px;
-                font-weight:bold;
-                color:#FFFFFF;">
-        PROJECT RANGER
-    </div>
-
-    <div style="font-size:13px;
-                color:#E0EBF4;
-                padding-top:5px;">
-        S4E Meter Removal Progress
-    </div>
-
-    <div style="font-size:11px;
-                color:#E0EBF4;
-                padding-top:8px;">
-        Updated through {report_date}
-    </div>
-
-</td>
-</tr>
-
-<!-- KPI HEADER -->
-<tr>
-<td style="padding:22px 0;">
-    {kpi_html}
-</td>
-</tr>
-
-<!-- FIVE-YEAR TRACKER -->
-<tr>
-<td style="padding:8px 0 24px 0;">
-
-    <h2 style="font-size:17px;
-               color:#173B59;
-               margin:0 0 6px 0;">
-        Five-Year Removal Tracker
-    </h2>
-
-    <p style="font-size:12px;
-              color:#526477;
-              margin:0 0 14px 0;">
-        Annual removal target: 13,000 S4E meters.
-        Progress is measured against each year's goal.
-    </p>
-
-    {tracker_html}
-
-</td>
-</tr>
-
-<!-- INVENTORY SECTION -->
-<tr>
-<td style="padding:12px 0 24px 0;
-           border-top:2px solid #D9E2EA;">
-
-    <h2 style="font-size:17px;
-               color:#173B59;
-               margin:0 0 6px 0;">
-        Replacement Meter Inventory
-    </h2>
-
-    <p style="font-size:12px;
-              color:#526477;
-              margin:0 0 14px 0;">
-        Current available stock by meter class,
-        form and voltage.
-    </p>
-
-    <table role="presentation" width="100%"
-           style="border-collapse:collapse;
-                  margin-bottom:14px;">
-        <tr>
-            <td style="padding:12px;
-                       border:1px solid #D9E2EA;
-                       background-color:#E8EFF5;">
-
-                <span style="font-size:12px;
-                             color:#526477;">
-                    TOTAL AVAILABLE INVENTORY
-                </span>
-
-                <br>
-
-                <strong style="font-size:22px;
-                               color:#173B59;">
-                    {fmt_num(total_stock)}
-                </strong>
-
-            </td>
-        </tr>
-    </table>
-
-    {inventory_html}
-
-</td>
-</tr>
-
-<!-- FOOTER -->
-<tr>
-<td style="border-top:1px solid #D9E2EA;
-           padding:15px 0;
-           font-size:11px;
-           color:#526477;">
-
-    Project Ranger | S4E Removal Progress Report
-    <br>
-    Inventory reflects the latest available stock snapshot.
-    <br>
-    This is an automated reporting summary.
-
-</td>
-</tr>
-
-</table>
-</td>
-</tr>
-</table>
-
-</body>
-</html>
-"""
-
-# 8. Preview inside Jupyter
-
-display(HTML(email_html))
-
-from pathlib import Path
-
-Path("project_ranger_email.html").write_text(
-    email_html,
-    encoding="utf-8"
-)
-
-from email.message import EmailMessage
-
-msg = EmailMessage()
-
-msg["Subject"] = (
-    f"Project Ranger | S4E Removal Progress | {report_date}"
-)
-
-msg.set_content(
-    "Please view this email in an HTML-compatible email client."
-)
-
-msg.add_alternative(email_html, subtype="html")
-
-
-
-import win32com.client as win32
-import pandas as pd
-
-# Connect to your installed Outlook application
-outlook = win32.Dispatch("Outlook.Application")
-
-# Create a new email
-mail = outlook.CreateItem(0)
-
-# Email recipients
-mail.To = "recipient@oncor.com"
-
-# Optional CC
-mail.CC = ""
-
-# Email subject
-report_date = pd.Timestamp.today().strftime("%B %d, %Y")
-
-mail.Subject = f"Project Ranger | S4E Removal Progress | {report_date}"
-
-# Insert the HTML report we created
-mail.HTMLBody = email_html
-
-# Open the email in Outlook for review
-mail.Display()
-
-
-
