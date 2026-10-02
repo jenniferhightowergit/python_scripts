@@ -1,66 +1,12 @@
-
-def style_table(html):
-
-    table_css = """
-        width:100%;
-        max-width:900px;
-        border-collapse:collapse;
-        table-layout:fixed;
-        margin:0 auto;
-        font-family:Arial,sans-serif;
-        font-size:12px;
-        color:#243746;
-    """
-
-    html = html.replace(
-        '<table border="0" class="dataframe">',
-        f'<table role="presentation" width="100%" '
-        f'align="center" style="{table_css}">'
-    )
-
-    html = html.replace(
-        "<th>",
-        '<th style="background-color:#E8EFF5;'
-        'color:#173B59;'
-        'padding:10px 7px;'
-        'border:1px solid #D5DFE8;'
-        'text-align:center;'
-        'vertical-align:middle;'
-        'overflow-wrap:break-word;">'
-    )
-
-    html = html.replace(
-        "<td>",
-        '<td style="padding:10px 7px;'
-        'border:1px solid #D5DFE8;'
-        'background-color:#FFFFFF;'
-        'color:#243746;'
-        'text-align:center;'
-        'vertical-align:middle;">'
-    )
-
-    return html
-
-
-def style_tracker(html):
-
-    html = html.replace(
-        "<table ",
-        '<table ',
-        1
-    )
-
-    # Give the first column more room
-    html = html.replace(
-        '<th style="',
-        '<th width="30%" style="',
-        1
-    )
-
-    return html
-
-tracker_html = style_tracker(
-    style_table(tracker_html)
-)
-
-inventory_html = style_table(inventory_html)
+round(
+    changed_ytd /
+    nullif(
+        date_diff(
+            'month',
+            date_trunc('year', work_week),
+            date_trunc('month', work_week)
+        ) + 1,
+        0
+    ),
+    1
+) as avg_changed_per_month
