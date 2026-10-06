@@ -1,33 +1,27 @@
-cleaned_df = df[[
-    "WR_ID",
-    "FA_ID",
-    "cleaned_comment",
-    "INSTRUCTIONS"
-]].copy()
+import duckdb
 
-cleaned_df = cleaned_df.rename(columns={
-    "WR_ID": "wr_id",
-    "FA_ID": "fa_id",
-    "cleaned_comment": "cleaned_comments",
-    "INSTRUCTIONS": "cleaned_instructions"
-})
+db_path = project_root / "data" / "database" / "dev.db"
 
-cleaned_df = cleaned_df.merge(
-    order_ids_df,
-    on=["wr_id", "fa_id"],
-    how="inner"
-)
+con = duckdb.connect(str(db_path))
 
-cleaned_df.shape
+con.register("cleaned_df", cleaned_df)
 
-cleaned_df = cleaned_df[[
-    "training_order_id",
-    "cleaned_comments",
-    "cleaned_instructions"
-]]
+con.execute("""
+    INSERT INTO training_cleaned_text (
+        training_order_id,
+        cleaned_comments,
+        cleaned_instructions
+    )
+    SELECT
+        training_order_id,
+        cleaned_comments,
+        cleaned_instructions
+    FROM cleaned_df
+""")
 
-cleaned_df["cleaned_comments"] = cleaned_df["cleaned_comments"].fillna("")
-cleaned_df["cleaned_instructions"] = cleaned_df["cleaned_instructions"].fillna("")
+con.close()
 
-cleaned_df.head()
-
+tables.select("""
+    SELECT COUNT(*) AS row_count
+    FROM training_cleaned_text
+""")
