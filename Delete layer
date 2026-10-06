@@ -1,22 +1,34 @@
-training_category_df = labels_df.melt(
-    id_vars=["training_order_id"],
-    value_vars=list(category_map.keys()),
-    var_name="category",
-    value_name="manual_label"
-)
+import duckdb
 
-training_category_df["category_id"] = (
-    training_category_df["category"].map(category_map)
-)
+db_path = project_root / "data" / "database" / "dev.db"
 
-training_category_df = training_category_df[[
-    "training_order_id",
-    "category_id",
-    "manual_label"
-]]
+con = duckdb.connect(str(db_path))
 
-training_category_df["manual_label"] = (
-    training_category_df["manual_label"]
-    .fillna(0)
-    .astype(int)
-)
+con.register("training_category_df", training_category_df)
+
+con.execute("""
+    INSERT INTO training_category (
+        training_order_id,
+        category_id,
+        manual_label
+    )
+    SELECT
+        training_order_id,
+        category_id,
+        manual_label
+    FROM training_category_df
+""")
+
+con.close()
+
+tables.select("""
+    SELECT *
+    FROM training_category
+    ORDER BY training_order_id, category_id
+    LIMIT 20
+""")
+
+tables.select("""
+    SELECT COUNT(*) AS row_count
+    FROM training_category
+""")
