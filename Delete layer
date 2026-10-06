@@ -1,5 +1,8 @@
 import duckdb
 
+training_orders_df["comments"] = training_orders_df["comments"].fillna("")
+training_orders_df["instructions"] = training_orders_df["instructions"].fillna("")
+
 con = duckdb.connect(str(db_path))
 
 con.register("training_orders_df", training_orders_df)
