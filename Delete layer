@@ -1,34 +1,32 @@
+training_orders_df["comments"] = (
+    training_orders_df["comments"].fillna("")
+)
+
+training_orders_df["instructions"] = (
+    training_orders_df["instructions"].fillna("")
+)
+
 import duckdb
 
 db_path = project_root / "data" / "database" / "dev.db"
 
 con = duckdb.connect(str(db_path))
 
-con.register("training_category_df", training_category_df)
+con.register("training_orders_df", training_orders_df)
 
 con.execute("""
-    INSERT INTO training_category (
-        training_order_id,
-        category_id,
-        manual_label
+    INSERT INTO training_orders (
+        wr_id,
+        fa_id,
+        comments,
+        instructions
     )
     SELECT
-        training_order_id,
-        category_id,
-        manual_label
-    FROM training_category_df
+        wr_id,
+        fa_id,
+        comments,
+        instructions
+    FROM training_orders_df
 """)
 
 con.close()
-
-tables.select("""
-    SELECT *
-    FROM training_category
-    ORDER BY training_order_id, category_id
-    LIMIT 20
-""")
-
-tables.select("""
-    SELECT COUNT(*) AS row_count
-    FROM training_category
-""")
