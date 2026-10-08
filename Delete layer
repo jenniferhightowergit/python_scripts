@@ -1,102 +1,115 @@
-# Keep Texas places
-texas_places = places[
-    places["STATEFP"].astype(str).str.zfill(2) == "48"
-].copy()
+from pathlib import Path
 
-# Match the coordinate system of our map
-texas_places = texas_places.to_crs(texas.crs)
+output_dir = Path(r"C:\Users\UIX9\Documents\ForMapping")
+output_dir.mkdir(parents=True, exist_ok=True)
 
-# Calculate a representative point for each city
-# Use a projected CRS for geographic calculations
-places_projected = texas_places.to_crs(epsg=3083)
+map_path = output_dir / "dgroup_map.png"
 
-places_projected["geometry"] = (
-    places_projected.geometry.representative_point()
-)
-
-city_points = places_projected.to_crs(texas.crs)
-
-print("Texas places:", len(city_points))
-display(city_points[["NAME", "geometry"]].head())
-
-major_cities = [
-    "Dallas",
-    "Fort Worth",
-    "Wichita Falls",
-    "Abilene",
-    "Waco",
-    "Austin",
-    "Houston",
-    "San Antonio",
-    "Lubbock",
-    "Amarillo",
-    "Tyler",
-    "Odessa",
-    "Midland",
-    "El Paso"
-]
-
-cities_to_plot = city_points[
-    city_points["NAME"].isin(major_cities)
-].copy()
-
-print(cities_to_plot["NAME"].tolist())
-
-fig, ax = plt.subplots(figsize=(16, 12))
-
-# Texas background
-texas.plot(
-    ax=ax,
-    color="whitesmoke",
-    edgecolor="black",
-    linewidth=1.2
-)
-
-# County boundaries
-texas_counties.boundary.plot(
-    ax=ax,
-    color="lightgray",
-    linewidth=0.5
-)
-
-# DGROUP territories
-regions_clipped.to_crs(texas.crs).plot(
-    ax=ax,
-    column="DGROUP",
-    categorical=True,
-    cmap="tab20",
-    legend=True,
-    alpha=0.4,
-    edgecolor="black",
-    linewidth=0.8
-)
-
-# City markers
-cities_to_plot.plot(
-    ax=ax,
-    color="black",
-    markersize=14,
-    zorder=5
-)
-
-# City labels
-for _, city in cities_to_plot.iterrows():
-    ax.annotate(
-        city["NAME"],
-        xy=(city.geometry.x, city.geometry.y),
-        xytext=(4, 4),
-        textcoords="offset points",
-        fontsize=8,
-        color="black",
-        zorder=6
-    )
-
-ax.set_title(
-    "Texas DGROUP Service Territories",
-    fontsize=18
-)
-
-ax.set_axis_off()
 plt.tight_layout()
+
+fig.savefig(
+    map_path,
+    dpi=160,
+    bbox_inches="tight",
+    facecolor="white"
+)
+
 plt.show()
+
+import pandas as pd
+
+# Tableau-style cross-tab
+hardware_pivot = pd.pivot_table(
+    for_allHardware,
+    index=["Hardware_Model", "INSTR_RATED"],
+    columns="DGROUP",
+    values="Meter_Count",
+    aggfunc="sum",
+    fill_value=0
+)
+
+# Optional grand total
+hardware_pivot["Grand Total"] = hardware_pivot.sum(axis=1)
+
+# Format with commas for display
+hardware_display = hardware_pivot.map(
+    lambda x: f"{x:,.0f}"
+)
+
+display(hardware_display)
+
+
+hardware_html = (
+    hardware_display
+    .style
+    .set_table_styles([
+        {
+            "selector": "table",
+            "props": [
+                ("border-collapse", "collapse"),
+                ("font-family", "Arial, sans-serif"),
+                ("font-size", "11px"),
+                ("width", "100%")
+            ]
+        },
+        {
+            "selector": "th",
+            "props": [
+                ("background-color", "#243b53"),
+                ("color", "white"),
+                ("padding", "7px"),
+                ("border", "1px solid #dddddd"),
+                ("text-align", "center")
+            ]
+        },
+        {
+            "selector": "td",
+            "props": [
+                ("padding", "6px"),
+                ("border", "1px solid #dddddd"),
+                ("text-align", "right")
+            ]
+        }
+    ])
+    .to_html()
+)
+
+
+html_report = f"""
+<html>
+<body style="margin:0; padding:20px; background-color:#ffffff;
+             font-family:Arial,sans-serif;">
+
+    <div style="max-width:1100px; margin:auto;">
+
+        <h2 style="color:#243b53; text-align:center;">
+            AMS Hardware Distribution Report
+        </h2>
+
+        <p style="text-align:center; color:#666666;">
+            DGROUP Service Territory Overview
+        </p>
+
+        <h3 style="color:#243b53;">Service Territory Map</h3>
+
+        <img src="cid:dgroup_map"
+             style="width:100%; max-width:1000px; height:auto;">
+
+        <h3 style="color:#243b53;">
+            Hardware Inventory by DGROUP
+        </h3>
+
+        {hardware_html}
+
+    </div>
+
+</body>
+</html>
+"""
+
+from IPython.display import HTML, display
+
+display(HTML(hardware_html))
+
+
 
