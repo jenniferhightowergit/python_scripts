@@ -1,25 +1,38 @@
-fig, ax = plt.subplots(figsize=(15, 11))
+import geopandas as gpd
+import matplotlib.pyplot as plt
 
-regions_map.plot(
+# Read state boundary file
+states = gpd.read_file("your_state_shapefile.shp")
+
+# Select Texas
+texas = states[states["NAME"] == "Texas"]
+
+# Make sure our data uses same coordinate system
+regions_tx = regions.to_crs(texas.crs)
+
+fig, ax = plt.subplots(figsize=(14, 12))
+
+# Texas background
+texas.plot(
+    ax=ax,
+    facecolor="whitesmoke",
+    edgecolor="black",
+    linewidth=1.5
+)
+
+# DGROUP territories
+regions_tx.plot(
     ax=ax,
     column="DGROUP",
     categorical=True,
     legend=True,
     edgecolor="black",
-    linewidth=1,
-    alpha=0.50
-)
-
-ctx.add_basemap(
-    ax,
-    source=ctx.providers.OpenStreetMap.Mapnik
+    linewidth=0.8,
+    alpha=0.60
 )
 
 ax.set_axis_off()
-ax.set_title(
-    "DGROUP Service Territories",
-    fontsize=18
-)
+ax.set_title("DGROUP Service Territories", fontsize=18)
 
 plt.tight_layout()
 plt.show()
