@@ -1,394 +1,43 @@
-# If needed, run once:
-# %pip install pywin32
+project_progress AS (
+    SELECT
+        60607 AS total_s4e,  -- TEMPORARY: replace with KPI source
+        COALESCE(SUM(Removed_YTD), 0) AS total_removed
+    FROM year_totals
+),
+
+dynamic_goals AS (
+    SELECT
+        y.report_year,
+
+        CASE
+            WHEN y.report_year = year(current_date)
+                THEN p.annual_goal
+
+            WHEN y.report_year > year(current_date)
+                THEN CEIL(
+                    GREATEST(
+                        pp.total_s4e
+                        - pp.total_removed
+                        - GREATEST(
+                            p.annual_goal - COALESCE(c.Removed_YTD, 0),
+                            0
+                        ),
+                        0
+                    ) * 1.0
+                    / NULLIF(
+                        p.project_end_year - year(current_date),
+                        0
+                    )
+                )
+
+            ELSE p.annual_goal
+        END AS Adjusted_Annual_Goal
+
+    FROM years y
+    CROSS JOIN params p
+    CROSS JOIN project_progress pp
+    LEFT JOIN year_totals c
+        ON c.REMOVAL_YEAR = year(current_date)
+),
 
-import pandas as pd
-from pathlib import Path
-from datetime import datetime
-from html import escape
-from IPython.display import HTML, display
-
-# --------------------------------------------------
-# 1. SETTINGS
-# --------------------------------------------------
-
-output_dir = Path(r"C:\Users\UIX9\Documents\ForMapping")
-output_dir.mkdir(parents=True, exist_ok=True)
-
-map_path = output_dir / "dgroup_map.png"
-preview_path = output_dir / "hardware_report_preview.html"
-
-report_date = datetime.now().strftime("%B %d, %Y")
-
-# Save the map from your existing Matplotlib figure
-fig.savefig(
-    map_path,
-    dpi=160,
-    bbox_inches="tight",
-    facecolor="white"
-)
-
-# --------------------------------------------------
-# 2. PREPARE DATA
-# --------------------------------------------------
-
-df = for_allHardware.copy()
-
-df["Hardware_Model"] = df["Hardware_Model"].fillna("Unknown")
-df["DGROUP"] = df["DGROUP"].fillna("Unassigned")
-df["INSTR_RATED"] = df["INSTR_RATED"].fillna("Unknown")
-
-df["Meter_Count"] = pd.to_numeric(
-    df["Meter_Count"],
-    errors="coerce"
-).fillna(0)
-
-# Build Tableau-style pivot
-hardware_pivot = pd.pivot_table(
-    df,
-    index=["Hardware_Model", "INSTR_RATED"],
-    columns="DGROUP",
-    values="Meter_Count",
-    aggfunc="sum",
-    fill_value=0
-)
-
-# Sort DGROUP columns
-hardware_pivot = hardware_pivot.reindex(
-    sorted(hardware_pivot.columns),
-    axis=1
-)
-
-# Add total column
-hardware_pivot["Grand Total"] = hardware_pivot.sum(axis=1)
-
-# Add total row
-total_row = hardware_pivot.sum(axis=0)
-
-hardware_pivot.loc[
-    ("Grand Total", ""),
-    :
-] = total_row
-
-# Report metrics
-total_meters = int(df["Meter_Count"].sum())
-total_dgroups = df["DGROUP"].nunique()
-total_models = df["Hardware_Model"].nunique()
-
-# Note: total_meters sums grouped distinct counts.
-# It assumes a meter is not counted in multiple groups.
-
-# --------------------------------------------------
-# 3. BUILD TABLE HTML
-# --------------------------------------------------
-
-headers = ["Hardware Model", "Instr Rated"] + list(
-    hardware_pivot.columns
-)
-
-header_html = "".join(
-    f"""
-    <th style="
-        background-color:#203A53;
-        color:#ffffff;
-        padding:9px 7px;
-        border:1px solid #d7e0e8;
-        text-align:center;
-        white-space:nowrap;
-        font-size:11px;
-    ">{escape(str(h))}</th>
-    """
-    for h in headers
-)
-
-body_rows = []
-
-previous_model = None
-
-for (model, rated), row in hardware_pivot.iterrows():
-
-    is_total = model == "Grand Total"
-
-    background = (
-        "#DCE8F2" if is_total
-        else "#F2F6FA" if rated == "Y"
-        else "#FFFFFF"
-    )
-
-    weight = "bold" if is_total else "normal"
-
-    # Show hardware model only once for consecutive rows
-    model_display = (
-        model if model != previous_model or is_total else ""
-    )
-    previous_model = model
-
-    cells = [
-        f"""
-        <td style="
-            padding:7px 9px;
-            border:1px solid #dce3e9;
-            text-align:left;
-            font-weight:{weight};
-            white-space:nowrap;
-        ">{escape(str(model_display))}</td>
-        """,
-        f"""
-        <td style="
-            padding:7px;
-            border:1px solid #dce3e9;
-            text-align:center;
-            font-weight:{weight};
-        ">{escape(str(rated))}</td>
-        """
-    ]
-
-    for value in row:
-        cells.append(
-            f"""
-            <td style="
-                padding:7px;
-                border:1px solid #dce3e9;
-                text-align:right;
-                font-weight:{weight};
-                white-space:nowrap;
-            ">{int(value):,}</td>
-            """
-        )
-
-    body_rows.append(
-        f'<tr style="background-color:{background};">'
-        + "".join(cells)
-        + "</tr>"
-    )
-
-hardware_html = f"""
-<table cellpadding="0" cellspacing="0"
-       style="
-           border-collapse:collapse;
-           font-family:Arial,sans-serif;
-           font-size:11px;
-           width:100%;
-       ">
-    <thead><tr>{header_html}</tr></thead>
-    <tbody>{"".join(body_rows)}</tbody>
-</table>
-"""
-
-# --------------------------------------------------
-# 4. KPI CARD FUNCTION
-# --------------------------------------------------
-
-def kpi_card(label, value):
-    return f"""
-    <td width="33%" style="padding:5px;">
-        <table width="100%" cellpadding="0" cellspacing="0"
-               style="background-color:#F0F5F9;">
-            <tr>
-                <td style="
-                    padding:16px 10px;
-                    text-align:center;
-                    border-bottom:3px solid #4C83A6;
-                ">
-                    <div style="
-                        font-size:23px;
-                        font-weight:bold;
-                        color:#203A53;
-                    ">{value}</div>
-
-                    <div style="
-                        font-size:11px;
-                        color:#526779;
-                        padding-top:5px;
-                    ">{label}</div>
-                </td>
-            </tr>
-        </table>
-    </td>
-    """
-
-# --------------------------------------------------
-# 5. CREATE COMPLETE EMAIL
-# --------------------------------------------------
-
-html_report = f"""
-<html>
-<body style="
-    margin:0;
-    padding:20px;
-    background-color:#ffffff;
-    font-family:Arial,sans-serif;
-    color:#263746;
-">
-
-<table align="center" cellpadding="0" cellspacing="0"
-       width="100%" style="max-width:1200px;">
-
-    <!-- HEADER -->
-    <tr>
-        <td style="
-            background-color:#203A53;
-            padding:25px;
-            text-align:center;
-        ">
-            <div style="
-                color:#BBD4E5;
-                font-size:12px;
-                letter-spacing:2px;
-            ">
-                ADVANCED METERING SYSTEM
-            </div>
-
-            <div style="
-                color:#ffffff;
-                font-size:26px;
-                font-weight:bold;
-                padding-top:8px;
-            ">
-                Hardware Distribution Report
-            </div>
-
-            <div style="
-                color:#DCE7EF;
-                font-size:12px;
-                padding-top:8px;
-            ">
-                Texas Service Territories | {report_date}
-            </div>
-        </td>
-    </tr>
-
-    <!-- KPI HEADER -->
-    <tr>
-        <td style="padding:18px 0;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                    {kpi_card("Total Meter Counts", f"{total_meters:,}")}
-                    {kpi_card("DGROUP Categories", f"{total_dgroups:,}")}
-                    {kpi_card("Hardware Models", f"{total_models:,}")}
-                </tr>
-            </table>
-        </td>
-    </tr>
-
-    <!-- MAP -->
-    <tr>
-        <td style="padding:12px 5px;">
-            <h3 style="
-                color:#203A53;
-                border-bottom:2px solid #DCE8F2;
-                padding-bottom:9px;
-            ">
-                Service Territory Map
-            </h3>
-
-            <p style="font-size:12px; color:#647687;">
-                Geographic distribution of meters by DGROUP.
-            </p>
-
-            <img src="cid:dgroup_map"
-                 width="1000"
-                 style="
-                    display:block;
-                    width:100%;
-                    max-width:1000px;
-                    height:auto;
-                    border:1px solid #E1E7EC;
-                 ">
-        </td>
-    </tr>
-
-    <!-- INVENTORY -->
-    <tr>
-        <td style="padding:22px 5px 12px 5px;">
-            <h3 style="
-                color:#203A53;
-                border-bottom:2px solid #DCE8F2;
-                padding-bottom:9px;
-            ">
-                Hardware Inventory by DGROUP
-            </h3>
-
-            <p style="font-size:12px; color:#647687;">
-                Meter counts by hardware model, installation rating,
-                and operating DGROUP.
-            </p>
-
-            {hardware_html}
-        </td>
-    </tr>
-
-    <!-- FOOTER -->
-    <tr>
-        <td style="
-            padding:25px 10px;
-            text-align:center;
-            color:#80909E;
-            font-size:10px;
-        ">
-            AMS Operations Reporting<br>
-            Generated {report_date}
-        </td>
-    </tr>
-
-</table>
-</body>
-</html>
-"""
-
-# --------------------------------------------------
-# 6. SAVE PREVIEW
-# --------------------------------------------------
-
-preview_path.write_text(
-    html_report,
-    encoding="utf-8"
-)
-
-print("Report created!")
-print("Preview:", preview_path)
-print("Map:", map_path)
-
-import base64
-
-map_base64 = base64.b64encode(
-    map_path.read_bytes()
-).decode("ascii")
-
-preview_html = html_report.replace(
-    "cid:dgroup_map",
-    f"data:image/png;base64,{map_base64}"
-)
-
-preview_path.write_text(
-    preview_html,
-    encoding="utf-8"
-)
-
-import webbrowser
-webbrowser.open(preview_path.as_uri())
-import win32com.client as win32
-
-outlook = win32.Dispatch("Outlook.Application")
-mail = outlook.CreateItem(0)
-
-mail.Subject = f"AMS Hardware Distribution Report - {report_date}"
-
-# Add recipients when ready
-mail.To = ""
-mail.CC = ""
-
-# Attach map as an inline image
-attachment = mail.Attachments.Add(str(map_path))
-
-# PR_ATTACH_CONTENT_ID
-attachment.PropertyAccessor.SetProperty(
-    "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
-    "dgroup_map"
-)
-
-# Use the email version with the cid image
-mail.HTMLBody = html_report
-
-# Open draft for review
-mail.Display()
 
