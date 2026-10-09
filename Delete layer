@@ -1,43 +1,36 @@
-project_progress AS (
-    SELECT
-        60607 AS total_s4e,  -- TEMPORARY: replace with KPI source
-        COALESCE(SUM(Removed_YTD), 0) AS total_removed
-    FROM year_totals
-),
+import folium
+import geopandas as gpd
 
-dynamic_goals AS (
-    SELECT
-        y.report_year,
+# Folium expects latitude/longitude coordinates
+folium_regions = regions_clipped.to_crs(epsg=4326)
 
-        CASE
-            WHEN y.report_year = year(current_date)
-                THEN p.annual_goal
+# Create an interactive Texas map
+m = folium.Map(
+    location=[31.0, -99.0],
+    zoom_start=6,
+    tiles="CartoDB positron"
+)
 
-            WHEN y.report_year > year(current_date)
-                THEN CEIL(
-                    GREATEST(
-                        pp.total_s4e
-                        - pp.total_removed
-                        - GREATEST(
-                            p.annual_goal - COALESCE(c.Removed_YTD, 0),
-                            0
-                        ),
-                        0
-                    ) * 1.0
-                    / NULLIF(
-                        p.project_end_year - year(current_date),
-                        0
-                    )
-                )
+# Add DGROUP polygons
+folium.GeoJson(
+    folium_regions,
+    name="DGROUP Territories",
+    style_function=lambda feature: {
+        "fillColor": "#4C83A6",
+        "color": "#203A53",
+        "weight": 1.5,
+        "fillOpacity": 0.35
+    },
+    tooltip=folium.GeoJsonTooltip(
+        fields=["DGROUP"],
+        aliases=["DGROUP:"]
+    )
+).add_to(m)
 
-            ELSE p.annual_goal
-        END AS Adjusted_Annual_Goal
+# Add layer controls
+folium.LayerControl().add_to(m)
 
-    FROM years y
-    CROSS JOIN params p
-    CROSS JOIN project_progress pp
-    LEFT JOIN year_totals c
-        ON c.REMOVAL_YEAR = year(current_date)
-),
+# Save interactive map
+m.save("dgroup_interactive_map.html")
 
-
+m
