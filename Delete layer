@@ -1,20 +1,20 @@
+import os
+import tempfile
+import webbrowser
 import folium
 
-# Create interactive map centered on Wichita Falls, TX
+def open_temp_map(m):
+    temp_dir = tempfile.gettempdir()
+    fp = os.path.join(temp_dir, "map.html")
+    m.save(fp)
+    webbrowser.open(fp)
+
+# Create the map
 m = folium.Map(
     location=[33.91, -98.49],
     zoom_start=12,
-    tiles="CartoDB positron"
+    tiles="OpenStreetMap"
 )
 
-# Add example S4E meter location
-folium.CircleMarker(
-    location=[33.91, -98.49],
-    radius=5,
-    color="red",
-    fill=True,
-    popup="S4E Meter"
-).add_to(m)
-
-# Save as interactive HTML
-m.save("s4e_folium_map.html")
+# Open using Erik's function
+open_temp_map(m)
