@@ -1,36 +1,16 @@
-import folium
-import geopandas as gpd
-
-# Folium expects latitude/longitude coordinates
-folium_regions = regions_clipped.to_crs(epsg=4326)
-
-# Create an interactive Texas map
 m = folium.Map(
     location=[31.0, -99.0],
     zoom_start=6,
-    tiles="CartoDB positron"
+    tiles=None
 )
 
-# Add DGROUP polygons
-folium.GeoJson(
-    folium_regions,
-    name="DGROUP Territories",
-    style_function=lambda feature: {
-        "fillColor": "#4C83A6",
-        "color": "#203A53",
-        "weight": 1.5,
-        "fillOpacity": 0.35
-    },
-    tooltip=folium.GeoJsonTooltip(
-        fields=["DGROUP"],
-        aliases=["DGROUP:"]
-    )
+folium.TileLayer(
+    tiles=(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/"
+        "World_Street_Map/MapServer/tile/{z}/{y}/{x}"
+    ),
+    attr="Tiles © Esri",
+    name="Esri Street Map",
+    overlay=False,
+    control=True
 ).add_to(m)
-
-# Add layer controls
-folium.LayerControl().add_to(m)
-
-# Save interactive map
-m.save("dgroup_interactive_map.html")
-
-m
