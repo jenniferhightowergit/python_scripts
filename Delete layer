@@ -1,16 +1,25 @@
-m = folium.Map(
-    location=[31.0, -99.0],
-    zoom_start=6,
-    tiles=None
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import contextily as ctx
+
+# Load S4E meter data
+meters = gpd.read_file("s4e_meters.geojson")
+
+# Convert to Web Mercator
+meters = meters.to_crs(epsg=3857)
+
+fig, ax = plt.subplots(figsize=(12, 10))
+
+meters.plot(
+    ax=ax,
+    color="red",
+    markersize=5
 )
 
-folium.TileLayer(
-    tiles=(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/"
-        "World_Street_Map/MapServer/tile/{z}/{y}/{x}"
-    ),
-    attr="Tiles © Esri",
-    name="Esri Street Map",
-    overlay=False,
-    control=True
-).add_to(m)
+# Add CARTO street-level basemap
+ctx.add_basemap(
+    ax,
+    source=ctx.providers.CartoDB.Positron
+)
+
+plt.show()
