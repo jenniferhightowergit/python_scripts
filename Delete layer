@@ -1,25 +1,20 @@
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import contextily as ctx
+import folium
 
-# Load S4E meter data
-meters = gpd.read_file("s4e_meters.geojson")
+# Create interactive map centered on Wichita Falls, TX
+m = folium.Map(
+    location=[33.91, -98.49],
+    zoom_start=12,
+    tiles="CartoDB positron"
+)
 
-# Convert to Web Mercator
-meters = meters.to_crs(epsg=3857)
-
-fig, ax = plt.subplots(figsize=(12, 10))
-
-meters.plot(
-    ax=ax,
+# Add example S4E meter location
+folium.CircleMarker(
+    location=[33.91, -98.49],
+    radius=5,
     color="red",
-    markersize=5
-)
+    fill=True,
+    popup="S4E Meter"
+).add_to(m)
 
-# Add CARTO street-level basemap
-ctx.add_basemap(
-    ax,
-    source=ctx.providers.CartoDB.Positron
-)
-
-plt.show()
+# Save as interactive HTML
+m.save("s4e_folium_map.html")
