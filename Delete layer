@@ -1,20 +1,35 @@
-import os
-import tempfile
-import webbrowser
-import folium
+dynamic_goals AS (
+    SELECT
+        y.report_year,
 
-def open_temp_map(m):
-    temp_dir = tempfile.gettempdir()
-    fp = os.path.join(temp_dir, "map.html")
-    m.save(fp)
-    webbrowser.open(fp)
+        CASE
+            WHEN y.report_year <= year(current_date)
+                THEN p.annual_goal
 
-# Create the map
-m = folium.Map(
-    location=[33.91, -98.49],
-    zoom_start=12,
-    tiles="OpenStreetMap"
-)
+            ELSE
+                p.annual_goal
+                -
+                (
+                    COALESCE(
+                        (
+                            SELECT SUM(yt.Removed_YTD)
+                            FROM year_totals yt
+                            WHERE yt.REMOVAL_YEAR >= p.project_start_year
+                              AND yt.REMOVAL_YEAR <= year(current_date)
+                        ), 0
+                    )
+                    -
+                    (
+                        p.annual_goal
+                        * (year(current_date) - p.project_start_year)
+                    )
+                ) * 1.0
+                / NULLIF(
+                    p.project_end_year - year(current_date),
+                    0
+                )
+        END AS Adjusted_Annual_Goal
 
-# Open using Erik's function
-open_temp_map(m)
+    FROM years y
+    CROSS JOIN params p
+),
