@@ -1,22 +1,90 @@
-WHEN y.report_year = YEAR(CURRENT_DATE) + 1
-THEN GREATEST(
-    0,
-    p.annual_goal
 
-    -- Carry forward only COMPLETED years' variance
-    + COALESCE((
-        SELECT SUM(
-            p.annual_goal - prev.Removed_YTD
-        )
-        FROM year_totals prev
-        WHERE prev.REMOVAL_YEAR >= p.project_start_year
-          AND prev.REMOVAL_YEAR < YEAR(CURRENT_DATE)
-    ), 0)
+dynamic_goals AS (
 
-    -- During the current year, only carry forward
-    -- removals exceeding the approved annual target
-    - GREATEST(
-        COALESCE(curr.Removed_YTD, 0) - p.annual_goal,
-        0
+    WITH yearly AS (
+        SELECT
+            y.report_year,
+            p.annual_goal,
+
+            CASE
+                WHEN y.report_year = 2025 THEN 0
+                ELSE COALESCE(yt.Removed_YTD, 0)
+            END AS Removed_YTD
+
+        FROM years y
+        CROSS JOIN params p
+
+        LEFT JOIN year_totals yt
+            ON yt.REMOVAL_YEAR = y.report_year
+    ),
+
+    carryover AS (
+        SELECT
+            *,
+
+            -- Surplus or shortfall from completed project years only
+            SUM(
+                CASE
+                    WHEN report_year >= 2026
+                     AND report_year < YEAR(CURRENT_DATE)
+                    THEN annual_goal - Removed_YTD
+                    ELSE 0
+                END
+            ) OVER () AS completed_carryover
+
+        FROM yearly
+    ),
+
+    goals AS (
+        SELECT
+            *,
+
+            -- Current year's actual adjusted target
+            GREATEST(
+                0,
+                annual_goal + completed_carryover
+            ) AS current_adjusted_target
+
+        FROM carryover
     )
+
+    SELECT
+        report_year,
+
+        CASE
+
+            -- Historical year outside the project
+            WHEN report_year = 2025
+                THEN annual_goal
+
+            -- Completed project years show actual removals
+            WHEN report_year < YEAR(CURRENT_DATE)
+                THEN Removed_YTD
+
+            -- Current year absorbs previous years' carryover
+            WHEN report_year = YEAR(CURRENT_DATE)
+                THEN current_adjusted_target
+
+            -- Next year absorbs current-year overperformance
+            WHEN report_year = YEAR(CURRENT_DATE) + 1
+                THEN GREATEST(
+                    0,
+                    annual_goal -
+                    GREATEST(
+                        0,
+                        (
+                            SELECT COALESCE(MAX(Removed_YTD), 0)
+                            FROM goals
+                            WHERE report_year = YEAR(CURRENT_DATE)
+                        ) -
+                        current_adjusted_target
+                    )
+                )
+
+            -- Later years retain the approved benchmark
+            ELSE annual_goal
+
+        END AS Adjusted_Annual_Goal
+
+    FROM goals
 )
