@@ -3,42 +3,29 @@ dynamic_goals AS (
         y.report_year,
 
         CASE
-            -- Current year retains its existing target
-            WHEN y.report_year <= YEAR(CURRENT_DATE)
+            -- Completed years retain the original benchmark
+            WHEN y.report_year < YEAR(CURRENT_DATE)
                 THEN p.annual_goal
 
-            -- Future years share the cumulative variance
+            -- Current and future years use cumulative performance
             ELSE
                 GREATEST(
                     0,
                     p.annual_goal
-                    -
+                    +
                     (
-                        (
-                            SELECT COALESCE(SUM(yt.Removed_YTD), 0)
-                            FROM year_totals yt
-                            WHERE yt.REMOVAL_YEAR >= p.project_start_year
-                              AND yt.REMOVAL_YEAR < YEAR(CURRENT_DATE)
-                        )
-                        -
                         p.annual_goal *
-                        (YEAR(CURRENT_DATE) - p.project_start_year)
-
-                        +
-                        GREATEST(
-                            COALESCE(
-                                (
-                                    SELECT SUM(yt.Removed_YTD)
-                                    FROM year_totals yt
-                                    WHERE yt.REMOVAL_YEAR = YEAR(CURRENT_DATE)
-                                ), 0
-                            ) - p.annual_goal,
+                        (y.report_year - p.project_start_year)
+                        -
+                        COALESCE(
+                            (
+                                SELECT SUM(yt.Removed_YTD)
+                                FROM year_totals yt
+                                WHERE yt.REMOVAL_YEAR >= p.project_start_year
+                                  AND yt.REMOVAL_YEAR < y.report_year
+                            ),
                             0
                         )
-                    ) * 1.0
-                    / NULLIF(
-                        p.project_end_year - YEAR(CURRENT_DATE),
-                        0
                     )
                 )
         END AS Adjusted_Annual_Goal
