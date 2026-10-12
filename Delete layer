@@ -3,13 +3,14 @@ dynamic_goals AS (
         y.report_year,
 
         CASE
-            -- Completed years retain the original benchmark
+            -- Completed years show actual removals
             WHEN y.report_year < YEAR(CURRENT_DATE)
-                THEN p.annual_goal
+                THEN COALESCE(yt.Removed_YTD, 0)
 
-            -- Current and future years use cumulative performance
-            ELSE
-                GREATEST(
+            -- Current year: prior-year rollover,
+            -- or actual removals if they exceed the target
+            WHEN y.report_year = YEAR(CURRENT_DATE)
+                THEN GREATEST(
                     0,
                     p.annual_goal
                     +
@@ -19,17 +20,44 @@ dynamic_goals AS (
                         -
                         COALESCE(
                             (
-                                SELECT SUM(yt.Removed_YTD)
-                                FROM year_totals yt
-                                WHERE yt.REMOVAL_YEAR >= p.project_start_year
-                                  AND yt.REMOVAL_YEAR < y.report_year
-                            ),
-                            0
+                                SELECT SUM(prev.Removed_YTD)
+                                FROM year_totals prev
+                                WHERE prev.REMOVAL_YEAR >= p.project_start_year
+                                  AND prev.REMOVAL_YEAR < y.report_year
+                            ), 0
+                        )
+                    ),
+                    COALESCE(yt.Removed_YTD, 0)
+                )
+
+            -- Next year: forecast cumulative rollover
+            WHEN y.report_year = YEAR(CURRENT_DATE) + 1
+                THEN GREATEST(
+                    0,
+                    p.annual_goal
+                    +
+                    (
+                        p.annual_goal *
+                        (YEAR(CURRENT_DATE) - p.project_start_year + 1)
+                        -
+                        COALESCE(
+                            (
+                                SELECT SUM(prev.Removed_YTD)
+                                FROM year_totals prev
+                                WHERE prev.REMOVAL_YEAR >= p.project_start_year
+                                  AND prev.REMOVAL_YEAR <= YEAR(CURRENT_DATE)
+                            ), 0
                         )
                     )
                 )
+
+            -- Later years retain approved goal
+            ELSE p.annual_goal
+
         END AS Adjusted_Annual_Goal
 
     FROM years y
     CROSS JOIN params p
+    LEFT JOIN year_totals yt
+        ON yt.REMOVAL_YEAR = y.report_year
 ),
