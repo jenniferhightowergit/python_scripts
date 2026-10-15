@@ -1,90 +1,68 @@
+SELECT
+    m.meterno,
+    i.datadefinitionid,
+    def.name AS def_name,
+    TRUNC(i.intervalstartdate) AS interval_date,
 
-dynamic_goals AS (
+    COUNT(*) AS interval_count,
 
-    WITH yearly AS (
-        SELECT
-            y.report_year,
-            p.annual_goal,
+    COUNT(DISTINCT i.intervalstartdate)
+        AS distinct_interval_count,
 
-            CASE
-                WHEN y.report_year = 2025 THEN 0
-                ELSE COALESCE(yt.Removed_YTD, 0)
-            END AS Removed_YTD
+    COUNT(i.intervalvalue)
+        AS nonnull_count,
 
-        FROM years y
-        CROSS JOIN params p
-
-        LEFT JOIN year_totals yt
-            ON yt.REMOVAL_YEAR = y.report_year
-    ),
-
-    carryover AS (
-        SELECT
-            *,
-
-            -- Surplus or shortfall from completed project years only
-            SUM(
-                CASE
-                    WHEN report_year >= 2026
-                     AND report_year < YEAR(CURRENT_DATE)
-                    THEN annual_goal - Removed_YTD
-                    ELSE 0
-                END
-            ) OVER () AS completed_carryover
-
-        FROM yearly
-    ),
-
-    goals AS (
-        SELECT
-            *,
-
-            -- Current year's actual adjusted target
-            GREATEST(
-                0,
-                annual_goal + completed_carryover
-            ) AS current_adjusted_target
-
-        FROM carryover
-    )
-
-    SELECT
-        report_year,
-
+    SUM(
         CASE
+            WHEN i.intervalvalue = 0 THEN 1
+            ELSE 0
+        END
+    ) AS zero_count,
 
-            -- Historical year outside the project
-            WHEN report_year = 2025
-                THEN annual_goal
+    MIN(i.intervalvalue) AS min_voltage,
+    MAX(i.intervalvalue) AS max_voltage,
 
-            -- Completed project years show actual removals
-            WHEN report_year < YEAR(CURRENT_DATE)
-                THEN Removed_YTD
+    MIN(
+        CASE
+            WHEN i.intervalvalue > 0
+            THEN i.intervalvalue
+        END
+    ) AS min_nonzero_voltage,
 
-            -- Current year absorbs previous years' carryover
-            WHEN report_year = YEAR(CURRENT_DATE)
-                THEN current_adjusted_target
+    MAX(
+        CASE
+            WHEN i.intervalvalue > 0
+            THEN i.intervalvalue
+        END
+    ) AS max_nonzero_voltage
 
-            -- Next year absorbs current-year overperformance
-            WHEN report_year = YEAR(CURRENT_DATE) + 1
-                THEN GREATEST(
-                    0,
-                    annual_goal -
-                    GREATEST(
-                        0,
-                        (
-                            SELECT COALESCE(MAX(Removed_YTD), 0)
-                            FROM goals
-                            WHERE report_year = YEAR(CURRENT_DATE)
-                        ) -
-                        current_adjusted_target
-                    )
-                )
+FROM centralservices.vw_meters m
 
-            -- Later years retain the approved benchmark
-            ELSE annual_goal
+JOIN centralservices.vw_endpoints ep
+    ON m.meterid = ep.meterid
 
-        END AS Adjusted_Annual_Goal
+JOIN centralservices.vw_intervaldata i
+    ON ep.endpointid = i.endpointid
 
-    FROM goals
+JOIN centralservices.datadefinitions def
+    ON def.datadefinitionid = i.datadefinitionid
+
+WHERE m.meterno IN (
+    '188895315LG',
+    '198890563LG',
+    '147872582LG'
 )
+
+AND i.intervalstartdate >= DATE '2026-06-01'
+AND i.intervalstartdate < DATE '2026-07-01'
+
+GROUP BY
+    m.meterno,
+    i.datadefinitionid,
+    def.name,
+    TRUNC(i.intervalstartdate)
+
+ORDER BY
+    m.meterno,
+    interval_date,
+    def.name;
