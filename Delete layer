@@ -1,68 +1,83 @@
-SELECT
-    m.meterno,
-    i.datadefinitionid,
-    def.name AS def_name,
-    TRUNC(i.intervalstartdate) AS interval_date,
+import logging
 
-    COUNT(*) AS interval_count,
+from database import init_tables
+from settings import get_settings
 
-    COUNT(DISTINCT i.intervalstartdate)
-        AS distinct_interval_count,
+DEFAULT_N = 100
 
-    COUNT(i.intervalvalue)
-        AS nonnull_count,
+# Reads up to n work orders that are NOT in training_orders and have cleaned text.
+# One row per (wr_id, fa_id): the most recently updated order, with every field needed
+# for both training_orders and training_cleaned_text.
+NEW_ORDERS_SQL = '''
+select
+    wr_id,
+    fa_id,
+    wr_status_upd_dttm,
+    comments,
+    instructions,
+    cleaned_comments,
+    cleaned_instructions
+from (
+    select
+        o.wr_id,
+        o.fa_id,
+        o.wr_status_upd_dttm,
+        coalesce(o.comments, '')              as comments,
+        coalesce(o.instructions, '')          as instructions,
+        coalesce(ct.cleaned_comments, '')     as cleaned_comments,
+        coalesce(ct.cleaned_instructions, '') as cleaned_instructions,
+        row_number() over (
+            partition by o.wr_id, o.fa_id
+            order by o.wr_status_upd_dttm desc, o.order_id desc
+        ) as rn
+    from orders o
+    join cleaned_text ct
+      on ct.order_id = o.order_id
+    where o.wr_id is not null
+      and o.fa_id is not null
+      and not exists (
+          select 1 from training_orders t
+          where t.wr_id = o.wr_id
+            and t.fa_id = o.fa_id
+      )
+) as candidates
+where rn = 1
+order by wr_status_upd_dttm
+{limit}
+'''
 
-    SUM(
-        CASE
-            WHEN i.intervalvalue = 0 THEN 1
-            ELSE 0
-        END
-    ) AS zero_count,
+ORDER_COLS = ['wr_id', 'fa_id', 'wr_status_upd_dttm', 'comments', 'instructions']
+TEXT_COLS = ['training_order_id', 'cleaned_comments', 'cleaned_instructions']
 
-    MIN(i.intervalvalue) AS min_voltage,
-    MAX(i.intervalvalue) AS max_voltage,
 
-    MIN(
-        CASE
-            WHEN i.intervalvalue > 0
-            THEN i.intervalvalue
-        END
-    ) AS min_nonzero_voltage,
+def run(n: int | None = DEFAULT_N) -> int:
+    '''
+    Append new work orders and their cleaned text to the training tables.
 
-    MAX(
-        CASE
-            WHEN i.intervalvalue > 0
-            THEN i.intervalvalue
-        END
-    ) AS max_nonzero_voltage
+    1. Read up to n orders (with cleaned text) that are not already in training_orders
+    2. Insert them into training_orders
+    3. Insert their cleaned text into training_cleaned_text, keyed on the new training_order_id
+    '''
+    logging.info('started: append_training_orders pipeline')
+    tables = init_tables(get_settings())
 
-FROM centralservices.vw_meters m
+    limit = f'limit {int(n)}' if n else ''
+    df_orders = tables.select(NEW_ORDERS_SQL.format(limit=limit))
 
-JOIN centralservices.vw_endpoints ep
-    ON m.meterid = ep.meterid
+    if df_orders.empty:
+        logging.info('no new orders to append to "training_orders"')
+        logging.info('finished: append_training_orders pipeline')
+        return 0
 
-JOIN centralservices.vw_intervaldata i
-    ON ep.endpointid = i.endpointid
+    tables.training_orders.insert(df_orders[ORDER_COLS])
+    logging.info(f'inserted: {len(df_orders):,} records to "training_orders"')
 
-JOIN centralservices.datadefinitions def
-    ON def.datadefinitionid = i.datadefinitionid
+    # training_order_id is assigned on insert, so look it up to key the text rows
+    df_ids = tables.select('select training_order_id, wr_id, fa_id from training_orders')
+    df_text = df_orders.merge(df_ids, on=['wr_id', 'fa_id'])[TEXT_COLS]
 
-WHERE m.meterno IN (
-    '188895315LG',
-    '198890563LG',
-    '147872582LG'
-)
+    tables.training_cleaned_text.insert(df_text)
+    logging.info(f'inserted: {len(df_text):,} records to "training_cleaned_text"')
 
-AND i.intervalstartdate >= DATE '2026-06-01'
-AND i.intervalstartdate < DATE '2026-07-01'
-
-GROUP BY
-    m.meterno,
-    i.datadefinitionid,
-    def.name,
-    TRUNC(i.intervalstartdate)
-
-ORDER BY
-    m.meterno,
-    interval_date,
-    def.name;
+    logging.info('finished: append_training_orders pipeline')
+    return len(df_orders)
