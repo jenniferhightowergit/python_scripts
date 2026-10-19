@@ -1,83 +1,60 @@
-import logging
+import pandas as pd
 
-from database import init_tables
-from settings import get_settings
+meter_list = (
+    assets['meterno']
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .drop_duplicates()
+    .tolist()
+)
 
-DEFAULT_N = 100
+batch_size = 900
+results = []
 
-# Reads up to n work orders that are NOT in training_orders and have cleaned text.
-# One row per (wr_id, fa_id): the most recently updated order, with every field needed
-# for both training_orders and training_cleaned_text.
-NEW_ORDERS_SQL = '''
-select
-    wr_id,
-    fa_id,
-    wr_status_upd_dttm,
-    comments,
-    instructions,
-    cleaned_comments,
-    cleaned_instructions
-from (
-    select
-        o.wr_id,
-        o.fa_id,
-        o.wr_status_upd_dttm,
-        coalesce(o.comments, '')              as comments,
-        coalesce(o.instructions, '')          as instructions,
-        coalesce(ct.cleaned_comments, '')     as cleaned_comments,
-        coalesce(ct.cleaned_instructions, '') as cleaned_instructions,
-        row_number() over (
-            partition by o.wr_id, o.fa_id
-            order by o.wr_status_upd_dttm desc, o.order_id desc
-        ) as rn
-    from orders o
-    join cleaned_text ct
-      on ct.order_id = o.order_id
-    where o.wr_id is not null
-      and o.fa_id is not null
-      and not exists (
-          select 1 from training_orders t
-          where t.wr_id = o.wr_id
-            and t.fa_id = o.fa_id
-      )
-) as candidates
-where rn = 1
-order by wr_status_upd_dttm
-{limit}
-'''
+for i in range(0, len(meter_list), batch_size):
 
-ORDER_COLS = ['wr_id', 'fa_id', 'wr_status_upd_dttm', 'comments', 'instructions']
-TEXT_COLS = ['training_order_id', 'cleaned_comments', 'cleaned_instructions']
+    batch = meter_list[i:i + batch_size]
 
+    params = {
+        f"m{j}": meter
+        for j, meter in enumerate(batch)
+    }
 
-def run(n: int | None = DEFAULT_N) -> int:
-    '''
-    Append new work orders and their cleaned text to the training tables.
+    placeholders = ", ".join(
+        f":m{j}" for j in range(len(batch))
+    )
 
-    1. Read up to n orders (with cleaned text) that are not already in training_orders
-    2. Insert them into training_orders
-    3. Insert their cleaned text into training_cleaned_text, keyed on the new training_order_id
-    '''
-    logging.info('started: append_training_orders pipeline')
-    tables = init_tables(get_settings())
+    query = f"""
+        SELECT DISTINCT
+            SUBSTR(WR.WORKLOCATION_ESIID, 8, 10) ESI_LOC,
+            CIS.METER_NUM,
+            WR.F1_SVC_TASK_ID WR_ID,
+            CAST(TRUNC(WR.CRE_DTTM) AS DATE) CREATE_DATE,
+            CAST(TRUNC(WR.CI_WORKDATETIME) AS DATE) WORKEDDATE,
+            WR.CRE_DTTM,
+            WR.SUBTYP WR_SUBTYPE,
+            WR.BO_STATUS_CD WR_STATUS
 
-    limit = f'limit {int(n)}' if n else ''
-    df_orders = tables.select(NEW_ORDERS_SQL.format(limit=limit))
+        FROM RPTUSER.CM_WORKREQUESTTASK_VW WR
 
-    if df_orders.empty:
-        logging.info('no new orders to append to "training_orders"')
-        logging.info('finished: append_training_orders pipeline')
-        return 0
+        JOIN CADPROD.CISPERSEL_VW CIS
+            ON SUBSTR(WR.WORKLOCATION_ESIID, 8, 10) = CIS.PREMISE
 
-    tables.training_orders.insert(df_orders[ORDER_COLS])
-    logging.info(f'inserted: {len(df_orders):,} records to "training_orders"')
+        WHERE WR.CRE_DTTM >= DATE '2025-01-01'
+        AND WR.BO_STATUS_CD = 'COMPLETED'
+        AND CIS.METER_NUM IN ({placeholders})
+    """
 
-    # training_order_id is assigned on insert, so look it up to key the text rows
-    df_ids = tables.select('select training_order_id, wr_id, fa_id from training_orders')
-    df_text = df_orders.merge(df_ids, on=['wr_id', 'fa_id'])[TEXT_COLS]
+    df = pd.read_sql(
+        query,
+        sql_connection,
+        params=params
+    )
 
-    tables.training_cleaned_text.insert(df_text)
-    logging.info(f'inserted: {len(df_text):,} records to "training_cleaned_text"')
+    results.append(df)
 
-    logging.info('finished: append_training_orders pipeline')
-    return len(df_orders)
+work_orders = pd.concat(
+    results,
+    ignore_index=True
+).drop_duplicates()
