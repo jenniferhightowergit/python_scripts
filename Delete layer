@@ -1,60 +1,44 @@
-import pandas as pd
+WITH meter_history AS (
+    SELECT
+        TRIM(meterno) AS meterno,
 
-meter_list = (
-    assets['meterno']
-    .dropna()
-    .astype(str)
-    .str.strip()
-    .drop_duplicates()
-    .tolist()
+        MAX(
+            CASE
+                WHEN end_dt < DATE '4000-12-31'
+                THEN end_dt
+            END
+        ) AS latest_end_date,
+
+        MAX(eff_dt) AS latest_effective_date,
+
+        MAX(
+            CASE
+                WHEN end_dt = DATE '4000-12-31'
+                THEN 1 ELSE 0
+            END
+        ) AS has_active_placeholder
+
+    FROM test_sample
+    GROUP BY TRIM(meterno)
 )
 
-batch_size = 900
-results = []
+SELECT
+    h.*,
 
-for i in range(0, len(meter_list), batch_size):
+    CASE
+        WHEN a.meterno IS NOT NULL
+            THEN 'IN ACTIVE INVENTORY'
 
-    batch = meter_list[i:i + batch_size]
+        WHEN h.has_active_placeholder = 1
+            THEN 'CONFLICT - PLACEHOLDER BUT NOT ACTIVE'
 
-    params = {
-        f"m{j}": meter
-        for j, meter in enumerate(batch)
-    }
+        ELSE 'NOT IN ACTIVE INVENTORY'
+    END AS meter_status
 
-    placeholders = ", ".join(
-        f":m{j}" for j in range(len(batch))
-    )
+FROM meter_history h
 
-    query = f"""
-        SELECT DISTINCT
-            SUBSTR(WR.WORKLOCATION_ESIID, 8, 10) ESI_LOC,
-            CIS.METER_NUM,
-            WR.F1_SVC_TASK_ID WR_ID,
-            CAST(TRUNC(WR.CRE_DTTM) AS DATE) CREATE_DATE,
-            CAST(TRUNC(WR.CI_WORKDATETIME) AS DATE) WORKEDDATE,
-            WR.CRE_DTTM,
-            WR.SUBTYP WR_SUBTYPE,
-            WR.BO_STATUS_CD WR_STATUS
-
-        FROM RPTUSER.CM_WORKREQUESTTASK_VW WR
-
-        JOIN CADPROD.CISPERSEL_VW CIS
-            ON SUBSTR(WR.WORKLOCATION_ESIID, 8, 10) = CIS.PREMISE
-
-        WHERE WR.CRE_DTTM >= DATE '2025-01-01'
-        AND WR.BO_STATUS_CD = 'COMPLETED'
-        AND CIS.METER_NUM IN ({placeholders})
-    """
-
-    df = pd.read_sql(
-        query,
-        sql_connection,
-        params=params
-    )
-
-    results.append(df)
-
-work_orders = pd.concat(
-    results,
-    ignore_index=True
-).drop_duplicates()
+LEFT JOIN (
+    SELECT DISTINCT TRIM(meterno) AS meterno
+    FROM alltown
+) a
+    ON h.meterno = a.meterno;
