@@ -1,169 +1,61 @@
 
-import pandas as pd
-from html import escape
-
-# Clean up the dataframe column names
-hardware.columns = hardware.columns.str.upper()
-
-def make_pivot(group_col, include_ir=False):
-    rows = ["HARDWARE_MODEL"]
-
-    if include_ir:
-        rows.append("INSTR_RATED")
-
-    pivot = hardware.pivot_table(
-        index=rows,
-        columns=group_col,
-        values="METER_COUNT",
-        aggfunc="sum",
-        fill_value=0
-    )
-
-    # Keep Grand Total as the first numeric column
-    pivot.insert("Grand Total", 0, pivot.sum(axis=1))
-
-    return pivot.reset_index()
-
-
-fsr = make_pivot("FSRSSR_DGROUP")
-meter_tech = make_pivot("METER_TECH_DGROUP")
-
-fsr_ir = make_pivot("FSRSSR_DGROUP", True)
-meter_tech_ir = make_pivot("METER_TECH_DGROUP", True)
-
-
-def format_table(df, title, subtitle):
-    display = df.copy()
-
-    # Format counts with comma separators
-    number_cols = display.select_dtypes(include="number").columns
-
-    for col in number_cols:
-        display[col] = display[col].map(lambda x: f"{x:,.0f}")
-
-    # Format headers and cells
-    headers = "".join(
-        f'<th style="background-color:#173B56;color:white;'
-        f'padding:10px 12px;border:1px solid #DCE4EA;'
-        f'text-align:{"right" if col in number_cols else "left"};">'
-        f'{escape(str(col).replace("_", " ").title())}</th>'
-        for col in display.columns
-    )
-
     body = ""
+    is_ir_table = "INSTR_RATED" in df.columns
+    previous_model = None
 
     for i, row in display.iterrows():
+
+        current_model = row["HARDWARE_MODEL"]
+
+        # Detect the beginning of a new hardware model
+        new_group = (
+            is_ir_table
+            and current_model != previous_model
+        )
+
+        # Light alternating background colors
         bg = "#FFFFFF" if i % 2 == 0 else "#F0F5F8"
+
+        # Highlight the beginning of each hardware group
+        if new_group:
+            bg = "#E8F1F7"
+
+        # Add a blue separator between hardware models
+        top_border = (
+            "2px solid #9DB9CC"
+            if new_group and i > 0
+            else "none"
+        )
 
         body += f'<tr style="background-color:{bg};">'
 
         for col in display.columns:
-            align = "right" if col in number_cols else "left"
+
+            align = (
+                "right" if col in number_cols else "left"
+            )
+
+            padding = (
+                "12px 12px" if new_group
+                else "8px 12px"
+            )
+
+            font_weight = (
+                "bold"
+                if new_group and col == "HARDWARE_MODEL"
+                else "normal"
+            )
 
             body += (
-                f'<td style="padding:8px 12px;'
+                f'<td style="padding:{padding};'
+                f'border-top:{top_border};'
                 f'border-bottom:1px solid #DFE6EC;'
-                f'text-align:{align};font-size:12px;">'
+                f'text-align:{align};'
+                f'font-weight:{font_weight};'
+                f'font-size:12px;">'
                 f'{escape(str(row[col]))}</td>'
             )
 
         body += "</tr>"
 
-    # Grand total row
-    totals = df[number_cols].sum()
-
-    body += '<tr style="background-color:#DCEAF2;font-weight:bold;">'
-
-    for col in df.columns:
-        if col == df.columns[0]:
-            value = "Grand Total"
-        elif col in number_cols:
-            value = f"{totals[col]:,.0f}"
-        else:
-            value = ""
-
-        body += (
-            '<td style="padding:10px 12px;'
-            'border-top:2px solid #173B56;'
-            'font-size:12px;">'
-            f'{escape(str(value))}</td>'
-        )
-
-    body += "</tr>"
-
-    return f"""
-    <div style="margin-top:30px;margin-bottom:32px;">
-        <h2 style="color:#173B56;font-size:18px;margin-bottom:5px;">
-            {escape(title)}
-        </h2>
-        <p style="color:#667788;font-size:12px;margin-top:0;">
-            {escape(subtitle)}
-        </p>
-        <table cellpadding="0" cellspacing="0"
-               style="border-collapse:collapse;
-                      font-family:Arial,sans-serif;
-                      width:100%;">
-            <thead><tr>{headers}</tr></thead>
-            <tbody>{body}</tbody>
-        </table>
-    </div>
-    """
-
-
-from datetime import datetime
-
-report_date = datetime.now().strftime("%B %d, %Y")
-
-total_meters = hardware["METER_COUNT"].sum()
-
-html_email = f"""
-<html>
-<body style="font-family:Arial,sans-serif;color:#263746;">
-
-<div style="max-width:1200px;margin:auto;">
-
-    <div style="background-color:#173B56;
-                padding:24px;color:white;">
-        <h1 style="margin:0;font-size:24px;">
-            AMS Hardware Distribution Report
-        </h1>
-        <p style="margin:8px 0 0;color:#D5E5EF;">
-            Hardware Counts by DGroup | {report_date}
-        </p>
-    </div>
-
-    <div style="background-color:#EDF3F7;padding:18px;
-                margin-top:16px;">
-        <div style="font-size:12px;color:#526779;">
-            TOTAL METERS
-        </div>
-        <div style="font-size:28px;font-weight:bold;
-                    color:#173B56;">
-            {total_meters:,}
-        </div>
-    </div>
-
-    {format_table(fsr, "01 | FSR/SSR Distribution",
-                  "Hardware counts by FSR/SSR group")}
-
-    {format_table(meter_tech, "02 | Meter Tech Distribution",
-                  "Hardware counts by meter technology group")}
-
-    {format_table(fsr_ir, "03 | FSR/SSR — Instrument Rated",
-                  "Hardware counts separated by instrument rating")}
-
-    {format_table(meter_tech_ir, "04 | Meter Tech — Instrument Rated",
-                  "Hardware counts separated by instrument rating")}
-
-    <div style="border-top:1px solid #DCE4EA;
-                padding-top:15px;margin-top:20px;
-                color:#738493;font-size:11px;">
-        AMS Operations | Hardware Distribution Summary
-    </div>
-
-</div>
-</body>
-</html>
-"""
-
-
+        previous_model = current_model
