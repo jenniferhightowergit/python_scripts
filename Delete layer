@@ -1,13 +1,27 @@
-# Highlight the entire GRAND TOTAL row
 import re
 
+# Style the entire GRAND TOTAL row
+def highlight_grand_total(match):
+    row = match.group(0)
+
+    # Change white cell backgrounds to blue
+    row = row.replace(
+        "background-color:#FFFFFF;",
+        "background-color:#E8EFF5;"
+    )
+
+    # Make every cell bold
+    row = row.replace(
+        "<td style=\"",
+        "<td style=\"font-weight:bold;"
+    )
+
+    return row
+
+
 inventory_html = re.sub(
-    r"<tr>\s*(<td[^>]*>\s*GRAND TOTAL\s*</td>.*?)</tr>",
-    lambda m: (
-        '<tr style="background-color:#E8EFF5; font-weight:bold;">'
-        + m.group(1)
-        + "</tr>"
-    ),
+    r"<tr>.*?GRAND TOTAL.*?</tr>",
+    highlight_grand_total,
     inventory_html,
     count=1,
     flags=re.DOTALL | re.IGNORECASE
