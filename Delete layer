@@ -2,11 +2,14 @@ SELECT
     class,
     form,
     volt,
-    COUNT(*) AS row_count,
-    SUM(NEEDED_AMOUNT) AS combined_needed,
-    MAX(NEEDED_AMOUNT) AS original_needed,
-    SUM(NEEDED_AMOUNT) - MAX(NEEDED_AMOUNT) AS extra_count
+    COUNT(DISTINCT stockno) AS stock_number_count,
+    STRING_AGG(
+        DISTINCT CAST(stockno AS VARCHAR),
+        ', '
+    ) AS stock_numbers,
+    SUM(NEEDED_AMOUNT) AS inflated_needed,
+    MAX(NEEDED_AMOUNT) AS actual_needed
 FROM combined
 GROUP BY class, form, volt
-HAVING COUNT(*) > 1
-ORDER BY extra_count DESC;
+HAVING COUNT(DISTINCT stockno) > 1
+ORDER BY inflated_needed - actual_needed DESC;
