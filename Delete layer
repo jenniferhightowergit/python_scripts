@@ -1,15 +1,14 @@
-SELECT
-    class,
-    form,
-    volt,
-    COUNT(DISTINCT stockno) AS stock_number_count,
-    STRING_AGG(
-        DISTINCT CAST(stockno AS VARCHAR),
-        ', '
-    ) AS stock_numbers,
-    SUM(NEEDED_AMOUNT) AS inflated_needed,
-    MAX(NEEDED_AMOUNT) AS actual_needed
-FROM combined
-GROUP BY class, form, volt
-HAVING COUNT(DISTINCT stockno) > 1
-ORDER BY inflated_needed - actual_needed DESC;
+# Highlight the entire GRAND TOTAL row
+import re
+
+inventory_html = re.sub(
+    r"<tr>\s*(<td[^>]*>\s*GRAND TOTAL\s*</td>.*?)</tr>",
+    lambda m: (
+        '<tr style="background-color:#E8EFF5; font-weight:bold;">'
+        + m.group(1)
+        + "</tr>"
+    ),
+    inventory_html,
+    count=1,
+    flags=re.DOTALL | re.IGNORECASE
+)
