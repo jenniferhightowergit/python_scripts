@@ -1,78 +1,90 @@
 
-import pandas as pd
-import numpy as np
+import geopandas as gpd
+import shapely
+from shapely.geometry import MultiPoint
 
-def convert_coordinate(value):
-    if pd.isna(value):
-        return np.nan
+# Create points from cleaned meters
+meters = gpd.GeoDataFrame(
+    df_valid.copy(),
+    geometry=gpd.points_from_xy(
+        df_valid["longitude_clean"],
+        df_valid["latitude_clean"]
+    ),
+    crs="EPSG:4326"
+).to_crs("EPSG:5070")
 
-    # Convert to string and clean
-    value = str(value).strip()
-
-    if not value:
-        return np.nan
-
-    # Replace decimal commas
-    value = value.replace(",", ".")
-
-    # Split degrees and minutes
-    parts = value.split()
-
-    try:
-        # Decimal degrees
-        if len(parts) == 1:
-            return float(parts[0])
-
-        # Degrees and decimal minutes
-        elif len(parts) == 2:
-            degrees = float(parts[0])
-            minutes = float(parts[1])
-
-            if not 0 <= minutes < 60:
-                return np.nan
-
-            sign = -1 if degrees < 0 else 1
-
-            return sign * (
-                abs(degrees) + minutes / 60
-            )
-
-        else:
-            return np.nan
-
-    except (ValueError, TypeError):
-        return np.nan
-
-
-# Apply to both columns
-df_meters["latitude_clean"] = (
-    df_meters["latitude"].apply(convert_coordinate)
+# Create a single geometry containing all meter points
+meter_points = MultiPoint(
+    list(meters.geometry)
 )
 
-df_meters["longitude_clean"] = (
-    df_meters["longitude"].apply(convert_coordinate)
+# Build a concave hull
+outer_boundary = shapely.concave_hull(
+    meter_points,
+    ratio=0.15,
+    allow_holes=False
+)
+
+footprint = gpd.GeoDataFrame(
+    geometry=[outer_boundary],
+    crs=meters.crs
 )
 
 
+# Make sure both datasets use the same CRS
+grid = grid.to_crs(footprint.crs)
 
-valid_coords = (
-    df_meters["latitude_clean"].between(25, 37)
-    & df_meters["longitude_clean"].between(-107, -93)
+# Clip the grid to the meter footprint
+grid_clipped = gpd.clip(
+    grid,
+    footprint
 )
 
-df_valid = df_meters[valid_coords].copy()
-df_invalid = df_meters[~valid_coords].copy()
-
-print(f"Total meters: {len(df_meters):,}")
-print(f"Valid coordinates: {len(df_valid):,}")
-print(f"Invalid coordinates: {len(df_invalid):,}")
-print(f"Valid percentage: {valid_coords.mean():.2%}")
-
-# Inspect invalid values
-display(
-    df_invalid[
-        ["latitude", "longitude",
-         "latitude_clean", "longitude_clean"]
-    ].head(30)
+# Merge cells belonging to the same op area
+boundaries_new = (
+    grid_clipped
+    .dissolve(by="op_area")
+    .reset_index()
 )
+
+# Convert back to geographic coordinates
+boundaries_new = boundaries_new.to_crs("EPSG:4326")
+
+# Export GeoJSON
+boundaries_new.to_file(
+    "op_area_boundaries_refined.geojson",
+    driver="GeoJSON"
+)
+
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(16, 12))
+
+boundaries_new.plot(
+    ax=ax,
+    column="op_area",
+    cmap="tab20",
+    edgecolor="black",
+    linewidth=0.7,
+    alpha=0.6,
+    legend=True
+)
+
+meters.to_crs("EPSG:4326").plot(
+    ax=ax,
+    color="black",
+    markersize=0.3,
+    alpha=0.15
+)
+
+ax.set_title(
+    "Estimated Operational Areas Based on Meter Locations",
+    fontsize=16
+)
+
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
 
