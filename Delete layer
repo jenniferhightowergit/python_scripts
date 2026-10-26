@@ -1,28 +1,89 @@
-import re
 
-# Style the entire GRAND TOTAL row
-def highlight_grand_total(match):
-    row = match.group(0)
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import box
+from scipy.spatial import cKDTree
 
-    # Change white cell backgrounds to blue
-    row = row.replace(
-        "background-color:#FFFFFF;",
-        "background-color:#E8EFF5;"
+# df_meters contains:
+# meter_id, op_area, latitude, longitude
+
+meters = gpd.GeoDataFrame(
+    df_meters.dropna(
+        subset=["latitude", "longitude", "op_area"]
+    ).copy(),
+    geometry=gpd.points_from_xy(
+        df_meters.dropna(
+            subset=["latitude", "longitude", "op_area"]
+        )["longitude"],
+        df_meters.dropna(
+            subset=["latitude", "longitude", "op_area"]
+        )["latitude"]
+    ),
+    crs="EPSG:4326"
+)
+
+# Project into meters for distance calculations
+meters = meters.to_crs("EPSG:5070")
+
+# Build a fixed grid (2 km cells)
+cell_size = 2000
+
+xmin, ymin, xmax, ymax = meters.total_bounds
+
+cells = []
+
+for x in np.arange(xmin, xmax, cell_size):
+    for y in np.arange(ymin, ymax, cell_size):
+        cells.append(
+            box(x, y, x + cell_size, y + cell_size)
+        )
+
+grid = gpd.GeoDataFrame(
+    geometry=cells,
+    crs=meters.crs
+)
+
+# Find the nearest meters to each grid cell
+meter_xy = np.column_stack([
+    meters.geometry.x,
+    meters.geometry.y
+])
+
+centroids = grid.geometry.centroid
+
+grid_xy = np.column_stack([
+    centroids.x,
+    centroids.y
+])
+
+tree = cKDTree(meter_xy)
+
+k = min(5, len(meters))
+distances, indices = tree.query(grid_xy, k=k)
+
+indices = np.atleast_2d(indices)
+if k == 1:
+    indices = indices.T
+
+labels = meters["op_area"].to_numpy()
+
+# Assign each cell by majority vote
+grid["op_area"] = [
+    max(
+        set(labels[idx]),
+        key=lambda area: np.sum(labels[idx] == area)
     )
+    for idx in indices
+]
 
-    # Make every cell bold
-    row = row.replace(
-        "<td style=\"",
-        "<td style=\"font-weight:bold;"
-    )
+# Merge neighboring cells with same op area
+boundaries = grid.dissolve(by="op_area").reset_index()
 
-    return row
+# Convert back to lat/long
+boundaries = boundaries.to_crs("EPSG:4326")
 
-
-inventory_html = re.sub(
-    r"<tr>.*?GRAND TOTAL.*?</tr>",
-    highlight_grand_total,
-    inventory_html,
-    count=1,
-    flags=re.DOTALL | re.IGNORECASE
+# Export
+boundaries.to_file(
+    "op_area_boundaries.geojson",
+    driver="GeoJSON"
 )
