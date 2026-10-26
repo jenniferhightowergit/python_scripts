@@ -1,77 +1,204 @@
 
+import numpy as np
+import pandas as pd
 import geopandas as gpd
-import shapely
-from shapely.geometry import MultiPoint
+import matplotlib.pyplot as plt
 
-# Create points from cleaned meters
+from shapely.geometry import box
+from scipy.spatial import cKDTree
+from pathlib import Path
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+LAT_COL = "latitude_clean"
+LON_COL = "longitude_clean"
+AREA_COL = "op_area"
+
+# Grid resolution in meters
+# Smaller = more detailed boundaries, but slower processing
+CELL_SIZE = 2000
+
+# Number of nearby meters used to assign each cell
+K_NEIGHBORS = 5
+
+OUTPUT_FILE = "op_area_boundaries_final.geojson"
+
+# ============================================================
+# 2. PREPARE METER DATA
+# ============================================================
+
+df = df_valid.dropna(
+    subset=[LAT_COL, LON_COL, AREA_COL]
+).copy()
+
+# Keep valid Texas-range coordinates
+df = df[
+    df[LAT_COL].between(25, 37)
+    & df[LON_COL].between(-107, -93)
+].copy()
+
+if df.empty:
+    raise ValueError("No valid meter coordinates found.")
+
+print(f"Total valid meters: {len(df):,}")
+print(f"Operational areas: {df[AREA_COL].nunique()}")
+
 meters = gpd.GeoDataFrame(
-    df_valid.copy(),
+    df,
     geometry=gpd.points_from_xy(
-        df_valid["longitude_clean"],
-        df_valid["latitude_clean"]
+        df[LON_COL],
+        df[LAT_COL]
     ),
     crs="EPSG:4326"
-).to_crs("EPSG:5070")
-
-# Create a single geometry containing all meter points
-meter_points = MultiPoint(
-    list(meters.geometry)
 )
 
-# Build a concave hull
-outer_boundary = shapely.concave_hull(
-    meter_points,
-    ratio=0.15,
-    allow_holes=False
-)
+# Use a projected CRS for spatial calculations
+meters = meters.to_crs("EPSG:5070")
+
+# ============================================================
+# 3. CREATE OUTER BOUNDARY FROM METER LOCATIONS
+# ============================================================
+
+# Convex hull wraps around the outermost meters
+outer_hull = meters.geometry.union_all().convex_hull
 
 footprint = gpd.GeoDataFrame(
-    geometry=[outer_boundary],
+    geometry=[outer_hull],
     crs=meters.crs
 )
 
+print("Outer meter footprint created.")
 
-# Make sure both datasets use the same CRS
-grid = grid.to_crs(footprint.crs)
+# ============================================================
+# 4. CREATE GEOGRAPHIC GRID
+# ============================================================
 
-# Clip the grid to the meter footprint
-grid_clipped = gpd.clip(
-    grid,
-    footprint
+xmin, ymin, xmax, ymax = meters.total_bounds
+
+x_coords = np.arange(xmin, xmax, CELL_SIZE)
+y_coords = np.arange(ymin, ymax, CELL_SIZE)
+
+cells = [
+    box(x, y, x + CELL_SIZE, y + CELL_SIZE)
+    for x in x_coords
+    for y in y_coords
+]
+
+grid = gpd.GeoDataFrame(
+    geometry=cells,
+    crs=meters.crs
 )
 
-# Merge cells belonging to the same op area
-boundaries_new = (
-    grid_clipped
-    .dissolve(by="op_area")
+print(f"Initial grid cells: {len(grid):,}")
+
+# ============================================================
+# 5. CLIP GRID TO METER FOOTPRINT
+# ============================================================
+
+grid = gpd.clip(
+    grid,
+    footprint
+).reset_index(drop=True)
+
+print(f"Grid cells inside footprint: {len(grid):,}")
+
+# ============================================================
+# 6. ASSIGN GRID CELLS TO OPERATIONAL AREAS
+# ============================================================
+
+meter_xy = np.column_stack([
+    meters.geometry.x,
+    meters.geometry.y
+])
+
+cell_centroids = grid.geometry.centroid
+
+grid_xy = np.column_stack([
+    cell_centroids.x,
+    cell_centroids.y
+])
+
+tree = cKDTree(meter_xy)
+
+k = min(K_NEIGHBORS, len(meters))
+
+distances, indices = tree.query(
+    grid_xy,
+    k=k
+)
+
+# Normalize shape for single-neighbor case
+if k == 1:
+    indices = indices.reshape(-1, 1)
+
+labels = meters[AREA_COL].to_numpy()
+
+def majority_area(neighbor_indices):
+    values = labels[neighbor_indices]
+
+    unique, counts = np.unique(
+        values,
+        return_counts=True
+    )
+
+    return unique[np.argmax(counts)]
+
+grid[AREA_COL] = [
+    majority_area(idx)
+    for idx in indices
+]
+
+print("Operational areas assigned to grid cells.")
+
+# ============================================================
+# 7. DISSOLVE CELLS INTO OPERATIONAL AREA POLYGONS
+# ============================================================
+
+boundaries = (
+    grid
+    .dissolve(by=AREA_COL)
     .reset_index()
 )
 
-# Convert back to geographic coordinates
-boundaries_new = boundaries_new.to_crs("EPSG:4326")
+# Repair invalid geometries if necessary
+boundaries["geometry"] = (
+    boundaries.geometry.make_valid()
+)
 
-# Export GeoJSON
-boundaries_new.to_file(
-    "op_area_boundaries_refined.geojson",
+print(f"Operational area polygons: {len(boundaries)}")
+
+# ============================================================
+# 8. EXPORT GEOJSON
+# ============================================================
+
+boundaries_export = boundaries.to_crs("EPSG:4326")
+
+boundaries_export.to_file(
+    OUTPUT_FILE,
     driver="GeoJSON"
 )
 
+print(f"GeoJSON saved: {Path(OUTPUT_FILE).resolve()}")
 
-import matplotlib.pyplot as plt
+# ============================================================
+# 9. PLOT OPERATIONAL AREAS AND METER LOCATIONS
+# ============================================================
 
 fig, ax = plt.subplots(figsize=(16, 12))
 
-boundaries_new.plot(
+boundaries.plot(
     ax=ax,
-    column="op_area",
+    column=AREA_COL,
     cmap="tab20",
     edgecolor="black",
-    linewidth=0.7,
-    alpha=0.6,
+    linewidth=0.6,
+    alpha=0.65,
     legend=True
 )
 
-meters.to_crs("EPSG:4326").plot(
+meters.plot(
     ax=ax,
     color="black",
     markersize=0.3,
@@ -79,12 +206,34 @@ meters.to_crs("EPSG:4326").plot(
 )
 
 ax.set_title(
-    "Estimated Operational Areas Based on Meter Locations",
+    "Estimated Operational Area Boundaries",
     fontsize=16
 )
 
 ax.set_axis_off()
+
 plt.tight_layout()
 plt.show()
 
+# ============================================================
+# 10. VALIDATE POLYGON OVERLAPS
+# ============================================================
 
+from itertools import combinations
+
+overlap_count = 0
+
+for i, j in combinations(range(len(boundaries)), 2):
+
+    geom1 = boundaries.geometry.iloc[i]
+    geom2 = boundaries.geometry.iloc[j]
+
+    overlap_area = geom1.intersection(geom2).area
+
+    if overlap_area > 1:
+        overlap_count += 1
+
+print(f"Overlapping operational area pairs: {overlap_count}")
+
+if overlap_count == 0:
+    print("Validation passed: no significant overlaps.")
