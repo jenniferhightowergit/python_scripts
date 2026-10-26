@@ -1,89 +1,38 @@
 
-import numpy as np
-import geopandas as gpd
-from shapely.geometry import box
-from scipy.spatial import cKDTree
+import pandas as pd
 
-# df_meters contains:
-# meter_id, op_area, latitude, longitude
+def convert_coordinate(value):
+    if pd.isna(value):
+        return None
 
-meters = gpd.GeoDataFrame(
-    df_meters.dropna(
-        subset=["latitude", "longitude", "op_area"]
-    ).copy(),
-    geometry=gpd.points_from_xy(
-        df_meters.dropna(
-            subset=["latitude", "longitude", "op_area"]
-        )["longitude"],
-        df_meters.dropna(
-            subset=["latitude", "longitude", "op_area"]
-        )["latitude"]
-    ),
-    crs="EPSG:4326"
-)
+    value = str(value).strip()
+    parts = value.split()
 
-# Project into meters for distance calculations
-meters = meters.to_crs("EPSG:5070")
+    # Already decimal degrees
+    if len(parts) == 1:
+        return float(parts[0])
 
-# Build a fixed grid (2 km cells)
-cell_size = 2000
+    # Degrees and decimal minutes
+    if len(parts) == 2:
+        degrees = float(parts[0])
+        minutes = float(parts[1])
 
-xmin, ymin, xmax, ymax = meters.total_bounds
+        if not 0 <= minutes < 60:
+            return None
 
-cells = []
+        sign = -1 if degrees < 0 else 1
 
-for x in np.arange(xmin, xmax, cell_size):
-    for y in np.arange(ymin, ymax, cell_size):
-        cells.append(
-            box(x, y, x + cell_size, y + cell_size)
+        return sign * (
+            abs(degrees) + minutes / 60
         )
 
-grid = gpd.GeoDataFrame(
-    geometry=cells,
-    crs=meters.crs
+    return None
+
+
+df_meters["longitude_clean"] = (
+    df_meters["longitude"].apply(convert_coordinate)
 )
 
-# Find the nearest meters to each grid cell
-meter_xy = np.column_stack([
-    meters.geometry.x,
-    meters.geometry.y
-])
-
-centroids = grid.geometry.centroid
-
-grid_xy = np.column_stack([
-    centroids.x,
-    centroids.y
-])
-
-tree = cKDTree(meter_xy)
-
-k = min(5, len(meters))
-distances, indices = tree.query(grid_xy, k=k)
-
-indices = np.atleast_2d(indices)
-if k == 1:
-    indices = indices.T
-
-labels = meters["op_area"].to_numpy()
-
-# Assign each cell by majority vote
-grid["op_area"] = [
-    max(
-        set(labels[idx]),
-        key=lambda area: np.sum(labels[idx] == area)
-    )
-    for idx in indices
-]
-
-# Merge neighboring cells with same op area
-boundaries = grid.dissolve(by="op_area").reset_index()
-
-# Convert back to lat/long
-boundaries = boundaries.to_crs("EPSG:4326")
-
-# Export
-boundaries.to_file(
-    "op_area_boundaries.geojson",
-    driver="GeoJSON"
+df_meters["latitude_clean"] = (
+    df_meters["latitude"].apply(convert_coordinate)
 )
