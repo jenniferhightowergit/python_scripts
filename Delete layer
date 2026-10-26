@@ -1,72 +1,83 @@
 
+import numpy as np
+import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import numpy as np
 import shapely
 
-from shapely.geometry import MultiPoint
-from shapely.ops import unary_union
+from shapely.geometry import box
+from scipy.spatial import cKDTree
+from pathlib import Path
+from itertools import combinations
 
 # ============================================================
-# 1. SETTINGS
+# 1. CONFIGURATION
 # ============================================================
 
+# Input DataFrame:
+# df_valid must already contain your cleaned meter data.
+
+LAT_COL = "latitude_clean"
+LON_COL = "longitude_clean"
 AREA_COL = "op_area"
 
-# Buffer distance around meters, in meters
+# Distance around each meter (meters)
 BUFFER_DISTANCE = 3000
 
-OUTPUT_FILE = "op_area_buffered_boundaries.geojson"
+# Geographic grid resolution (meters)
+CELL_SIZE = 1000
+
+# Number of nearby meters used to assign an op area
+K_NEIGHBORS = 5
+
+OUTPUT_FILE = "op_area_boundaries_3km.geojson"
 
 # ============================================================
-# 2. PREPARE METER LOCATIONS
+# 2. CLEAN AND VALIDATE METER DATA
 # ============================================================
 
-# Uses the meters GeoDataFrame from our previous script
-meters = meters.to_crs("EPSG:5070").copy()
+df = df_valid.dropna(
+    subset=[LAT_COL, LON_COL, AREA_COL]
+).copy()
 
-meters = meters.dropna(
-    subset=[AREA_COL]
-)
+df = df[
+    df[LAT_COL].between(25, 37)
+    & df[LON_COL].between(-107, -93)
+].copy()
 
-# Remove duplicate coordinates for Voronoi generation.
-# If multiple op areas share a coordinate, choose the
-# most common label, with alphabetical tie-breaking.
-meters["x"] = meters.geometry.x
-meters["y"] = meters.geometry.y
+if df.empty:
+    raise ValueError("No valid meter coordinates found.")
 
-point_labels = (
-    meters.groupby(["x", "y", AREA_COL])
-    .size()
-    .reset_index(name="n")
-    .sort_values(
-        ["x", "y", "n", AREA_COL],
-        ascending=[True, True, False, True]
-    )
-    .drop_duplicates(["x", "y"])
-)
+print(f"Valid meters: {len(df):,}")
+print(f"Operational areas: {df[AREA_COL].nunique()}")
 
-unique_meters = gpd.GeoDataFrame(
-    point_labels,
+# ============================================================
+# 3. CREATE GEOGRAPHIC POINTS
+# ============================================================
+
+meters = gpd.GeoDataFrame(
+    df,
     geometry=gpd.points_from_xy(
-        point_labels["x"],
-        point_labels["y"]
+        df[LON_COL],
+        df[LAT_COL]
     ),
-    crs=meters.crs
-).reset_index(drop=True)
+    crs="EPSG:4326"
+)
 
-print(f"Unique meter locations: {len(unique_meters):,}")
+# Project to meters for distance calculations
+meters = meters.to_crs("EPSG:5070")
 
 # ============================================================
-# 3. BUILD BUFFERED METER FOOTPRINT
+# 4. CREATE 3 KM BUFFERED METER FOOTPRINT
 # ============================================================
 
-# Buffer every meter
+print("Creating 3 km meter buffers...")
+
 meter_buffers = meters.geometry.buffer(
     BUFFER_DISTANCE
 )
 
-# Merge overlapping buffers
+# Merge overlapping buffers into a single geometry
 footprint_geom = shapely.union_all(
     meter_buffers.values
 )
@@ -79,57 +90,140 @@ footprint = gpd.GeoDataFrame(
 print("Buffered meter footprint created.")
 
 # ============================================================
-# 4. CREATE VORONOI PARTITION
+# 5. CREATE GRID OVER METER EXTENT
 # ============================================================
 
-# Create Voronoi cells from meter locations
-points = MultiPoint(
-    list(unique_meters.geometry)
+xmin, ymin, xmax, ymax = meters.total_bounds
+
+x_coords = np.arange(
+    xmin - BUFFER_DISTANCE,
+    xmax + BUFFER_DISTANCE,
+    CELL_SIZE
 )
 
-# Voronoi diagram; ordered=True associates cells with
-# the original point order (Shapely 2.1+/GEOS 3.12+)
-voronoi = shapely.voronoi_polygons(
-    points,
-    extend_to=footprint_geom.envelope,
-    ordered=True
+y_coords = np.arange(
+    ymin - BUFFER_DISTANCE,
+    ymax + BUFFER_DISTANCE,
+    CELL_SIZE
 )
 
-cells = list(voronoi.geoms)
+cells = [
+    box(x, y, x + CELL_SIZE, y + CELL_SIZE)
+    for x in x_coords
+    for y in y_coords
+]
 
-voronoi_gdf = gpd.GeoDataFrame(
-    {
-        AREA_COL: unique_meters[AREA_COL].values
-    },
+grid = gpd.GeoDataFrame(
     geometry=cells,
     crs=meters.crs
 )
 
+print(f"Initial grid cells: {len(grid):,}")
+
 # ============================================================
-# 5. CLIP VORONOI CELLS TO BUFFERED FOOTPRINT
+# 6. CLIP GRID TO BUFFERED FOOTPRINT
 # ============================================================
 
-clipped = gpd.clip(
-    voronoi_gdf,
+grid = gpd.clip(
+    grid,
     footprint
+).reset_index(drop=True)
+
+print(f"Grid cells inside footprint: {len(grid):,}")
+
+# ============================================================
+# 7. ASSIGN EACH GRID CELL TO AN OP AREA
+# ============================================================
+
+print("Assigning operational areas...")
+
+meter_xy = np.column_stack([
+    meters.geometry.x,
+    meters.geometry.y
+])
+
+centroids = grid.geometry.centroid
+
+grid_xy = np.column_stack([
+    centroids.x,
+    centroids.y
+])
+
+tree = cKDTree(meter_xy)
+
+k = min(
+    K_NEIGHBORS,
+    len(meters)
 )
 
-# Merge all cells belonging to the same op area
+distances, indices = tree.query(
+    grid_xy,
+    k=k
+)
+
+if k == 1:
+    indices = indices.reshape(-1, 1)
+
+labels = meters[AREA_COL].astype(str).to_numpy()
+
+def assign_area(neighbor_indices):
+
+    nearby_areas = labels[neighbor_indices]
+
+    unique, counts = np.unique(
+        nearby_areas,
+        return_counts=True
+    )
+
+    return unique[np.argmax(counts)]
+
+grid[AREA_COL] = [
+    assign_area(idx)
+    for idx in indices
+]
+
+# ============================================================
+# 8. DISSOLVE INTO OPERATIONAL AREA POLYGONS
+# ============================================================
+
+print("Creating operational area polygons...")
+
 boundaries = (
-    clipped
+    grid
     .dissolve(by=AREA_COL)
     .reset_index()
 )
 
-# Repair geometries
 boundaries["geometry"] = (
     boundaries.geometry.make_valid()
 )
 
-print(f"Operational areas: {len(boundaries)}")
+boundaries = boundaries[
+    ~boundaries.geometry.is_empty
+].copy()
+
+print(f"Operational areas created: {len(boundaries)}")
 
 # ============================================================
-# 6. EXPORT TO GEOJSON
+# 9. VALIDATE OVERLAPPING POLYGONS
+# ============================================================
+
+print("Checking for overlaps...")
+
+overlap_count = 0
+
+for i, j in combinations(range(len(boundaries)), 2):
+
+    geom1 = boundaries.geometry.iloc[i]
+    geom2 = boundaries.geometry.iloc[j]
+
+    if geom1.intersection(geom2).area > 1:
+        overlap_count += 1
+
+print(f"Overlapping area pairs: {overlap_count}")
+
+# ============================================================
+# 10. EXPORT GEOJSON FOR TABLEAU
 # ============================================================
 
 boundaries_export = boundaries.to_crs("EPSG:4326")
@@ -139,13 +233,15 @@ boundaries_export.to_file(
     driver="GeoJSON"
 )
 
-print(f"Saved: {OUTPUT_FILE}")
+print(f"GeoJSON saved to: {Path(OUTPUT_FILE).resolve()}")
 
 # ============================================================
-# 7. PLOT THE RESULT
+# 11. PLOT BOUNDARIES WITH METER LOCATIONS
 # ============================================================
 
-fig, ax = plt.subplots(figsize=(16, 12))
+fig, ax = plt.subplots(
+    figsize=(18, 12)
+)
 
 boundaries.plot(
     ax=ax,
@@ -165,7 +261,7 @@ meters.plot(
 )
 
 ax.set_title(
-    "Operational Areas - Buffered Meter Footprints",
+    "Operational Area Boundaries - 3 km Meter Buffers",
     fontsize=16
 )
 
