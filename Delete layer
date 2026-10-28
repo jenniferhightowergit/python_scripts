@@ -1,14 +1,7 @@
-nlp_database/
-│
-├── staging/
-│   └── training_staging.duckdb
-│
-├── production/
-│   ├── training_prod_20261028.duckdb
-│   ├── training_prod_20261029.duckdb
-│   └── current_version.json
-│
-├── backups/
-│
-└── logs/
-    └── pipeline_runs.csv
+import duckdb
+
+con = duckdb.connect(
+    database=production_path,
+    read_only=True
+)
+
