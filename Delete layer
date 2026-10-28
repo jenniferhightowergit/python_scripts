@@ -1,21 +1,49 @@
-ROUND(
-    3958.7613 * 2 * ASIN(
-        SQRT(
-            LEAST(1,
-                POWER(
-                    SIN((A.LATITUDE - A.PREV_LATITUDE)
-                        * ACOS(-1) / 360), 2
-                )
-                +
-                COS(A.PREV_LATITUDE * ACOS(-1) / 180)
-                * COS(A.LATITUDE * ACOS(-1) / 180)
-                *
-                POWER(
-                    SIN((A.LONGITUDE - A.PREV_LONGITUDE)
-                        * ACOS(-1) / 360), 2
-                )
-            )
+
+import pandas as pd
+
+# Get unique meter numbers from dataframe
+meters = (
+    df_meters["METERNO"]
+    .dropna()
+    .astype(str)
+    .unique()
+    .tolist()
+)
+
+batch_size = 900
+all_results = []
+
+with edw_alchemy_engine() as sql_connection:
+
+    for i in range(0, len(meters), batch_size):
+
+        batch = meters[i:i + batch_size]
+
+        # Build the IN clause
+        meter_string = ",".join(
+            f"'{m.replace(chr(39), chr(39) * 2)}'"
+            for m in batch
         )
-    ),
-    2
-) AS DISTANCE_MILES
+
+        query = f"""
+            SELECT *
+            FROM CADPROD.ORDER_INFO
+            WHERE METERNO IN ({meter_string})
+        """
+
+        df = pd.read_sql(query, sql_connection)
+
+        all_results.append(df)
+
+        print(
+            f"Batch {i // batch_size + 1}: "
+            f"{len(df):,} rows returned"
+        )
+
+# Combine all batches
+df_final = pd.concat(
+    all_results,
+    ignore_index=True
+) if all_results else pd.DataFrame()
+
+print(f"Total records: {len(df_final):,}")
