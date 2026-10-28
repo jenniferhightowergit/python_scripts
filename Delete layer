@@ -1,49 +1,14 @@
-
-import pandas as pd
-
-# Get unique meter numbers from dataframe
-meters = (
-    df_meters["METERNO"]
-    .dropna()
-    .astype(str)
-    .unique()
-    .tolist()
-)
-
-batch_size = 900
-all_results = []
-
-with edw_alchemy_engine() as sql_connection:
-
-    for i in range(0, len(meters), batch_size):
-
-        batch = meters[i:i + batch_size]
-
-        # Build the IN clause
-        meter_string = ",".join(
-            f"'{m.replace(chr(39), chr(39) * 2)}'"
-            for m in batch
-        )
-
-        query = f"""
-            SELECT *
-            FROM CADPROD.ORDER_INFO
-            WHERE METERNO IN ({meter_string})
-        """
-
-        df = pd.read_sql(query, sql_connection)
-
-        all_results.append(df)
-
-        print(
-            f"Batch {i // batch_size + 1}: "
-            f"{len(df):,} rows returned"
-        )
-
-# Combine all batches
-df_final = pd.concat(
-    all_results,
-    ignore_index=True
-) if all_results else pd.DataFrame()
-
-print(f"Total records: {len(df_final):,}")
+nlp_database/
+│
+├── staging/
+│   └── training_staging.duckdb
+│
+├── production/
+│   ├── training_prod_20261028.duckdb
+│   ├── training_prod_20261029.duckdb
+│   └── current_version.json
+│
+├── backups/
+│
+└── logs/
+    └── pipeline_runs.csv
