@@ -1,113 +1,30 @@
-import pandas as pd
+# 3. S4E Inventory Burndown
 
-df_burndown = monthly_removals.copy()
+burndown_html = """
+<table role="presentation"
+       width="100%"
+       cellpadding="0"
+       cellspacing="0"
+       style="border-collapse:collapse;
+              margin-top:20px;
+              margin-bottom:24px;">
 
-# Build a date column from the existing year/month fields
-df_burndown["Date"] = pd.to_datetime(
-    dict(
-        year=df_burndown["REMOVAL_YEAR"],
-        month=df_burndown["REMOVAL_MONTH"],
-        day=1
-    )
-)
+    <tr>
+        <td align="center"
+            style="padding:12px 0;">
 
-df_burndown = df_burndown.sort_values("Date")
+            <img src="cid:project_ranger_burndown"
+                 alt="S4E Inventory Burndown"
+                 width="850"
+                 style="display:block;
+                        width:100%;
+                        max-width:850px;
+                        height:auto;
+                        border:0;">
 
-# Use the existing calculated remaining inventory
-df_burndown["Remaining"] = df_burndown["Remaining_S4E"]
+        </td>
+    </tr>
+</table>
+"""
 
-# Starting inventory before removals
-total_s4e = (
-    df_burndown["Remaining_S4E"].iloc[-1]
-    + df_burndown["Cumulative_Removed"].iloc[-1]
-)
 
-df_burndown = df_burndown[
-    df_burndown["Date"] >= "2025-12-01"
-].copy()
-
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import pandas as pd
-
-df = df_burndown.copy()
-
-fig, ax = plt.subplots(figsize=(12, 4.5), dpi=160)
-
-fig.patch.set_facecolor("white")
-ax.set_facecolor("white")
-
-# Main burndown line
-ax.plot(
-    df["Date"],
-    df["Remaining"],
-    color="#174A7E",
-    linewidth=2.8,
-    marker="o",
-    markersize=4
-)
-
-# Subtle shaded area
-ax.fill_between(
-    df["Date"],
-    df["Remaining"],
-    df["Remaining"].min() * 0.92,
-    color="#DCEAF5",
-    alpha=0.45
-)
-
-# Highlight final value
-last = df.iloc[-1]
-
-ax.scatter(
-    last["Date"],
-    last["Remaining"],
-    s=95,
-    color="#087E8B",
-    zorder=5
-)
-
-ax.annotate(
-    f'{last["Remaining"]:,.0f}',
-    xy=(last["Date"], last["Remaining"]),
-    xytext=(-8, 16),
-    textcoords="offset points",
-    ha="right",
-    fontsize=12,
-    fontweight="bold",
-    color="#087E8B"
-)
-
-ax.set_title(
-    "S4E INVENTORY BURNDOWN",
-    loc="left",
-    fontsize=15,
-    fontweight="bold",
-    color="#173B63",
-    pad=22
-)
-
-ax.set_ylabel("Remaining S4E Meters")
-
-ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
-
-ax.spines[["top", "right", "left"]].set_visible(False)
-ax.spines["bottom"].set_color("#DCE3EA")
-
-ax.grid(axis="y", alpha=0.15)
-ax.tick_params(axis="both", length=0, pad=8)
-
-ax.set_ylim(bottom=0)
-ax.margins(x=0.04)
-
-plt.tight_layout()
-
-plt.savefig(
-    "project_ranger_burndown.png",
-    dpi=180,
-    bbox_inches="tight",
-    facecolor="white"
-)
-
-plt.show()
