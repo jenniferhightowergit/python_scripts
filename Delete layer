@@ -1,30 +1,69 @@
-# 3. S4E Inventory Burndown
+<!-- S4E INVENTORY BURNDOWN -->
+<tr>
+    <td align="center"
+        style="padding:0 18px 24px 18px;">
 
-burndown_html = """
-<table role="presentation"
-       width="100%"
-       cellpadding="0"
-       cellspacing="0"
-       style="border-collapse:collapse;
-              margin-top:20px;
-              margin-bottom:24px;">
+        <img src="cid:project_ranger_burndown"
+             alt="S4E Inventory Burndown"
+             width="850"
+             style="display:block;
+                    width:100%;
+                    max-width:850px;
+                    height:auto;
+                    border:0;">
 
-    <tr>
-        <td align="center"
-            style="padding:12px 0;">
+    </td>
+</tr>
 
-            <img src="cid:project_ranger_burndown"
-                 alt="S4E Inventory Burndown"
-                 width="850"
-                 style="display:block;
-                        width:100%;
-                        max-width:850px;
-                        height:auto;
-                        border:0;">
 
-        </td>
-    </tr>
-</table>
-"""
+import os
+import win32com.client as win32
+import pythoncom
 
+
+def send_report(email_html, chart_path):
+
+    pythoncom.CoInitialize()
+
+    mail = None
+    outlook = None
+
+    try:
+        outlook = win32.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+
+        mail.To = "jennifer.hightower@oncor.com"
+        # mail.CC = "Edmundo.Rodriguez@oncor.com"
+
+        mail.Subject = (
+            "[Report] [Project Ranger] - "
+            "Project Ranger Status Update"
+        )
+
+        mail.HTMLBody = email_html
+
+        # Attach chart as an inline Outlook image
+        attachment = mail.Attachments.Add(
+            os.path.abspath(chart_path)
+        )
+
+        attachment.PropertyAccessor.SetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+            "project_ranger_burndown"
+        )
+
+        attachment.PropertyAccessor.SetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B",
+            True
+        )
+
+        mail.Save()
+        mail.Send()
+
+        print("Project Ranger report sent successfully")
+
+    finally:
+        mail = None
+        outlook = None
+        pythoncom.CoUninitialize()
 
