@@ -1,69 +1,42 @@
-<!-- S4E INVENTORY BURNDOWN -->
-<tr>
-    <td align="center"
-        style="padding:0 18px 24px 18px;">
+# Keep original data unchanged
+stock_clean = stock.copy()
 
-        <img src="cid:project_ranger_burndown"
-             alt="S4E Inventory Burndown"
-             width="850"
-             style="display:block;
-                    width:100%;
-                    max-width:850px;
-                    height:auto;
-                    border:0;">
+# Stock-specific display rules
+rules = {
+    "0404103": {"form": "03", "volt": "120/240"},
+    "0404326": {"form": "45", "volt": "120/240"},
+    "0405056": {"form": "36", "volt": "120"},
+    "0405160": {"form": "09", "volt": "120/240"}
+}
 
-    </td>
-</tr>
+# Normalize stock numbers and form values
+stock_clean["STOCKNO"] = stock_clean["STOCKNO"].astype(str).str.strip()
+stock_clean["form"] = stock_clean["form"].astype(str).str.zfill(2)
 
+# Apply rules
+for stockno, rule in rules.items():
+    mask = stock_clean["STOCKNO"].eq(stockno)
 
-import os
-import win32com.client as win32
-import pythoncom
+    stock_clean.loc[mask, "form"] = rule["form"]
+    stock_clean.loc[mask, "volt"] = rule["volt"]
 
+# Combine matching rows
+stock_clean = (
+    stock_clean
+    .groupby(
+        ["STOCKNO", "class", "form", "volt"],
+        as_index=False,
+        dropna=False
+    )
+    .agg({
+        "NEEDED_AMOUNT": "sum",
+        "STOCK_AMOUNT": "sum"
+    })
+)
 
-def send_report(email_html, chart_path):
+# Filter AFTER combining
+stock_clean = stock_clean[
+    stock_clean["NEEDED_AMOUNT"] > 0
+].copy()
 
-    pythoncom.CoInitialize()
-
-    mail = None
-    outlook = None
-
-    try:
-        outlook = win32.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)
-
-        mail.To = "jennifer.hightower@oncor.com"
-        # mail.CC = "Edmundo.Rodriguez@oncor.com"
-
-        mail.Subject = (
-            "[Report] [Project Ranger] - "
-            "Project Ranger Status Update"
-        )
-
-        mail.HTMLBody = email_html
-
-        # Attach chart as an inline Outlook image
-        attachment = mail.Attachments.Add(
-            os.path.abspath(chart_path)
-        )
-
-        attachment.PropertyAccessor.SetProperty(
-            "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
-            "project_ranger_burndown"
-        )
-
-        attachment.PropertyAccessor.SetProperty(
-            "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B",
-            True
-        )
-
-        mail.Save()
-        mail.Send()
-
-        print("Project Ranger report sent successfully")
-
-    finally:
-        mail = None
-        outlook = None
-        pythoncom.CoUninitialize()
-
+stock_clean.head(100)
