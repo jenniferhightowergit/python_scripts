@@ -1,7 +1,103 @@
-import duckdb
+"""Generate a standalone NLP model performance dashboard.
 
-con = duckdb.connect(
-    database=production_path,
-    read_only=True
-)
+Run: python model_performance_report.py
+Requires: Python 3.9+ (standard library only).
 
+To switch to DuckDB later, replace load_dummy_data() with a function that
+returns the same list of dictionaries from a database query.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from html import escape
+from pathlib import Path
+
+OUTPUT_PATH = Path(__file__).with_name('nlp_model_performance_report.html')
+
+
+def load_dummy_data() -> list[dict]:
+    """Simulated data; one evaluation per model, joined to model/category metadata."""
+    return [
+        dict(model_id=1, name='Battery v1', category_id=1, category='Battery Change', active_flag=False, tpc=180, tnc=740, fpc=30, fnc=50),
+        dict(model_id=2, name='Battery v2', category_id=1, category='Battery Change', active_flag=True, tpc=210, tnc=750, fpc=20, fnc=20),
+        dict(model_id=3, name='LCD v1', category_id=2, category='Bad LCD', active_flag=False, tpc=140, tnc=790, fpc=40, fnc=30),
+        dict(model_id=4, name='LCD v2', category_id=2, category='Bad LCD', active_flag=True, tpc=155, tnc=810, fpc=20, fnc=15),
+        dict(model_id=5, name='Meter v1', category_id=3, category='Meter Change', active_flag=False, tpc=300, tnc=600, fpc=60, fnc=40),
+        dict(model_id=6, name='Meter v2', category_id=3, category='Meter Change', active_flag=True, tpc=320, tnc=620, fpc=40, fnc=20),
+    ]
+
+
+def safe_ratio(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def calculate_metrics(records: list[dict]) -> list[dict]:
+    output = []
+    for item in records:
+        row = dict(item)
+        tp, tn, fp, fn = (int(row[key]) for key in ('tpc', 'tnc', 'fpc', 'fnc'))
+        if min(tp, tn, fp, fn) < 0:
+            raise ValueError(f"Negative count for model {row['model_id']}")
+        row['actp'] = tp + fn
+        row['actn'] = tn + fp
+        row['precision'] = safe_ratio(tp, tp + fp)
+        row['recall'] = safe_ratio(tp, tp + fn)
+        row['accuracy'] = safe_ratio(tp + tn, tp + tn + fp + fn)
+        row['f1'] = safe_ratio(2 * tp, 2 * tp + fp + fn)
+        output.append(row)
+    return output
+
+
+def render_html(records: list[dict]) -> str:
+    # Escape JSON for safe embedding in a script element.
+    payload = json.dumps(records, ensure_ascii=True).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+    generated = escape(datetime.now().strftime('%B %d, %Y %I:%M %p'))
+    template = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NLP Model Performance | Demo</title>
+<style>
+:root{font-family:Segoe UI,Arial,sans-serif;color:#182337;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}main{max-width:1250px;margin:auto;padding:30px 22px 55px}.header{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;flex-wrap:wrap}h1{font-size:29px;margin:0 0 7px}h2{font-size:19px;margin:0 0 16px}.sub{color:#617085;font-size:14px}.pill{background:#fff0d4;color:#825400;border:1px solid #f2d79b;border-radius:30px;padding:8px 13px;font-weight:700;font-size:12px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:24px 0}.card,.panel{background:white;border:1px solid #e0e6ed;border-radius:13px;box-shadow:0 2px 8px #13223808}.card{padding:18px}.card .label{font-size:12px;color:#637184}.card .value{font-size:30px;font-weight:750;margin-top:7px}.panel{padding:22px;margin-bottom:18px}.controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:17px}label{font-size:12px;color:#637184;display:block;margin-bottom:5px}select{border:1px solid #cbd5e1;background:#fff;border-radius:7px;padding:9px;min-width:170px;color:#243348}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f1f5f9;text-align:left;color:#45556c;font-size:12px}th,td{padding:12px 10px;border-bottom:1px solid #e7ecf2;white-space:nowrap}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.status{font-weight:650;font-size:12px}.status.active{color:#087f62}.status.inactive{color:#7c8796}.muted{color:#64748b}.small{font-size:12px}.chart-row{display:grid;grid-template-columns:145px 1fr 65px;align-items:center;gap:12px;margin:13px 0}.track{height:17px;background:#edf1f5;border-radius:5px;overflow:hidden}.bar{height:100%;border-radius:5px;background:#0f8b78}.bar.inactive{background:#a4b1c1}.score{text-align:right;font-weight:650;font-size:13px}.metric-buttons{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:17px}.metric-buttons button{border:1px solid #cbd5e1;background:white;color:#405168;border-radius:7px;padding:8px 12px;cursor:pointer}.metric-buttons button.selected{background:#164c77;color:white;border-color:#164c77}.formulas{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.formula{background:#f8fafc;border:1px solid #e6edf3;border-radius:8px;padding:14px}.formula strong{display:block;margin-bottom:6px}.formula code{font-size:13px;color:#164c77}.formula p{font-size:13px;color:#56677c;margin-bottom:0}.note{font-size:12px;color:#64748b;line-height:1.5}.empty{padding:18px;color:#64748b}@media(max-width:800px){.cards{grid-template-columns:repeat(2,1fr)}.formulas{grid-template-columns:1fr}.chart-row{grid-template-columns:100px 1fr 55px;font-size:12px}}@media(max-width:430px){.cards{grid-template-columns:1fr 1fr}.card .value{font-size:23px}main{padding:18px 12px}}
+</style></head><body><main>
+<div class="header"><div><h1>NLP Model Performance</h1><div class="sub">Model status, evaluation metrics, and category comparisons</div><div class="sub small" style="margin-top:6px">Generated: __GENERATED__</div></div><span class="pill">SIMULATED DATA â DEMO ONLY</span></div>
+<section class="cards"><div class="card"><div class="label">Total models</div><div class="value" id="total">â</div></div><div class="card"><div class="label">Active models</div><div class="value" id="active">â</div></div><div class="card"><div class="label">Inactive models</div><div class="value" id="inactive">â</div></div><div class="card"><div class="label">Average accuracy</div><div class="value" id="average">â</div></div></section>
+<section class="panel"><h2>Model scorecard</h2><div class="controls"><div><label for="category">Category</label><select id="category"></select></div><div><label for="status">Model status</label><select id="status"><option value="all">All models</option><option value="active">Active</option><option value="inactive">Inactive</option></select></div></div><div class="scroll"><table><thead><tr><th>Model ID</th><th>Model</th><th>Category</th><th>Status</th><th class="num">Precision</th><th class="num">Recall</th><th class="num">Accuracy</th><th class="num">F1</th></tr></thead><tbody id="scoreRows"></tbody></table></div><p class="note">Scores reflect a single hypothetical evaluation per model. A model's active status does not itself imply higher performance.</p></section>
+<section class="panel"><h2>Model comparison</h2><div class="metric-buttons" id="metricButtons"><button data-metric="precision">Precision</button><button data-metric="recall">Recall</button><button data-metric="accuracy">Accuracy</button><button data-metric="f1" class="selected">F1 score</button></div><div id="chart"></div><p class="note">Green bars indicate active models; gray bars indicate inactive models. Filters apply to both table and graph.</p></section>
+<section class="panel"><h2>Confusion matrix counts</h2><div class="scroll"><table><thead><tr><th>Model</th><th class="num">TP</th><th class="num">TN</th><th class="num">FP</th><th class="num">FN</th><th class="num">Actual positives</th><th class="num">Actual negatives</th></tr></thead><tbody id="countRows"></tbody></table></div><p class="note">Actual positives = TP + FN; actual negatives = TN + FP. Counts are simulated.</p></section>
+<section class="panel"><h2>How the metrics are calculated</h2><div class="formulas"><div class="formula"><strong>Precision</strong><code>TP / (TP + FP)</code><p>Of all predictions labeled positive, what fraction were correct?</p></div><div class="formula"><strong>Recall</strong><code>TP / (TP + FN)</code><p>Of all actual positives, what fraction did the model find?</p></div><div class="formula"><strong>Accuracy</strong><code>(TP + TN) / (TP + TN + FP + FN)</code><p>Of all predictions, what fraction were correct?</p></div><div class="formula"><strong>F1 score</strong><code>2 Ã TP / (2 Ã TP + FP + FN)</code><p>Harmonic mean of precision and recall; balances missed positives and false alarms.</p></div></div><p class="note">TP = true positive; TN = true negative; FP = false positive; FN = false negative. Undefined metrics display N/A when their denominator is zero. These evaluation metrics are different from per-prediction confidence scores.</p></section>
+</main><script>
+const models=__DATA__;
+const $=id=>document.getElementById(id);
+const fmt=v=>v===null?'N/A':(v*100).toFixed(1)+'%';
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let metric='f1';
+const categories=[...new Set(models.map(m=>m.category))].sort();
+$('category').innerHTML='<option value="all">All categories</option>'+categories.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+function draw(){
+ const cat=$('category').value,status=$('status').value;
+ const rows=models.filter(m=>(cat==='all'||m.category===cat)&&(status==='all'||(status==='active'&&m.active_flag)||(status==='inactive'&&!m.active_flag)));
+ $('total').textContent=rows.length;
+ $('active').textContent=rows.filter(m=>m.active_flag).length;
+ $('inactive').textContent=rows.filter(m=>!m.active_flag).length;
+ const accuracies=rows.map(m=>m.accuracy).filter(v=>v!==null);
+ $('average').textContent=accuracies.length?fmt(accuracies.reduce((a,b)=>a+b,0)/accuracies.length):'N/A';
+ $('scoreRows').innerHTML=rows.map(m=>`<tr><td>${m.model_id}</td><td><strong>${esc(m.name)}</strong></td><td>${esc(m.category)}</td><td class="status ${m.active_flag?'active':'inactive'}">${m.active_flag?'â Active':'â Inactive'}</td>${['precision','recall','accuracy','f1'].map(k=>`<td class="num">${fmt(m[k])}</td>`).join('')}</tr>`).join('')||'<tr><td colspan="8" class="empty">No matching models</td></tr>';
+ $('countRows').innerHTML=rows.map(m=>`<tr><td>${esc(m.name)}</td>${['tpc','tnc','fpc','fnc','actp','actn'].map(k=>`<td class="num">${m[k]}</td>`).join('')}</tr>`).join('')||'<tr><td colspan="7" class="empty">No matching models</td></tr>';
+ $('chart').innerHTML=rows.map(m=>`<div class="chart-row"><div>${esc(m.name)}</div><div class="track"><div class="bar ${m.active_flag?'':'inactive'}" style="width:${m[metric]===null?0:Math.max(0,Math.min(100,m[metric]*100))}%"></div></div><div class="score">${fmt(m[metric])}</div></div>`).join('')||'<p class="empty">No matching models</p>';
+}
+$('category').addEventListener('change',draw);$('status').addEventListener('change',draw);
+$('metricButtons').addEventListener('click',event=>{const button=event.target.closest('button[data-metric]');if(!button)return;metric=button.dataset.metric;document.querySelectorAll('#metricButtons button').forEach(b=>b.classList.toggle('selected',b===button));draw()});
+draw();
+</script></body></html>'''
+    return template.replace('__DATA__', payload).replace('__GENERATED__', generated)
+
+
+def main() -> None:
+    records = calculate_metrics(load_dummy_data())
+    OUTPUT_PATH.write_text(render_html(records), encoding='utf-8')
+    print(f"Created: {OUTPUT_PATH.resolve()}")
+    print(f"Models: {len(records)} (simulated)")
+
+
+if __name__ == '__main__':
+    main()
