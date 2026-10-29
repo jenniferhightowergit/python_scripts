@@ -1,73 +1,113 @@
-import io
-import base64
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
+
+df_burndown = monthly_removals.copy()
+
+# Build a date column from the existing year/month fields
+df_burndown["Date"] = pd.to_datetime(
+    dict(
+        year=df_burndown["REMOVAL_YEAR"],
+        month=df_burndown["REMOVAL_MONTH"],
+        day=1
+    )
+)
+
+df_burndown = df_burndown.sort_values("Date")
+
+# Use the existing calculated remaining inventory
+df_burndown["Remaining"] = df_burndown["Remaining_S4E"]
+
+# Starting inventory before removals
+total_s4e = (
+    df_burndown["Remaining_S4E"].iloc[-1]
+    + df_burndown["Cumulative_Removed"].iloc[-1]
+)
+
+df_burndown = df_burndown[
+    df_burndown["Date"] >= "2025-12-01"
+].copy()
+
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
+import matplotlib.dates as mdates
+import pandas as pd
 
+df = df_burndown.copy()
 
-def create_burndown_chart(monthly_removals, total_s4e=76459, output_path='project_ranger_burndown.png'):
-    """Create a professional PNG suitable for embedding in the Outlook HTML report.
+fig, ax = plt.subplots(figsize=(12, 4.5), dpi=160)
 
-    monthly_removals: DataFrame with REMOVAL_YEAR, REMOVAL_MONTH, Remaining_S4E.
-    The original 76,459 is shown as a separate program baseline, not a Dec 2025 month-end.
-    """
-    df = monthly_removals.copy()
-    df['date'] = pd.to_datetime(dict(year=df['REMOVAL_YEAR'].astype(int), month=df['REMOVAL_MONTH'].astype(int), day=1)) + pd.offsets.MonthEnd(0)
-    df = df.sort_values('date').reset_index(drop=True)
-    df['Remaining_S4E'] = pd.to_numeric(df['Remaining_S4E'])
-    plot_df = df.loc[df['date'] >= pd.Timestamp('2025-12-31')].copy()
-    if plot_df.empty:
-        raise ValueError('No month-end observations from December 2025 onward.')
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
 
-    navy, blue, muted = '#174675', '#2873AF', '#62758A'
-    fig, ax = plt.subplots(figsize=(11.5, 4.6), dpi=170)
-    fig.patch.set_facecolor('white')
-    ax.set_facecolor('white')
-    x = list(range(len(plot_df)))
-    y = plot_df['Remaining_S4E'].to_numpy()
-    bottom = max(0, min(y) - 3500)
-    ax.fill_between(x, y, bottom, color='#DCECF8', alpha=0.65)
-    ax.plot(x, y, color=blue, linewidth=2.8, solid_capstyle='round', zorder=3)
-    ax.scatter(x, y, s=22, color='white', edgecolor=blue, linewidth=1.6, zorder=4)
-    ax.scatter([x[-1]], [y[-1]], s=88, color=navy, edgecolor='white', linewidth=2, zorder=5)
-    ax.annotate(f'{y[0]:,.0f}', (x[0], y[0]), xytext=(5, 13), textcoords='offset points', color=navy, fontsize=10, weight='bold')
-    ax.annotate(f'{y[-1]:,.0f}', (x[-1], y[-1]), xytext=(-7, 14), textcoords='offset points', ha='right', color=navy, fontsize=12, weight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels([d.strftime("%b '%y") for d in plot_df['date']], fontsize=8.5, color=muted)
-    ax.tick_params(axis='x', length=0, pad=12)
-    ax.tick_params(axis='y', length=0, colors=muted, labelsize=9)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v/1000:,.0f}k'))
-    ax.grid(axis='y', color='#E7EDF3', linewidth=0.9)
-    ax.set_axisbelow(True)
-    ax.set_ylim(bottom, max(y) + 3200)
-    ax.set_xlim(-0.35, len(x) - 0.65)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    fig.text(0.085, 0.95, 'S4E INVENTORY BURNDOWN', fontsize=16, color=navy, weight='bold', va='top')
-    fig.text(0.085, 0.885, f'Month-end remaining inventory  |  Original program baseline: {total_s4e:,} meters', fontsize=9.5, color=muted, va='top')
-    fig.text(0.085, 0.035, 'Source: Project Ranger monthly removals  â¢  Current month reflects reporting-to-date', fontsize=8, color=muted)
-    fig.subplots_adjust(left=0.085, right=0.97, bottom=0.19, top=0.79)
-    fig.savefig(output_path, dpi=170, facecolor='white')
-    plt.close(fig)
-    return output_path
+# Main burndown line
+ax.plot(
+    df["Date"],
+    df["Remaining"],
+    color="#174A7E",
+    linewidth=2.8,
+    marker="o",
+    markersize=4
+)
 
+# Subtle shaded area
+ax.fill_between(
+    df["Date"],
+    df["Remaining"],
+    df["Remaining"].min() * 0.92,
+    color="#DCEAF5",
+    alpha=0.45
+)
 
-def image_as_data_uri(path):
-    """For browser HTML previews; Outlook email should use CID attachments instead."""
-    with open(path, 'rb') as f:
-        return 'data:image/png;base64,' + base64.b64encode(f.read()).decode('ascii')
+# Highlight final value
+last = df.iloc[-1]
 
+ax.scatter(
+    last["Date"],
+    last["Remaining"],
+    s=95,
+    color="#087E8B",
+    zorder=5
+)
 
-if __name__ == '__main__':
-    rows = [
-        (2025,1,75944),(2025,2,75498),(2025,3,74758),(2025,4,73006),
-        (2025,5,71347),(2025,6,69725),(2025,7,68121),(2025,8,66658),
-        (2025,9,65467),(2025,10,64330),(2025,11,63488),(2025,12,62759),
-        (2026,1,61871),(2026,2,60945),(2026,3,59799),(2026,4,58407),
-        (2026,5,56850),(2026,6,55307),(2026,7,53960),(2026,8,52029),
-        (2026,9,49911),(2026,10,48514),
-    ]
-    sample = pd.DataFrame(rows, columns=['REMOVAL_YEAR','REMOVAL_MONTH','Remaining_S4E'])
-    create_burndown_chart(sample, output_path='/mnt/data/project_ranger_burndown.png')
+ax.annotate(
+    f'{last["Remaining"]:,.0f}',
+    xy=(last["Date"], last["Remaining"]),
+    xytext=(-8, 16),
+    textcoords="offset points",
+    ha="right",
+    fontsize=12,
+    fontweight="bold",
+    color="#087E8B"
+)
+
+ax.set_title(
+    "S4E INVENTORY BURNDOWN",
+    loc="left",
+    fontsize=15,
+    fontweight="bold",
+    color="#173B63",
+    pad=22
+)
+
+ax.set_ylabel("Remaining S4E Meters")
+
+ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+ax.spines[["top", "right", "left"]].set_visible(False)
+ax.spines["bottom"].set_color("#DCE3EA")
+
+ax.grid(axis="y", alpha=0.15)
+ax.tick_params(axis="both", length=0, pad=8)
+
+ax.set_ylim(bottom=0)
+ax.margins(x=0.04)
+
+plt.tight_layout()
+
+plt.savefig(
+    "project_ranger_burndown.png",
+    dpi=180,
+    bbox_inches="tight",
+    facecolor="white"
+)
+
+plt.show()
