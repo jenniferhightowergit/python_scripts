@@ -1,84 +1,67 @@
-# Map DGroup codes to their descriptive names
-fsr_names = (
-    hardware[
-        ["FSRSSR_DGROUP", "FSRSSR_DGROUP_NAME"]
-    ]
-    .dropna()
-    .drop_duplicates()
-    .set_index("FSRSSR_DGROUP")["FSRSSR_DGROUP_NAME"]
-    .to_dict()
+# Header
+c.setFillColor(NAVY)
+c.rect(
+    margin, top - header_h,
+    usable_w, header_h,
+    fill=1, stroke=0
 )
 
-meter_tech_names = (
-    hardware[
-        ["METER_TECH_DGROUP", "METER_TECH_DGROUP_NAME"]
-    ]
-    .dropna()
-    .drop_duplicates()
-    .set_index("METER_TECH_DGROUP")["METER_TECH_DGROUP_NAME"]
-    .to_dict()
-)
+x = margin
 
+for col, w in zip(cols, widths):
 
+    c.setFillColor(colors.white)
 
-headers = ""
+    label = str(col).replace("_", " ")
 
-for col in display.columns:
+    if label == "Grand Total":
+        label = "GRAND TOTAL"
 
-    # Original column header
-    header = escape(str(col).replace("_", " "))
-
-    # Add descriptive name below DGroup code
-    if group_names and col in group_names:
-        group_name = escape(str(group_names[col]))
-
-        header = (
-            f'<div style="font-weight:bold;">{header}</div>'
-            f'<div style="font-size:10px;'
-            f'font-weight:normal;'
-            f'margin-top:4px;">'
-            f'{group_name}</div>'
-        )
-
-    align = "right" if col in number_cols else "left"
-
-    headers += (
-        f'<th style="background-color:#173B56;'
-        f'color:white;'
-        f'padding:10px 12px;'
-        f'border:1px solid #DCE4EA;'
-        f'text-align:{align};'
-        f'vertical-align:middle;">'
-        f'{header}</th>'
+    # Look up the descriptive DGroup name
+    group_name = (
+        group_names.get(col, "")
+        if group_names else ""
     )
 
+    align = "right" if col in numeric else "left"
 
+    if group_name:
 
-{format_table(
-    fsr,
-    "01 | FSR/SSR Distribution",
-    "Hardware counts by FSR/SSR group",
-    fsr_names
-)}
+        # DGroup acronym - first line
+        draw_text(
+            label,
+            x,
+            top - 18,
+            w,
+            align=align,
+            bold=True,
+            max_font=min(font, 8)
+        )
 
-{format_table(
-    meter_tech,
-    "02 | Meter Tech Distribution",
-    "Hardware counts by meter technology group",
-    meter_tech_names
-)}
+        # Descriptive name - second line
+        draw_text(
+            str(group_name),
+            x,
+            top - 34,
+            w,
+            align=align,
+            bold=False,
+            max_font=6
+        )
 
-{format_table(
-    fsr_ir,
-    "03 | FSR/SSR - Self Contained",
-    "Hardware counts only include Self-Contained",
-    fsr_names
-)}
+    else:
 
-{format_table(
-    meter_tech_ir,
-    "04 | Meter Tech - Instrument Rated",
-    "Hardware counts only include Instrument Rated",
-    meter_tech_names
-)}
+        # Normal headers without a descriptive name
+        draw_text(
+            label,
+            x,
+            top - header_h / 2 - 3,
+            w,
+            align=align,
+            bold=True,
+            max_font=min(font, 8)
+        )
+
+    x += w
+
 
