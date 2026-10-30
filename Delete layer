@@ -1,45 +1,11 @@
-def draw_group_header(text, x, y, width, font_size=5.5):
-    """Draw a centered, wrapped group name inside one column."""
-    from reportlab.lib.utils import simpleSplit
+# Put the TOTAL AVAILABLE INVENTORY box inside the inventory table
+total_box = (
+    f'<tr><td colspan="{len(inventory.columns)}" '
+    'style="padding:12px;border:1px solid #D9E2EA;'
+    'background-color:#E8EFF5;text-align:left;">'
+    '<span style="font-size:12px;color:#526477;">TOTAL AVAILABLE INVENTORY</span><br>'
+    f'<strong style="font-size:22px;color:#173B59;">{fmt_num(total_stock)}</strong>'
+    '</td></tr>'
+)
 
-    text = str(text).strip()
-
-    lines = simpleSplit(
-        text,
-        "Helvetica",
-        font_size,
-        max(width - 6, 5)
-    )
-
-    # Maximum three lines
-    lines = lines[:3]
-
-    c.setFont("Helvetica", font_size)
-
-    for i, line in enumerate(lines):
-        c.drawCentredString(
-            x + width / 2,
-            y - i * font_size * 1.2,
-            line
-        )
-
-
-if group_name:
-
-    # DGroup abbreviation
-    c.setFont("Helvetica-Bold", min(font, 8))
-
-    c.drawCentredString(
-        x + w / 2,
-        top - 18,
-        label
-    )
-
-    # Full DGroup name
-    draw_group_header(
-        group_name,
-        x,
-        top - 32,
-        w,
-        font_size=5 if len(cols) >= 10 else 6
-    )
+inventory_html = inventory_html.replace("<thead>", "<thead>" + total_box, 1)
