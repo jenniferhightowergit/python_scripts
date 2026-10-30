@@ -1,11 +1,426 @@
-# Put the TOTAL AVAILABLE INVENTORY box inside the inventory table
-total_box = (
-    f'<tr><td colspan="{len(inventory.columns)}" '
-    'style="padding:12px;border:1px solid #D9E2EA;'
-    'background-color:#E8EFF5;text-align:left;">'
-    '<span style="font-size:12px;color:#526477;">TOTAL AVAILABLE INVENTORY</span><br>'
-    f'<strong style="font-size:22px;color:#173B59;">{fmt_num(total_stock)}</strong>'
-    '</td></tr>'
+# =====================================================================
+# PROJECT RANGER - EMAIL REPORT  (consistent-formatting version)
+#
+# Two cells to replace in Ranger_Complete_Incomplete.ipynb:
+#
+#   CELL A  -> replaces your create_burndown_chart cell
+#              (the chart no longer draws its own title; the email does)
+#
+#   CELL B  -> replaces your whole email cell (fmt helpers through
+#              Path("project_ranger_email.html").write_text(...))
+#
+# Nothing else changes: same variable names in (total_s4e, total_removed,
+# total_remaining, total_pct_complete, report1, stock_clean,
+# monthly_removals), same email_html out, same cid:project_ranger_burndown,
+# so your send/attach code keeps working.
+# =====================================================================
+
+
+# %% ================================================================
+# CELL A - BURNDOWN CHART
+# ===================================================================
+import io
+import base64
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+plt.rcParams["font.family"] = ["Arial", "DejaVu Sans"]
+
+
+def create_burndown_chart(monthly_removals, total_s4e=76459,
+                          output_path="project_ranger_burndown.png"):
+    """Chart body only. Title, subtitle and source line live in the
+    email HTML so they match the other sections."""
+    df = monthly_removals.copy()
+    df["date"] = pd.to_datetime(dict(
+        year=df["REMOVAL_YEAR"].astype(int),
+        month=df["REMOVAL_MONTH"].astype(int),
+        day=1,
+    )) + pd.offsets.MonthEnd(0)
+    df = df.sort_values("date").reset_index(drop=True)
+    df["Remaining_S4E"] = pd.to_numeric(df["Remaining_S4E"])
+    plot_df = df.loc[df["date"] >= pd.Timestamp("2025-12-31")].copy()
+    if plot_df.empty:
+        raise ValueError("No month-end observations from December 2025 onward.")
+
+    navy, blue, muted = "#173B59", "#287E9A", "#526477"
+
+    # 900 px wide in the email -> 9.0 x 3.4 in keeps a 900 x 340 look
+    fig, ax = plt.subplots(figsize=(9.0, 3.4), dpi=200)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    x = list(range(len(plot_df)))
+    y = plot_df["Remaining_S4E"].to_numpy()
+    bottom = max(0, min(y) - 3500)
+
+    ax.fill_between(x, y, bottom, color="#E8EFF5", alpha=1.0)
+    ax.plot(x, y, color=blue, linewidth=2.4, solid_capstyle="round", zorder=3)
+    ax.scatter(x, y, s=18, color="white", edgecolor=blue, linewidth=1.4, zorder=4)
+    ax.scatter([x[-1]], [y[-1]], s=70, color=navy, edgecolor="white", linewidth=2, zorder=5)
+
+    ax.annotate(f"{y[0]:,.0f}", (x[0], y[0]), xytext=(4, 10),
+                textcoords="offset points", color=navy, fontsize=9, weight="bold")
+    ax.annotate(f"{y[-1]:,.0f}", (x[-1], y[-1]), xytext=(-6, 12),
+                textcoords="offset points", ha="right", color=navy,
+                fontsize=10, weight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([d.strftime("%b '%y") for d in plot_df["date"]],
+                       fontsize=8, color=muted)
+    ax.tick_params(axis="x", length=0, pad=8)
+    ax.tick_params(axis="y", length=0, colors=muted, labelsize=8)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1000:,.0f}k"))
+    ax.grid(axis="y", color="#E7EDF3", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.set_ylim(bottom, max(y) + 3200)
+    ax.set_xlim(-0.35, len(x) - 0.65)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    fig.subplots_adjust(left=0.055, right=0.985, bottom=0.12, top=0.97)
+    fig.savefig(output_path, dpi=200, facecolor="white")
+    plt.close(fig)
+    return output_path
+
+
+def image_as_data_uri(path):
+    """For browser HTML previews; Outlook email should use CID attachments instead."""
+    with open(path, "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+
+
+chart_path = create_burndown_chart(
+    monthly_removals,
+    total_s4e=(monthly_removals["Remaining_S4E"].iloc[-1]
+               + monthly_removals["Cumulative_Removed"].iloc[-1]),
+    output_path="project_ranger_burndown.png",
 )
 
-inventory_html = inventory_html.replace("<thead>", "<thead>" + total_box, 1)
+
+# %% ================================================================
+# CELL B - EMAIL
+# ===================================================================
+import pandas as pd
+from html import escape
+from IPython.display import HTML, display
+from pathlib import Path
+
+# -------------------------------------------------------------------
+# 1. Style tokens - change a color or size here and it changes
+#    everywhere in the email
+# -------------------------------------------------------------------
+NAVY   = "#173B59"   # banner, table headers, titles, KPI values
+ACCENT = "#287E9A"   # banner underline
+LIGHT  = "#E8EFF5"   # label column, GRAND TOTAL row
+BORDER = "#D9E2EA"   # every border and divider
+TEXT   = "#243746"   # body text
+MUTED  = "#526477"   # labels, subtitles, captions
+
+WIDTH = 900          # every section, table and image is exactly this wide
+FONT  = "font-family:Arial,Helvetica,sans-serif;"
+
+# Type scale (px) - only these sizes are used
+SIZE_BANNER   = 22
+SIZE_KPI      = 22
+SIZE_SECTION  = 14
+SIZE_BODY     = 12
+SIZE_LABEL    = 11
+
+
+# -------------------------------------------------------------------
+# 2. Formatting helpers
+# -------------------------------------------------------------------
+def fmt_num(value):
+    if pd.isna(value):
+        return "&mdash;"
+    return f"{float(value):,.0f}"
+
+def fmt_pct(value):
+    if pd.isna(value):
+        return "&mdash;"
+    return f"{float(value):,.1f}%"
+
+def fmt_text(value):
+    if pd.isna(value):
+        return "&mdash;"
+    return escape(str(value))
+
+
+# -------------------------------------------------------------------
+# 3. Building blocks - every section is made from these, so every
+#    section looks the same
+# -------------------------------------------------------------------
+def section_header(title, subtitle=None):
+    """Same title style for every section: CAPS, navy, divider above."""
+    sub = (
+        f'<div style="{FONT}font-size:{SIZE_BODY}px;color:{MUTED};'
+        f'padding-top:4px;">{subtitle}</div>'
+        if subtitle else ""
+    )
+    return f"""
+<tr><td style="padding:28px 0 12px 0;border-top:1px solid {BORDER};">
+  <div style="{FONT}font-size:{SIZE_SECTION}px;font-weight:bold;
+              letter-spacing:0.5px;color:{NAVY};">{escape(title.upper())}</div>
+  {sub}
+</td></tr>"""
+
+
+def section_body(content, bottom=28):
+    return f'<tr><td style="padding:0 0 {bottom}px 0;">{content}</td></tr>'
+
+
+def kpi_row(items):
+    """items = [("LABEL IN CAPS", value), ...]; cards split WIDTH evenly."""
+    w = WIDTH // len(items)
+    cells = "".join(
+        f'<td width="{w}" align="center" valign="top" '
+        f'style="padding:14px 10px;border:1px solid {BORDER};'
+        f'background-color:#FFFFFF;">'
+        f'<div style="{FONT}font-size:{SIZE_LABEL}px;font-weight:bold;'
+        f'letter-spacing:0.5px;color:{MUTED};">{label}</div>'
+        f'<div style="{FONT}font-size:{SIZE_KPI}px;font-weight:bold;'
+        f'color:{NAVY};padding-top:6px;">{value}</div></td>'
+        for label, value in items
+    )
+    return (
+        f'<table role="presentation" width="{WIDTH}" cellpadding="0" '
+        f'cellspacing="0" border="0" style="border-collapse:collapse;'
+        f'width:{WIDTH}px;"><tr>{cells}</tr></table>'
+    )
+
+
+def data_table(headers, rows, widths, aligns,
+               shade_first_col=False, total_rows=()):
+    """
+    headers  : column titles
+    rows     : list of lists of already-formatted (HTML-safe) strings
+    widths   : px per column - must add up to WIDTH
+    aligns   : "left" / "center" / "right" per column
+    shade_first_col : light-blue bold label column (tracker)
+    total_rows      : row positions to style as GRAND TOTAL
+    """
+    assert sum(widths) == WIDTH, f"column widths add to {sum(widths)}, not {WIDTH}"
+
+    head = "".join(
+        f'<th width="{w}" align="{a}" style="{FONT}font-size:{SIZE_BODY}px;'
+        f'font-weight:bold;color:#FFFFFF;background-color:{NAVY};'
+        f'padding:9px 10px;border:1px solid {NAVY};text-align:{a};">'
+        f'{escape(str(h))}</th>'
+        for h, w, a in zip(headers, widths, aligns)
+    )
+
+    body = ""
+    for r, row in enumerate(rows):
+        is_total = r in total_rows
+        cells = ""
+        for c, (val, w, a) in enumerate(zip(row, widths, aligns)):
+            label_cell = shade_first_col and c == 0
+            bg = LIGHT if (is_total or label_cell) else "#FFFFFF"
+            weight = "bold" if (is_total or label_cell) else "normal"
+            color = NAVY if (is_total or label_cell) else TEXT
+            cells += (
+                f'<td width="{w}" align="{a}" style="{FONT}'
+                f'font-size:{SIZE_BODY}px;color:{color};font-weight:{weight};'
+                f'background-color:{bg};padding:8px 10px;'
+                f'border:1px solid {BORDER};text-align:{a};">{val}</td>'
+            )
+        body += f"<tr>{cells}</tr>"
+
+    return (
+        f'<table role="presentation" width="{WIDTH}" cellpadding="0" '
+        f'cellspacing="0" border="0" style="border-collapse:collapse;'
+        f'width:{WIDTH}px;">'
+        f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+    )
+
+
+# -------------------------------------------------------------------
+# 4. Report date
+# -------------------------------------------------------------------
+report_date = pd.Timestamp.today().strftime("%B %d, %Y")
+
+
+# -------------------------------------------------------------------
+# 5. KPI cards
+# -------------------------------------------------------------------
+kpi_html = kpi_row([
+    ("TOTAL S4Es",       fmt_num(total_s4e)),
+    ("TOTAL REMOVED",   fmt_num(total_removed)),
+    ("TOTAL REMAINING", fmt_num(total_remaining)),
+    ("% COMPLETE",      f"{total_pct_complete * 100:.1f}%"),
+])
+
+
+# -------------------------------------------------------------------
+# 6. Burndown (image only - title/subtitle come from section_header)
+# -------------------------------------------------------------------
+burndown_html = f"""
+<img src="cid:project_ranger_burndown" alt="S4E Inventory Burndown"
+     width="{WIDTH}"
+     style="display:block;width:{WIDTH}px;height:auto;border:0;">
+<div style="{FONT}font-size:{SIZE_LABEL}px;color:{MUTED};padding-top:8px;">
+  Source: Project Ranger monthly removals &nbsp;&middot;&nbsp;
+  Current month reflects reporting-to-date
+</div>"""
+
+
+# -------------------------------------------------------------------
+# 7. Five-year tracker
+# -------------------------------------------------------------------
+years = [2025, 2026, 2027, 2028, 2029, 2030]
+tracker = report1.loc[:, years].copy()
+
+count_rows = [
+    "Annual Goal",
+    "Adjusted Annual Goal",
+    "Removed YTD",
+    "Remaining Annual Goal",
+    "Monthly Target",
+    "Removed This Month",
+    "Remaining Monthly Target",
+    "Avg Needed Per Remaining Month",
+]
+
+def fmt_tracker(row_label, value):
+    if row_label == "% Annual Goal Complete":
+        return fmt_pct(value)
+    if row_label in count_rows:
+        return fmt_num(value)
+    return fmt_text(value)
+
+tracker_rows = [
+    [escape(str(label))] + [fmt_tracker(label, v) for v in tracker.loc[label]]
+    for label in tracker.index
+]
+
+tracker_html = data_table(
+    headers=["Report Year"] + [str(y) for y in years],
+    rows=tracker_rows,
+    widths=[240] + [110] * 6,                  # = 900
+    aligns=["left"] + ["right"] * 6,
+    shade_first_col=True,
+)
+
+
+# -------------------------------------------------------------------
+# 8. Inventory (same prep as before)
+# -------------------------------------------------------------------
+inventory = stock_clean.copy()
+inventory.columns = inventory.columns.str.strip().str.lower()
+inventory = inventory[
+    ["stockno", "form", "volt", "class", "stock_amount", "needed_amount"]
+].copy()
+
+for col in ["stock_amount", "needed_amount"]:
+    inventory[col] = pd.to_numeric(inventory[col], errors="coerce").fillna(0)
+
+inventory = (
+    inventory.groupby(["stockno", "form", "volt", "class"],
+                      dropna=False, as_index=False)
+    .agg(stock_amount=("stock_amount", "sum"),
+         needed_amount=("needed_amount", "sum"))
+    .sort_values(["stockno", "class", "form", "volt"],
+                 key=lambda col: col.astype(str))
+)
+
+total_stock = inventory["stock_amount"].sum()
+total_needed = inventory["needed_amount"].sum()
+
+inventory_rows = [["GRAND TOTAL", "", "", "",
+                   fmt_num(total_stock), fmt_num(total_needed)]]
+for _, r in inventory.iterrows():
+    inventory_rows.append([
+        fmt_text(r["stockno"]), fmt_text(r["form"]),
+        fmt_text(r["volt"]),    fmt_text(r["class"]),
+        fmt_num(r["stock_amount"]), fmt_num(r["needed_amount"]),
+    ])
+
+inventory_kpi_html = kpi_row([
+    ("TOTAL AVAILABLE STOCK", fmt_num(total_stock)),
+    ("TOTAL NEEDED",          fmt_num(total_needed)),
+])
+
+inventory_html = data_table(
+    headers=["Stockno", "Form", "Voltage", "Class",
+             "Available Stock", "Total Needed"],
+    rows=inventory_rows,
+    widths=[190, 110, 130, 110, 180, 180],      # = 900
+    aligns=["left", "center", "center", "center", "right", "right"],
+    total_rows={0},
+)
+
+
+# -------------------------------------------------------------------
+# 9. Final email body
+# -------------------------------------------------------------------
+email_html = f"""
+<html>
+<body style="margin:0;padding:0;background-color:#FFFFFF;{FONT}color:{TEXT};">
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+       border="0" style="border-collapse:collapse;background-color:#FFFFFF;">
+<tr><td align="center" style="padding:16px 0;">
+
+<table role="presentation" width="{WIDTH}" cellpadding="0" cellspacing="0"
+       border="0" style="border-collapse:collapse;width:{WIDTH}px;">
+
+<!-- BANNER -->
+<tr><td style="background-color:{NAVY};padding:22px 20px;
+               border-bottom:4px solid {ACCENT};">
+  <div style="{FONT}font-size:{SIZE_BANNER}px;font-weight:bold;color:#FFFFFF;">
+    PROJECT RANGER</div>
+  <div style="{FONT}font-size:13px;color:#E0EBF4;padding-top:5px;">
+    S4E Meter Removal Progress</div>
+  <div style="{FONT}font-size:{SIZE_LABEL}px;color:#E0EBF4;padding-top:8px;">
+    Updated through {report_date}</div>
+</td></tr>
+
+<!-- KPI CARDS -->
+<tr><td style="padding:20px 0 28px 0;">{kpi_html}</td></tr>
+
+<!-- BURNDOWN -->
+{section_header("S4E Inventory Burndown",
+                f"Month-end remaining inventory &nbsp;|&nbsp; "
+                f"Original program baseline: {fmt_num(total_s4e)} meters")}
+{section_body(burndown_html)}
+
+<!-- FIVE-YEAR TRACKER -->
+{section_header("Five-Year Removal Tracker",
+                "Annual removal target: 13,600 S4E meters. "
+                "Progress is measured against each year's goal.")}
+{section_body(tracker_html)}
+
+<!-- INVENTORY -->
+{section_header("Replacement S4X Meter Inventory",
+                "Current available stock by meter class, form and voltage.")}
+{section_body(inventory_kpi_html, bottom=12)}
+{section_body(inventory_html)}
+
+<!-- FOOTER -->
+<tr><td style="border-top:1px solid {BORDER};padding:15px 0;
+               {FONT}font-size:{SIZE_LABEL}px;color:{MUTED};">
+  Project Ranger | S4E Removal Progress Report<br>
+  Inventory reflects the latest available stock snapshot.<br>
+  This is an automated reporting summary.
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+
+</body>
+</html>
+"""
+
+# -------------------------------------------------------------------
+# 10. Preview inside Jupyter + save
+# -------------------------------------------------------------------
+# The chart uses cid: for Outlook, so swap in the PNG for the preview
+display(HTML(email_html.replace(
+    "cid:project_ranger_burndown", image_as_data_uri(chart_path))))
+
+Path("project_ranger_email.html").write_text(email_html, encoding="utf-8")
