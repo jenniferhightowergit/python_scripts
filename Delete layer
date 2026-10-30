@@ -1,67 +1,24 @@
-# Header
-c.setFillColor(NAVY)
-c.rect(
-    margin, top - header_h,
-    usable_w, header_h,
-    fill=1, stroke=0
-)
+def draw_group_header(text, x, y, width, font_size=5.5):
+    """Draw a centered, wrapped group name inside one column."""
+    from reportlab.lib.utils import simpleSplit
 
-x = margin
+    text = str(text).strip()
 
-for col, w in zip(cols, widths):
-
-    c.setFillColor(colors.white)
-
-    label = str(col).replace("_", " ")
-
-    if label == "Grand Total":
-        label = "GRAND TOTAL"
-
-    # Look up the descriptive DGroup name
-    group_name = (
-        group_names.get(col, "")
-        if group_names else ""
+    lines = simpleSplit(
+        text,
+        "Helvetica",
+        font_size,
+        max(width - 6, 5)
     )
 
-    align = "right" if col in numeric else "left"
+    # Maximum three lines
+    lines = lines[:3]
 
-    if group_name:
+    c.setFont("Helvetica", font_size)
 
-        # DGroup acronym - first line
-        draw_text(
-            label,
-            x,
-            top - 18,
-            w,
-            align=align,
-            bold=True,
-            max_font=min(font, 8)
+    for i, line in enumerate(lines):
+        c.drawCentredString(
+            x + width / 2,
+            y - i * font_size * 1.2,
+            line
         )
-
-        # Descriptive name - second line
-        draw_text(
-            str(group_name),
-            x,
-            top - 34,
-            w,
-            align=align,
-            bold=False,
-            max_font=6
-        )
-
-    else:
-
-        # Normal headers without a descriptive name
-        draw_text(
-            label,
-            x,
-            top - header_h / 2 - 3,
-            w,
-            align=align,
-            bold=True,
-            max_font=min(font, 8)
-        )
-
-    x += w
-
-
