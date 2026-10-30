@@ -22,3 +22,24 @@ def draw_group_header(text, x, y, width, font_size=5.5):
             y - i * font_size * 1.2,
             line
         )
+
+
+if group_name:
+
+    # DGroup abbreviation
+    c.setFont("Helvetica-Bold", min(font, 8))
+
+    c.drawCentredString(
+        x + w / 2,
+        top - 18,
+        label
+    )
+
+    # Full DGroup name
+    draw_group_header(
+        group_name,
+        x,
+        top - 32,
+        w,
+        font_size=5 if len(cols) >= 10 else 6
+    )
