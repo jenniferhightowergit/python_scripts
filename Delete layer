@@ -1,105 +1,45 @@
-# Numbered work-order stops
-for r in d.itertuples():
+import numpy as np
 
-    # Is this stop flagged as backtracking?
-    is_return = pd.notna(r.return_to)
+ANNUAL_GOAL = 13600
 
-    # Determine marker color
-    if is_return:
-        fill = "#E53935"       # Red - backtracking
-    elif r.order_num == 1:
-        fill = "#1E88E5"       # Blue - first stop
-    elif r.order_num == len(d):
-        fill = "#8E44AD"       # Purple - last stop
-    else:
-        fill = "#43A047"       # Green - regular stop
+df_goals = by_meter_tech_group.copy()
 
-    # Popup details (only visible when clicked)
-    popup = (
-        f"<b>Stop {r.order_num}</b><br>"
-        f"Work Order: {r.cdb_wr_no}<br>"
-        f"Meter: {r.meterno}<br>"
-        f"Completed: {r.complete_datetime:%I:%M %p}<br>"
-        f"Distance from previous: {r.mi_prev:.2f} miles"
-    )
-
-    if is_return:
-        popup += (
-            f"<br><b style='color:red;'>"
-            f"BACKTRACKING to Stop {int(r.return_to)}"
-            f"</b>"
-        )
-
-    # Marker with sequence number inside
-    folium.Marker(
-        location=[r.latitude, r.longitude],
-        tooltip=f"Stop {r.order_num}",
-        popup=folium.Popup(popup, max_width=300),
-        icon=folium.DivIcon(
-            icon_size=(30, 30),
-            icon_anchor=(15, 15),
-            html=f"""
-            <div style="
-                width:30px;
-                height:30px;
-                border-radius:50%;
-                background:{fill};
-                color:white;
-                border:2px solid white;
-                display:flex;
-                align-items:center;
-                justify-content:center;
-                font-size:13px;
-                font-weight:bold;
-                box-shadow:0 1px 4px #555;
-            ">
-                {r.order_num}
-            </div>
-            """
-        )
-    ).add_to(m)
-
-
-# Draw lines connecting work orders in completion order
-for i in range(1, len(d)):
-
-    is_return = pd.notna(d.loc[i, "return_to"])
-
-    folium.PolyLine(
-        locations=[
-            [d.loc[i-1, "latitude"], d.loc[i-1, "longitude"]],
-            [d.loc[i, "latitude"], d.loc[i, "longitude"]]
-        ],
-        color="#E53935" if is_return else "#64748B",
-        weight=4 if is_return else 2,
-        opacity=0.85,
-        dash_array="6, 5" if is_return else None,
-        tooltip=f"Stop {i} → Stop {i+1}"
-    ).add_to(m)
-
-
-
-legend_html = """
-<div style="
-    position:fixed;
-    bottom:30px;
-    left:30px;
-    z-index:9999;
-    background:white;
-    padding:12px 16px;
-    border:1px solid #ccc;
-    border-radius:8px;
-    box-shadow:0 2px 8px #999;
-    font-size:13px;
-">
-    <b>Work Order Sequence</b><br><br>
-    <span style="color:#1E88E5;">●</span> First stop<br>
-    <span style="color:#43A047;">●</span> Regular stop<br>
-    <span style="color:#E53935;">●</span> Backtracking<br>
-    <span style="color:#8E44AD;">●</span> Last stop
-</div>
-"""
-
-m.get_root().html.add_child(
-    folium.Element(legend_html)
+df_goals["Weight"] = (
+    df_goals["Total_S4Es"]
+    / df_goals["Total_S4Es"].sum()
 )
+
+raw_goals = df_goals["Weight"] * ANNUAL_GOAL
+base_goals = np.floor(raw_goals).astype(int)
+
+remainder = ANNUAL_GOAL - base_goals.sum()
+
+df_goals["Annual_Goal"] = base_goals
+
+# Allocate remaining meters by largest fraction
+priority = (
+    (raw_goals - base_goals)
+    .sort_values(ascending=False)
+    .index[:remainder]
+)
+
+df_goals.loc[priority, "Annual_Goal"] += 1
+
+assert df_goals["Annual_Goal"].sum() == ANNUAL_GOAL
+assert df_goals["Total_S4Es"].sum() == 76459
+
+display(df_goals)
+
+
+
+manager_columns = [
+    "METER_TECH_DGROUP_NAME",
+    "METER_TECH_DGROUP",
+    "Total_S4Es",
+    "Annual_Goal",
+    "YTD_Removed",
+    "Total_Remaining",
+    "Pct_Annual_Goal",
+    "Needed_Monthly_Pace",
+    "Actual_Monthly_Pace",
+]
