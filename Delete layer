@@ -1,45 +1,95 @@
-import numpy as np
+import duckdb
 
-ANNUAL_GOAL = 13600
+conn = duckdb.connect()
 
-df_goals = by_meter_tech_group.copy()
+df_dgroup_removals = conn.execute("""
+    SELECT
+        METER_TECH_DGROUP,
 
-df_goals["Weight"] = (
-    df_goals["Total_S4Es"]
-    / df_goals["Total_S4Es"].sum()
+        COUNT(DISTINCT CASE
+            WHEN isRemoved = 1
+             AND REMOVAL_YEAR = YEAR(CURRENT_DATE)
+            THEN meterno
+        END) AS YTD_Removed,
+
+        COUNT(DISTINCT CASE
+            WHEN isRemoved = 1
+             AND REMOVAL_YEAR = YEAR(CURRENT_DATE)
+             AND REMOVAL_MONTH = MONTH(CURRENT_DATE)
+            THEN meterno
+        END) AS Removed_This_Month,
+
+        COUNT(DISTINCT CASE
+            WHEN isRemoved = 1
+            THEN meterno
+        END) AS Total_Removed
+
+    FROM base
+
+    GROUP BY METER_TECH_DGROUP
+
+""").df()
+
+
+
+df_manager = df_goals.merge(
+    df_dgroup_removals,
+    on="METER_TECH_DGROUP",
+    how="left"
 )
 
-raw_goals = df_goals["Weight"] * ANNUAL_GOAL
-base_goals = np.floor(raw_goals).astype(int)
-
-remainder = ANNUAL_GOAL - base_goals.sum()
-
-df_goals["Annual_Goal"] = base_goals
-
-# Allocate remaining meters by largest fraction
-priority = (
-    (raw_goals - base_goals)
-    .sort_values(ascending=False)
-    .index[:remainder]
-)
-
-df_goals.loc[priority, "Annual_Goal"] += 1
-
-assert df_goals["Annual_Goal"].sum() == ANNUAL_GOAL
-assert df_goals["Total_S4Es"].sum() == 76459
-
-display(df_goals)
-
-
-
-manager_columns = [
-    "METER_TECH_DGROUP_NAME",
-    "METER_TECH_DGROUP",
-    "Total_S4Es",
-    "Annual_Goal",
+cols = [
     "YTD_Removed",
-    "Total_Remaining",
-    "Pct_Annual_Goal",
-    "Needed_Monthly_Pace",
-    "Actual_Monthly_Pace",
+    "Removed_This_Month",
+    "Total_Removed"
 ]
+
+df_manager[cols] = df_manager[cols].fillna(0).astype(int)
+
+
+df_manager["Total_Remaining"] = (
+    df_manager["Total_S4Es"]
+    - df_manager["Total_Removed"]
+)
+
+
+df_manager["Pct_Annual_Goal"] = (
+    df_manager["YTD_Removed"]
+    / df_manager["Annual_Goal"]
+    * 100
+)
+
+
+from datetime import date
+
+today = date.today()
+
+months_elapsed = today.month - 1
+months_remaining = 12 - months_elapsed
+
+df_manager["Actual_Monthly_Pace"] = (
+    df_manager["YTD_Removed"]
+    / max(months_elapsed, 1)
+)
+
+df_manager["Needed_Monthly_Pace"] = (
+    (
+        df_manager["Annual_Goal"]
+        - df_manager["YTD_Removed"]
+    ).clip(lower=0)
+    / max(months_remaining, 1)
+)
+
+
+print("Starting population:",
+      df_manager["Total_S4Es"].sum())
+
+print("Annual goals:",
+      df_manager["Annual_Goal"].sum())
+
+print("Total removed:",
+      df_manager["Total_Removed"].sum())
+
+print("Remaining:",
+      df_manager["Total_Remaining"].sum())
+
