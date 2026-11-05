@@ -18,3 +18,57 @@ def is_first_workday_of_week(check_date=None):
         first_workday += timedelta(days=1)
 
     return check_date == first_workday
+
+
+
+
+# Project Ranger weekly reports
+weekly_jobs = [
+    r"C:\Users\UIX9\Documents\Ranger Complete - Incomplete\ProjectRanger5YearPlan.py",
+    r"C:\Users\UIX9\Documents\Ranger Complete - Incomplete\ProjectRangerStatusReport_by_MeterTechDGroup.py",
+]
+
+# Add weekly reports only on the first workday
+if is_first_workday_of_week():
+    print("First workday of the week: Running Project Ranger reports")
+    jobs.extend(weekly_jobs)
+else:
+    print("Not the first workday: Skipping Project Ranger reports")
+
+
+for job in jobs:
+    print(f"Running {job}")
+
+    result = subprocess.run(
+        [sys.executable, job],
+        capture_output=True,
+        text=True
+    )
+
+    print("STDOUT:")
+    print(result.stdout)
+
+    print("STDERR:")
+    print(result.stderr)
+
+    if result.returncode != 0:
+        print(f"{job} failed with return code {result.returncode}")
+        break
+
+
+company_holidays = holidays.US(years=check_date.year)
+
+# Add any additional company holidays
+company_holidays.update([
+    date(2026, 12, 24),
+])
+
+
+first_workday in company_holidays
+
+
+
+
+
+
+
