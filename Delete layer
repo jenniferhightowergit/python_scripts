@@ -1,37 +1,36 @@
-# Grand Total row
-total_annual_pct = (
-    100 * ytd_removed / annual_goal
-    if annual_goal else 0
-)
+<ul style="
+    font-size:12px;
+    line-height:1.8;
+    color:#475569;
+    margin:12px 0 0;
+    padding-left:20px;
+">
+    <li>
+        <strong>Annual Goals:</strong>
+        Weighted by each DGroup's starting S4E population.
+    </li>
 
-def total_cell(value, align="right"):
-    return (
-        f'<td style="padding:13px 10px;'
-        f'background:#dceaf7;'
-        f'border-bottom:2px solid #9ab8d6;'
-        f'text-align:{align};'
-        f'color:#17385f;'
-        f'font-weight:700;'
-        f'font-size:12px;">'
-        f'{value}</td>'
-    )
+    <li>
+        <strong>Overall Completion:</strong>
+        Total S4Es removed divided by the starting population.
+    </li>
 
-grand_total_html = "<tr>"
+    <li>
+        <strong>Actual Monthly Pace:</strong>
+        Average removals across completed calendar months only.
+        The current partial month is excluded.
+    </li>
 
-grand_total_html += total_cell("GRAND TOTAL", align="left")
-grand_total_html += total_cell(number(total_population))
-grand_total_html += total_cell(number(total_removed))
-grand_total_html += total_cell(number(total_remaining))
-grand_total_html += total_cell(f"{pct_complete:.1f}%")
-grand_total_html += total_cell(number(annual_goal))
-grand_total_html += total_cell(number(ytd_removed))
-grand_total_html += total_cell(number(monthly_removed))
-grand_total_html += total_cell(f"{total_annual_pct:.1f}%")
-grand_total_html += total_cell(number(actual_pace, 1))
-grand_total_html += total_cell(number(needed_pace, 1))
+    <li>
+        <strong>Needed Monthly Pace:</strong>
+        Remaining annual goal divided by remaining calendar
+        months, including the current month.
+    </li>
 
-grand_total_html += "</tr>"
-
-
-
-
+    <li>
+        <strong>Annual Goal Attainment:</strong>
+        May exceed 100% when removals surpass the assigned
+        annual target. Green progress bars indicate the
+        annual goal has been met.
+    </li>
+</ul>
