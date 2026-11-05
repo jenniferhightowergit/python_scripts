@@ -1,32 +1,21 @@
 
+import subprocess
+import sys
 from pathlib import Path
-from playwright.sync_api import sync_playwright
 
-def html_to_png(html_path):
-    html_path = Path(html_path).resolve()
-    png_path = html_path.with_suffix(".png")
+script_path = Path(html_path).resolve().parent / "ranger_html_to_png.py"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+result = subprocess.run(
+    [sys.executable, str(script_path), str(html_path)],
+    capture_output=True,
+    text=True
+)
 
-        page = browser.new_page(
-            viewport={"width": 1400, "height": 900},
-            device_scale_factor=2
-        )
+print("STDOUT:", result.stdout)
+print("STDERR:", result.stderr)
 
-        page.goto(html_path.as_uri())
-        page.screenshot(
-            path=str(png_path),
-            full_page=True
-        )
+if result.returncode != 0:
+    raise RuntimeError("HTML to PNG conversion failed")
 
-        browser.close()
-
-    return png_path
-
-
-if __name__ == "__main__":
-    html_path = Path(__file__).with_name(
-        "ranger_manager_report.html"
-    )
-    print(f"PNG created: {html_to_png(html_path)}")
+png_path = Path(html_path).with_suffix(".png")
+print(f"PNG created: {png_path}")
