@@ -1,216 +1,37 @@
+# Grand Total row
+total_annual_pct = (
+    100 * ytd_removed / annual_goal
+    if annual_goal else 0
+)
 
-from datetime import datetime
-from pathlib import Path
-from html import escape
-import pandas as pd
-
-def create_ranger_manager_html(df_manager, output_path="ranger_manager_report.html"):
-    df = df_manager.copy()
-
-    required = [
-        "METER_TECH_DGROUP_NAME", "METER_TECH_DGROUP",
-        "METER_TECH_MANAGER", "Total_S4Es", "Total_Removed",
-        "Total_Remaining", "Pct_Complete", "Annual_Goal",
-        "YTD_Removed", "Removed_This_Month",
-        "Pct_Annual_Goal", "Actual_Monthly_Pace",
-        "Needed_Monthly_Pace"
-    ]
-    missing = set(required) - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns: {sorted(missing)}")
-
-    df = df.sort_values("METER_TECH_DGROUP_NAME")
-
-    def number(v, decimals=0):
-        return f"{v:,.{decimals}f}"
-
-    def cell(value, align="right", bold=False, color="#334155"):
-        weight = "700" if bold else "400"
-        return (
-            f'<td style="padding:12px 10px;'
-            f'border-bottom:1px solid #e5eaf0;'
-            f'text-align:{align};color:{color};'
-            f'font-weight:{weight};font-size:12px;">'
-            f'{value}</td>'
-        )
-
-    def progress_bar(pct):
-        width = min(max(float(pct), 0), 100)
-        color = "#16866b" if pct >= 100 else "#3973b9"
-        return (
-            f'<div style="background:#e8edf3;width:110px;'
-            f'height:9px;border-radius:5px;">'
-            f'<div style="background:{color};width:{width}%;'
-            f'height:9px;border-radius:5px;"></div></div>'
-            f'<div style="font-size:11px;margin-top:4px;">'
-            f'{pct:.1f}%</div>'
-        )
-
-    total_population = int(df["Total_S4Es"].sum())
-    total_removed = int(df["Total_Removed"].sum())
-    total_remaining = int(df["Total_Remaining"].sum())
-    annual_goal = int(df["Annual_Goal"].sum())
-    ytd_removed = int(df["YTD_Removed"].sum())
-    monthly_removed = int(df["Removed_This_Month"].sum())
-    pct_complete = 100 * total_removed / total_population
-
-    today = datetime.now()
-    completed_months = today.month - 1
-    remaining_months = 12 - completed_months
-
-    # Exclude current partial month from actual pace.
-    actual_pace = (
-        (ytd_removed - monthly_removed) / completed_months
-        if completed_months else 0
-    )
-    needed_pace = max(annual_goal - ytd_removed, 0) / remaining_months
-
-    def kpi(label, value):
-        return f"""
-        <td style="width:25%;padding:5px;vertical-align:top;">
-          <div style="background:#f2f6fa;border:1px solid #e4eaf1;
-                      border-radius:7px;padding:17px 12px;">
-            <div style="color:#64748b;font-size:11px;">{label}</div>
-            <div style="color:#17385f;font-size:23px;font-weight:700;
-                        margin-top:7px;">{value}</div>
-          </div>
-        </td>"""
-
-    rows = []
-
-    for _, r in df.iterrows():
-        annual_pct = float(r["Pct_Annual_Goal"])
-        status_color = "#16866b" if annual_pct >= 100 else "#334155"
-
-        row = "<tr>"
-        row += cell(
-            f'<strong>{escape(str(r["METER_TECH_DGROUP_NAME"]))}</strong>'
-            f'<div style="color:#64748b;font-size:11px;">'
-            f'{escape(str(r["METER_TECH_MANAGER"]))}</div>',
-            align="left"
-        )
-        row += cell(number(r["Total_S4Es"]))
-        row += cell(number(r["Total_Removed"]))
-        row += cell(number(r["Total_Remaining"]))
-        row += cell(number(r["Annual_Goal"]))
-        row += cell(number(r["YTD_Removed"]), bold=True)
-        row += cell(number(r["Removed_This_Month"]))
-        row += cell(progress_bar(annual_pct), align="left")
-        row += cell(number(r["Actual_Monthly_Pace"], 1))
-        row += cell(
-            number(r["Needed_Monthly_Pace"], 1),
-            color=status_color
-        )
-        row += "</tr>"
-        rows.append(row)
-
-    headers = [
-        "DGroup / Manager", "Population", "Total Removed",
-        "Remaining", "Annual Goal", "YTD Removed",
-        "This Month", "Annual Goal %", "Actual / Mo",
-        "Needed / Mo"
-    ]
-
-    header_html = "".join(
-        f'<th style="background:#17385f;color:white;'
-        f'padding:12px 10px;text-align:left;font-size:11px;'
-        f'white-space:nowrap;">{h}</th>'
-        for h in headers
+def total_cell(value, align="right"):
+    return (
+        f'<td style="padding:13px 10px;'
+        f'background:#dceaf7;'
+        f'border-bottom:2px solid #9ab8d6;'
+        f'text-align:{align};'
+        f'color:#17385f;'
+        f'font-weight:700;'
+        f'font-size:12px;">'
+        f'{value}</td>'
     )
 
-    html = f"""
-    <html>
-    <body style="margin:0;padding:24px;background:#eef2f6;
-                 font-family:Arial,Helvetica,sans-serif;color:#334155;">
-      <table role="presentation" cellpadding="0" cellspacing="0"
-             style="width:100%;max-width:1200px;margin:auto;
-                    background:white;border-collapse:collapse;">
-        <tr>
-          <td style="background:#142b49;padding:30px;">
-            <div style="color:#a9c5e4;font-size:11px;
-                        letter-spacing:2px;">
-              ONCOR | ADVANCED METERING SERVICES
-            </div>
-            <h1 style="color:white;margin:12px 0 5px;
-                       font-size:29px;">PROJECT RANGER</h1>
-            <div style="color:#dbe7f5;font-size:15px;">
-              S4E Removal Program | Manager Performance Overview
-            </div>
-            <div style="color:#b9cbe0;font-size:12px;margin-top:12px;">
-              Reporting date: {today:%B %d, %Y}
-            </div>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:24px;">
-            <h2 style="font-size:17px;color:#17385f;">
-              Program Overview
-            </h2>
-            <table role="presentation" style="width:100%;">
-              <tr>
-                {kpi("Starting Population", number(total_population))}
-                {kpi("Total Removed", number(total_removed))}
-                {kpi("Remaining", number(total_remaining))}
-                {kpi("Overall Completion", f"{pct_complete:.1f}%")}
-              </tr>
-            </table>
+grand_total_html = "<tr>"
 
-            <h2 style="font-size:17px;color:#17385f;margin-top:30px;">
-              Annual Performance
-            </h2>
-            <table role="presentation" style="width:100%;">
-              <tr>
-                {kpi("2026 Annual Goal", number(annual_goal))}
-                {kpi("2026 YTD Removed", number(ytd_removed))}
-                {kpi("Removed This Month", number(monthly_removed))}
-                {kpi("Annual Goal Complete",
-                     f"{100*ytd_removed/annual_goal:.1f}%")}
-              </tr>
-            </table>
+grand_total_html += total_cell("GRAND TOTAL", align="left")
+grand_total_html += total_cell(number(total_population))
+grand_total_html += total_cell(number(total_removed))
+grand_total_html += total_cell(number(total_remaining))
+grand_total_html += total_cell(f"{pct_complete:.1f}%")
+grand_total_html += total_cell(number(annual_goal))
+grand_total_html += total_cell(number(ytd_removed))
+grand_total_html += total_cell(number(monthly_removed))
+grand_total_html += total_cell(f"{total_annual_pct:.1f}%")
+grand_total_html += total_cell(number(actual_pace, 1))
+grand_total_html += total_cell(number(needed_pace, 1))
 
-            <h2 style="font-size:17px;color:#17385f;margin-top:32px;">
-              DGroup Manager Comparison
-            </h2>
-            <p style="font-size:12px;color:#64748b;">
-              Annual goals weighted by each DGroup's starting S4E population.
-            </p>
-            <table cellpadding="0" cellspacing="0"
-                   style="border-collapse:collapse;width:100%;">
-              <thead><tr>{header_html}</tr></thead>
-              <tbody>{''.join(rows)}</tbody>
-            </table>
-
-            <div style="margin-top:24px;background:#f2f6fa;
-                        padding:18px;border-left:4px solid #3973b9;">
-              <strong style="color:#17385f;font-size:13px;">
-                Reporting Notes
-              </strong>
-              <p style="font-size:12px;line-height:1.7;margin-bottom:0;">
-                Actual monthly pace excludes the current partial month
-                and averages removals across completed calendar months.
-                Needed monthly pace represents remaining annual goal
-                divided by remaining calendar months, including the
-                current month. Annual goal attainment can exceed 100%.
-                Green progress bars indicate the annual goal has been met.
-              </p>
-            </div>
-
-            <div style="font-size:11px;color:#94a3b8;
-                        margin-top:25px;border-top:1px solid #e5eaf0;
-                        padding-top:15px;">
-              Project Ranger | AMS Reporting | Internal Use
-            </div>
-          </td>
-        </tr>
-      </table>
-    </body>
-    </html>
-    """
-
-    path = Path(output_path)
-    path.write_text(html, encoding="utf-8")
-    return path
+grand_total_html += "</tr>"
 
 
-html_path = create_ranger_manager_html(df_manager)
-print(f"HTML report created: {html_path.resolve()}")
+
+
