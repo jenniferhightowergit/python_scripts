@@ -1,75 +1,20 @@
+def is_first_workday_of_week(check_date=None):
 
-from pathlib import Path
-import win32com.client as win32
-import pythoncom
+    if check_date is None:
+        check_date = date.today()
 
+    us_holidays = holidays.US(years=check_date.year)
 
-def send_report(png_path):
-    png_path = Path(png_path).resolve()
+    # Start with Monday of the current week
+    monday = check_date - timedelta(days=check_date.weekday())
 
-    if not png_path.is_file():
-        raise FileNotFoundError(f"PNG not found: {png_path}")
+    # Find the first non-holiday weekday
+    first_workday = monday
 
-    pythoncom.CoInitialize()
+    while (
+        first_workday.weekday() >= 5
+        or first_workday in us_holidays
+    ):
+        first_workday += timedelta(days=1)
 
-    try:
-        outlook = win32.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)
-
-        # Test recipient
-        mail.To = "jennifer.hightower@oncor.com"
-        # mail.CC = "Edmundo.Rodriguez@oncor.com"
-
-        mail.Subject = (
-            "[Report] [Project Ranger] - "
-            "Project Ranger Status Update by Meter Tech DGROUP"
-        )
-
-        # Attach PNG as an inline image
-        attachment = mail.Attachments.Add(str(png_path))
-
-        # Set Content-ID for embedding in HTML
-        attachment.PropertyAccessor.SetProperty(
-            "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
-            "ranger_report"
-        )
-
-        # Reference the attached image in the email body
-        mail.HTMLBody = """
-        <html>
-        <body style="margin:0; padding:0; background-color:#ffffff;">
-            <table role="presentation" cellpadding="0"
-                   cellspacing="0" border="0" width="100%">
-                <tr>
-                    <td align="center">
-                        <img src="cid:ranger_report"
-                             alt="Project Ranger Manager Report"
-                             width="1000"
-                             style="display:block; width:100%;
-                                    max-width:1000px; height:auto;
-                                    border:0;">
-                    </td>
-                </tr>
-            </table>
-        </body>
-        </html>
-        """
-
-        mail.Save()
-
-        # Preview before sending
-        mail.Display()
-
-        # Once verified, replace Display() with Send()
-        # mail.Send()
-
-        print("Project Ranger email prepared successfully!")
-
-    finally:
-        pythoncom.CoUninitialize()
-
-
-from pathlib import Path
-
-png_path = Path(html_path).with_suffix(".png")
-send_report(png_path)
+    return check_date == first_workday
