@@ -1,21 +1,12 @@
-
 import subprocess
 import sys
-from pathlib import Path
-
-script_path = Path(html_path).resolve().parent / "ranger_html_to_png.py"
 
 result = subprocess.run(
-    [sys.executable, str(script_path), str(html_path)],
+    [sys.executable, "-m", "playwright", "install", "chromium"],
     capture_output=True,
     text=True
 )
 
+print("Return code:", result.returncode)
 print("STDOUT:", result.stdout)
 print("STDERR:", result.stderr)
-
-if result.returncode != 0:
-    raise RuntimeError("HTML to PNG conversion failed")
-
-png_path = Path(html_path).with_suffix(".png")
-print(f"PNG created: {png_path}")
