@@ -1,143 +1,103 @@
-def load_dummy_activity(days=90):
-    rng = random.Random(42)
-    categories = ["Battery Change", "Bad LCD", "Meter Change"]
-    start = datetime.now().date() - timedelta(days=days - 1)
-
-    activity = []
-
-    for i in range(days):
-        day = start + timedelta(days=i)
-        total_orders = max(0, 200 + i // 3 + rng.randint(-25, 25))
-
-        predictions = {
-            "Battery Change": rng.randint(35, 70),
-            "Bad LCD": rng.randint(20, 50),
-            "Meter Change": rng.randint(45, 85),
-        }
-
-        activity.append({
-            "date": day.isoformat(),
-            "total_orders": total_orders,
-            "predictions": predictions,
-        })
-
-    return activity
-
-
-
 <section class="panel">
-  <h2>Daily Processing Activity</h2>
+  <h2>Category Overview</h2>
 
-  <p class="sub">
-    Compare total daily orders against predictions for a selected category.
-  </p>
+  <div class="cards">
+    <div class="card">
+      <div class="label">Total categories</div>
+      <div class="value" id="categoryCount">-</div>
+    </div>
 
-  <label for="activityCategory">Select category:</label>
-  <select id="activityCategory"></select>
+    <div class="card">
+      <div class="label">Active model</div>
+      <div class="value" id="currentModel">-</div>
+    </div>
 
-  <div style="overflow-x:auto; margin-top:20px;">
-    <svg id="activityChart"
-         viewBox="0 0 900 340"
-         style="width:100%; min-width:600px;">
-    </svg>
+    <div class="card">
+      <div class="label">Predictions (90 days)</div>
+      <div class="value" id="predictionCount">-</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Avg. predictions/day</div>
+      <div class="value" id="dailyAverage">-</div>
+    </div>
   </div>
-
-  <p class="sub">
-    Simulated daily activity. Total orders include all orders,
-    regardless of prediction status.
-  </p>
 </section>
 
 
 
+const activitySelect = document.getElementById("category");
+const activityChart = document.getElementById("activityChart")
 
 
-<script>
-const activityData = __ACTIVITY__;
-
-const activitySelect = document.getElementById("activityCategory");
-const activityChart = document.getElementById("activityChart");
-
-const activityCategories = Object.keys(activityData[0].predictions);
-
-activityCategories.forEach(category => {
-    const option = document.createElement("option");
-    option.value = category;
-    option.textContent = category;
-    activitySelect.appendChild(option);
-});
 
 function drawActivityChart() {
     const category = activitySelect.value;
-    const width = 900;
-    const height = 340;
-    const left = 65;
-    const right = 25;
-    const top = 35;
-    const bottom = 55;
 
-    const plotWidth = width - left - right;
-    const plotHeight = height - top - bottom;
+    const predictions = activityData.map(d =>
+        category === "all"
+            ? Object.values(d.predictions).reduce((a, b) => a + b, 0)
+            : (d.predictions[category] || 0)
+    );
 
-    const maxValue = Math.max(
-        1,
-        ...activityData.map(d => d.total_orders),
-        ...activityData.map(d => d.predictions[category])
-    ) * 1.1;
 
-    const x = i => left + i * plotWidth /
-        Math.max(1, activityData.length - 1);
+const maxValue = Math.max(
+    1,
+    ...activityData.map(d => d.total_orders),
+    ...predictions
+) * 1.1
 
-    const y = value => top + plotHeight -
-        value / maxValue * plotHeight;
 
-    const line = values => values.map((value, i) =>
-        `${i === 0 ? "M" : "L"} ${x(i)} ${y(value)}`
-    ).join(" ");
+const predictionLabel = category === "all"
+    ? "All category predictions"
+    : `${category} predictions`;
 
-    const orders = activityData.map(d => d.total_orders);
-    const predictions = activityData.map(d => d.predictions[category]);
 
-    const grid = [0, 0.25, 0.5, 0.75, 1].map(f => {
-        const value = maxValue * f;
-        return `
-          <line x1="${left}" y1="${y(value)}"
-                x2="${width-right}" y2="${y(value)}"
-                stroke="#e2e8f0"/>
-          <text x="${left-10}" y="${y(value)+4}"
-                text-anchor="end" font-size="12"
-                fill="#64748b">${Math.round(value)}</text>
-        `;
-    }).join("");
+function updateCategoryOverview() {
+    const category = activitySelect.value;
 
-    activityChart.innerHTML = `
-        ${grid}
-        <path d="${line(orders)}" fill="none"
-              stroke="#2563eb" stroke-width="3"/>
-        <path d="${line(predictions)}" fill="none"
-              stroke="#0d9488" stroke-width="3"/>
+    const categories = [...new Set(models.map(m => m.category))];
 
-        <text x="${left}" y="18" fill="#2563eb" font-size="14">
-          Total orders
-        </text>
-        <text x="${left+140}" y="18" fill="#0d9488" font-size="14">
-          ${category} predictions
-        </text>
+    const selectedModels = models.filter(m =>
+        category === "all" || m.category === category
+    );
 
-        <text x="${left}" y="${height-15}"
-              fill="#64748b" font-size="12">
-          ${activityData[0].date}
-        </text>
-        <text x="${width-right}" y="${height-15}"
-              text-anchor="end" fill="#64748b" font-size="12">
-          ${activityData[activityData.length-1].date}
-        </text>
-    `;
+    const activeModels = selectedModels.filter(m => m.active_flag);
+
+    const totalPredictions = activityData.reduce((total, day) => {
+        if (category === "all") {
+            return total + Object.values(day.predictions)
+                .reduce((a, b) => a + b, 0);
+        }
+
+        return total + (day.predictions[category] || 0);
+    }, 0);
+
+    const modelName = category === "all"
+        ? `${activeModels.length} active models`
+        : activeModels.map(m => m.name).join(", ") || "None";
+
+    document.getElementById("categoryCount").textContent =
+        categories.length;
+
+    document.getElementById("currentModel").textContent =
+        modelName;
+
+    document.getElementById("predictionCount").textContent =
+        totalPredictions.toLocaleString();
+
+    document.getElementById("dailyAverage").textContent =
+        (totalPredictions / activityData.length).toFixed(1);
 }
 
-activitySelect.addEventListener("change", drawActivityChart);
+
+activitySelect.addEventListener("change", () => {
+    drawActivityChart();
+    updateCategoryOverview();
+});
+
 drawActivityChart();
-</script>
+updateCategoryOverview();
 
 
 
