@@ -1,16 +1,12 @@
 from pathlib import Path
 
-folder = Path(r"C:\Users\UMUE")
-
-for name in [
-    "anaconda3",
-    "miniconda3",
-    ".conda",
-    "AppData/Local/conda",
-    "AppData/Local/Programs",
+for folder in [
+    Path(r"C:\Users\UMUE\.conda"),
+    Path(r"C:\Users\UMUE\AppData\Local\conda"),
 ]:
-    path = folder / name
+    print(f"\n{folder}")
     try:
-        print(name, "FOUND" if path.exists() else "NOT FOUND")
-    except PermissionError:
-        print(name, "ACCESS DENIED")
+        for item in folder.iterdir():
+            print(" ", item.name)
+    except (PermissionError, FileNotFoundError) as e:
+        print("Cannot inspect:", e)
