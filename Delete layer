@@ -1,19 +1,16 @@
 from pathlib import Path
 
-for user in ["UINTADM", "UMUE"]:
-    folder = Path(f"C:/Users/{user}")
+folder = Path(r"C:\Users\UMUE")
 
-    print(f"\n--- {user} ---")
-
-    for location in [
-        folder / "Desktop",
-        folder / "anaconda3",
-        folder / "miniconda3",
-        folder / ".conda",
-        folder / "AppData/Local/conda",
-        folder / "AppData/Local/Programs",
-    ]:
-        print(
-            "FOUND:  " if location.exists() else "MISSING:",
-            location
-        )
+for name in [
+    "anaconda3",
+    "miniconda3",
+    ".conda",
+    "AppData/Local/conda",
+    "AppData/Local/Programs",
+]:
+    path = folder / name
+    try:
+        print(name, "FOUND" if path.exists() else "NOT FOUND")
+    except PermissionError:
+        print(name, "ACCESS DENIED")
