@@ -1,107 +1,167 @@
-<section class="panel">
-  <h2>Category Overview</h2>
+"""GPS Research assistant: manual Google Maps selection, automatic Excel updates.
 
-  <div class="cards">
-    <div class="card">
-      <div class="label">Total categories</div>
-      <div class="value" id="categoryCount">-</div>
-    </div>
+Requires: openpyxl (pip install openpyxl)
+Run: python gps_research.py "path/to/Jennifer_26_11_12.xlsx"
 
-    <div class="card">
-      <div class="label">Active model</div>
-      <div class="value" id="currentModel">-</div>
-    </div>
+Edit DEFAULT_OUTPUT_DIR below if desired. The original workbook is never modified.
+"""
 
-    <div class="card">
-      <div class="label">Predictions (90 days)</div>
-      <div class="value" id="predictionCount">-</div>
-    </div>
+import argparse
+import os
+import re
+import tempfile
+import webbrowser
+from pathlib import Path
+from urllib.parse import quote
 
-    <div class="card">
-      <div class="label">Avg. predictions/day</div>
-      <div class="value" id="dailyAverage">-</div>
-    </div>
-  </div>
-</section>
+from openpyxl import load_workbook
 
+# CHANGE THIS to your preferred output folder, e.g. r"C:\Users\YourID\Documents\GPS_Output"
+DEFAULT_OUTPUT_DIR = Path("GPS_OUTPUT")
 
-
-const activitySelect = document.getElementById("category");
-const activityChart = document.getElementById("activityChart")
+COORDINATES = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
+)
 
 
-
-function drawActivityChart() {
-    const category = activitySelect.value;
-
-    const predictions = activityData.map(d =>
-        category === "all"
-            ? Object.values(d.predictions).reduce((a, b) => a + b, 0)
-            : (d.predictions[category] || 0)
-    );
-
-
-const maxValue = Math.max(
-    1,
-    ...activityData.map(d => d.total_orders),
-    ...predictions
-) * 1.1
+def parse_coordinates(value):
+    match = COORDINATES.fullmatch(value)
+    if not match:
+        raise ValueError("Paste two decimal coordinates separated by a comma, e.g. 32.1234, -97.1234")
+    latitude, longitude = map(float, match.groups())
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        raise ValueError("Latitude must be -90 to 90 and longitude -180 to 180")
+    # The research assignments shown are in Texas; flag unlikely coordinates for confirmation.
+    if not (25 <= latitude <= 37 and -107 <= longitude <= -93):
+        print("WARNING: Coordinates appear outside Texas. Please verify before saving.")
+        if input("Save anyway? (y/N): ").strip().lower() != "y":
+            raise ValueError("Not saved; please try again")
+    return latitude, longitude
 
 
-const predictionLabel = category === "all"
-    ? "All category predictions"
-    : `${category} predictions`;
+def save_safely(workbook, destination):
+    """Save via a temporary file then replace destination to reduce partial writes."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix="gps_tmp_", suffix=".xlsx", dir=destination.parent)
+    os.close(fd)
+    try:
+        workbook.save(temp_name)
+        os.replace(temp_name, destination)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
-function updateCategoryOverview() {
-    const category = activitySelect.value;
-
-    const categories = [...new Set(models.map(m => m.category))];
-
-    const selectedModels = models.filter(m =>
-        category === "all" || m.category === category
-    );
-
-    const activeModels = selectedModels.filter(m => m.active_flag);
-
-    const totalPredictions = activityData.reduce((total, day) => {
-        if (category === "all") {
-            return total + Object.values(day.predictions)
-                .reduce((a, b) => a + b, 0);
-        }
-
-        return total + (day.predictions[category] || 0);
-    }, 0);
-
-    const modelName = category === "all"
-        ? `${activeModels.length} active models`
-        : activeModels.map(m => m.name).join(", ") || "None";
-
-    document.getElementById("categoryCount").textContent =
-        categories.length;
-
-    document.getElementById("currentModel").textContent =
-        modelName;
-
-    document.getElementById("predictionCount").textContent =
-        totalPredictions.toLocaleString();
-
-    document.getElementById("dailyAverage").textContent =
-        (totalPredictions / activityData.length).toFixed(1);
-}
+def append_note(cell, message):
+    existing = str(cell.value).strip() if cell.value is not None else ""
+    cell.value = f"{existing}; {message}" if existing else message
 
 
-activitySelect.addEventListener("change", () => {
-    drawActivityChart();
-    updateCategoryOverview();
-});
+def find_columns(sheet):
+    # Spreadsheet screenshots show headers on row 1; tolerate small variations in spacing/case.
+    expected = {
+        "METERNO": "meter", "ADDRESS": "address", "LAT": "lat", "LON": "lon",
+        "NOTESIFNEEDED": "notes", "CC&BCOORD": "ccb",
+    }
+    columns = {}
+    for cell in sheet[1]:
+        label = re.sub(r"\s+", "", str(cell.value or "")).upper()
+        if label in expected:
+            columns[expected[label]] = cell.column
+        elif label in ("NOTES", "N"):
+            columns["notes"] = cell.column
+    required = ("meter", "address", "lat", "lon", "notes", "ccb")
+    missing = [name for name in required if name not in columns]
+    if missing:
+        raise ValueError(f"Missing columns {missing}. Found headers: {[c.value for c in sheet[1]]}")
+    return columns
 
-drawActivityChart();
-updateCategoryOverview();
+
+def main():
+    parser = argparse.ArgumentParser(description="Assisted weekly GPS coordinate research")
+    parser.add_argument("workbook", type=Path, help="Path to the assigned .xlsx file")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
+                        help="Folder for updated workbooks (default: GPS_OUTPUT)")
+    args = parser.parse_args()
+    source = args.workbook.expanduser().resolve()
+    if not source.is_file() or source.suffix.lower() != ".xlsx":
+        parser.error("Provide an existing .xlsx workbook")
+    destination = (args.output_dir.expanduser().resolve() / f"{source.stem}_GPS_working.xlsx")
+    if source == destination:
+        parser.error("Output must not be the same file as the original")
+
+    if destination.exists():
+        print(f"Resuming existing output: {destination}")
+        working_file = destination
+    else:
+        print(f"Starting from original: {source}")
+        working_file = source
+    workbook = load_workbook(working_file)
+    sheet = workbook.active
+    columns = find_columns(sheet)
+    tasks = [row for row in range(2, sheet.max_row + 1)
+             if sheet.cell(row, columns["meter"]).value is not None
+             and str(sheet.cell(row, columns["address"]).value or "").strip()]
+    if not tasks:
+        print("No meter rows found.")
+        return
+    if not destination.exists():
+        save_safely(workbook, destination)
+    print(f"Output: {destination}")
+    print("Commands: paste 'latitude, longitude' | note | skip | quit")
+    print("Copy coordinates by right-clicking your chosen Google Maps point.")
+
+    for index, row in enumerate(tasks, 1):
+        lat_cell = sheet.cell(row, columns["lat"])
+        lon_cell = sheet.cell(row, columns["lon"])
+        if lat_cell.value is not None and lon_cell.value is not None:
+            print(f"[{index}/{len(tasks)}] Row {row}: already completed; skipping")
+            continue
+        address = str(sheet.cell(row, columns["address"]).value).strip()
+        meter = sheet.cell(row, columns["meter"]).value
+        print(f"\n[{index}/{len(tasks)}] Row {row} | Meter {meter} | {address}")
+        print("CC&B reference:", sheet.cell(row, columns["ccb"]).value or "(blank)")
+        url = "https://www.google.com/maps/search/?api=1&query=" + quote(address)
+        print("Google Maps:", url)
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            print(f"Could not open browser automatically: {exc}")
+        while True:
+            command = input("Coordinates or command: ").strip()
+            if command.lower() in ("quit", "q"):
+                print("Progress saved at:", destination)
+                return
+            if command.lower() in ("skip", "s"):
+                print("Skipped; will appear again next run")
+                break
+            if command.lower() in ("note", "n"):
+                note = input("Note (blank cancels): ").strip()
+                if note:
+                    append_note(sheet.cell(row, columns["notes"]), note)
+                    save_safely(workbook, destination)
+                    print("Note saved")
+                continue
+            try:
+                latitude, longitude = parse_coordinates(command)
+            except ValueError as exc:
+                print("Invalid entry:", exc)
+                continue
+            lat_cell.value = latitude
+            lon_cell.value = longitude
+            try:
+                save_safely(workbook, destination)
+            except PermissionError:
+                # Avoid advancing after a failed save, e.g. workbook open in Excel.
+                lat_cell.value = None
+                lon_cell.value = None
+                print("Cannot save. Close the output workbook in Excel, then try again.")
+                continue
+            print(f"Saved LAT={latitude}, LON={longitude}")
+            break
+    print("\nAll available rows processed. Output:", destination)
 
 
-
-
-
-
-
+if __name__ == "__main__":
+    main()
