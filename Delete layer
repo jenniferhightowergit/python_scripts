@@ -1,1 +1,16 @@
-& "C:\ProgramData\anaconda3\python.exe" "gps_research.py" "C:\Users\UMUE\Documents\GPS research from Caleb\input\Jennifer_26_11_12.xlsx"
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import duckdb
+
+print("Pandas:", pd.__version__)
+print("PyArrow:", pa.__version__)
+print("DuckDB:", duckdb.__version__)
+
+
+file_path = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\METER_EFFECTIVEDATE_CHANGE.parquet"
+
+df_test = duckdb.read_parquet(file_path).limit(10).df()
+
+print(df_test.shape)
+
