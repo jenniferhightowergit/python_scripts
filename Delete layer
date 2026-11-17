@@ -1,111 +1,80 @@
-import pandas as pd
-import json
-from pathlib import Path
+import random
+from datetime import datetime, timedelta
 
-# Simulated model records
-df_models = pd.DataFrame([
-    {
-        "model_id": 1,
-        "name": "SVM v1",
-        "category": "Battery Change",
-        "active_flag": False,
-        "tpc": 85,
-        "tnc": 210,
-        "fpc": 15,
-        "fnc": 10
-    },
-    {
-        "model_id": 2,
-        "name": "SVM v2",
-        "category": "Battery Change",
-        "active_flag": True,
-        "tpc": 110,
-        "tnc": 225,
-        "fpc": 12,
-        "fnc": 8
-    },
-    {
-        "model_id": 3,
-        "name": "Random Forest v1",
-        "category": "Meter Issue",
-        "active_flag": True,
-        "tpc": 95,
-        "tnc": 190,
-        "fpc": 20,
-        "fnc": 15
-    }
-])
+def build_daily_activity(days=90):
+    rng = random.Random(42)
 
-display(df_models)
+    categories = [
+        "Battery Change",
+        "Bad LCD",
+        "Meter Change"
+    ]
 
+    start = datetime.now().date() - timedelta(days=days - 1)
 
-def calculate_metrics(df):
-    df = df.copy()
+    activity = []
 
-    tp = df["tpc"]
-    tn = df["tnc"]
-    fp = df["fpc"]
-    fn = df["fnc"]
+    for i in range(days):
+        day = start + timedelta(days=i)
 
-    def safe_divide(numerator, denominator):
-        return numerator.div(
-            denominator.where(denominator != 0)
+        total_orders = max(
+            0,
+            200 + i // 3 + rng.randint(-25, 25)
         )
 
-    df["precision"] = safe_divide(tp, tp + fp)
-    df["recall"] = safe_divide(tp, tp + fn)
-    df["accuracy"] = safe_divide(
-        tp + tn, tp + tn + fp + fn
+        predictions = {
+            "Battery Change": rng.randint(35, 70),
+            "Bad LCD": rng.randint(20, 50),
+            "Meter Change": rng.randint(45, 85)
+        }
+
+        activity.append({
+            "date": day.isoformat(),
+            "total_orders": total_orders,
+            "predictions": predictions
+        })
+
+    return activity
+
+def build_report_json(df, activity):
+
+    records = df.to_dict(orient="records")
+
+    total_predictions = sum(
+        sum(day["predictions"].values())
+        for day in activity
     )
-    df["f1"] = safe_divide(
-        2 * tp, 2 * tp + fp + fn
-    )
 
-    df["actp"] = tp + fn
-    df["actn"] = tn + fp
-
-    return df
-
-
-df_performance = calculate_metrics(df_models)
-
-display(df_performance)
-
-
-def build_report_json(df):
-    records = df.astype(object).where(
-        pd.notna(df), None
-    ).to_dict(orient="records")
+    active_models = int(df["active_flag"].sum())
 
     report = {
         "summary": {
             "total_models": len(df),
-            "active_models": int(df["active_flag"].sum()),
-            "inactive_models": int(
-                (~df["active_flag"]).sum()
-            ),
+            "active_models": active_models,
+            "inactive_models": len(df) - active_models,
             "average_accuracy": (
                 float(df["accuracy"].mean())
                 if df["accuracy"].notna().any()
                 else None
             )
         },
-        "model_performance": records
+
+        "model_performance": records,
+
+        "category_overview": {
+            "total_categories": int(df["category"].nunique()),
+            "active_models": active_models,
+            "predictions_90_days": total_predictions,
+            "average_predictions_per_day": (
+                total_predictions / len(activity)
+                if activity else 0
+            )
+        },
+
+        "daily_activity": activity
     }
 
     return report
-
-
-report_data = build_report_json(df_performance)
-
-output_path = Path("model_report.json")
-
-with output_path.open("w", encoding="utf-8") as f:
-    json.dump(report_data, f, indent=4, allow_nan=False)
-
-print(f"JSON saved to: {output_path.resolve()}")
-
-
 
 
 
