@@ -1,16 +1,111 @@
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-import duckdb
+import json
+from pathlib import Path
 
-print("Pandas:", pd.__version__)
-print("PyArrow:", pa.__version__)
-print("DuckDB:", duckdb.__version__)
+# Simulated model records
+df_models = pd.DataFrame([
+    {
+        "model_id": 1,
+        "name": "SVM v1",
+        "category": "Battery Change",
+        "active_flag": False,
+        "tpc": 85,
+        "tnc": 210,
+        "fpc": 15,
+        "fnc": 10
+    },
+    {
+        "model_id": 2,
+        "name": "SVM v2",
+        "category": "Battery Change",
+        "active_flag": True,
+        "tpc": 110,
+        "tnc": 225,
+        "fpc": 12,
+        "fnc": 8
+    },
+    {
+        "model_id": 3,
+        "name": "Random Forest v1",
+        "category": "Meter Issue",
+        "active_flag": True,
+        "tpc": 95,
+        "tnc": 190,
+        "fpc": 20,
+        "fnc": 15
+    }
+])
+
+display(df_models)
 
 
-file_path = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\METER_EFFECTIVEDATE_CHANGE.parquet"
+def calculate_metrics(df):
+    df = df.copy()
 
-df_test = duckdb.read_parquet(file_path).limit(10).df()
+    tp = df["tpc"]
+    tn = df["tnc"]
+    fp = df["fpc"]
+    fn = df["fnc"]
 
-print(df_test.shape)
+    def safe_divide(numerator, denominator):
+        return numerator.div(
+            denominator.where(denominator != 0)
+        )
+
+    df["precision"] = safe_divide(tp, tp + fp)
+    df["recall"] = safe_divide(tp, tp + fn)
+    df["accuracy"] = safe_divide(
+        tp + tn, tp + tn + fp + fn
+    )
+    df["f1"] = safe_divide(
+        2 * tp, 2 * tp + fp + fn
+    )
+
+    df["actp"] = tp + fn
+    df["actn"] = tn + fp
+
+    return df
+
+
+df_performance = calculate_metrics(df_models)
+
+display(df_performance)
+
+
+def build_report_json(df):
+    records = df.astype(object).where(
+        pd.notna(df), None
+    ).to_dict(orient="records")
+
+    report = {
+        "summary": {
+            "total_models": len(df),
+            "active_models": int(df["active_flag"].sum()),
+            "inactive_models": int(
+                (~df["active_flag"]).sum()
+            ),
+            "average_accuracy": (
+                float(df["accuracy"].mean())
+                if df["accuracy"].notna().any()
+                else None
+            )
+        },
+        "model_performance": records
+    }
+
+    return report
+
+
+report_data = build_report_json(df_performance)
+
+output_path = Path("model_report.json")
+
+with output_path.open("w", encoding="utf-8") as f:
+    json.dump(report_data, f, indent=4, allow_nan=False)
+
+print(f"JSON saved to: {output_path.resolve()}")
+
+
+
+
 
