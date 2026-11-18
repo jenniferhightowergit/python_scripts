@@ -1,77 +1,45 @@
+import subprocess
+import sys
 from pathlib import Path
-from playwright.sync_api import sync_playwright
-import base64
-import re
+
+# Save the completed HTML report
+html_path = Path("project_ranger_temp.html").resolve()
+html_path.write_text(email_html, encoding="utf-8")
+
+# Run PDF generation outside Jupyter
+result = subprocess.run(
+    [
+        sys.executable,
+        "project_ranger_pdf.py",
+        str(html_path),
+        str(Path(chart_path).resolve())
+    ],
+    check=True,
+    capture_output=True,
+    text=True
+)
+
+pdf_path = str(Path("project_ranger_report.pdf").resolve())
+
+print(f"PDF created: {pdf_path}")
+
+# Send the report
+send_report(email_html, chart_path, pdf_path)
 
 
-def create_project_ranger_pdf(email_html, chart_path):
 
-    pdf_path = Path("project_ranger_report.pdf").resolve()
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
 
-    # Convert the burndown PNG to an embedded image
-    with open(chart_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("ascii")
+    html_path = Path(sys.argv[1])
+    chart_path = sys.argv[2]
 
-    image_uri = f"data:image/png;base64,{encoded}"
+    email_html = html_path.read_text(encoding="utf-8")
 
-    # Replace Outlook's CID image reference for PDF rendering
-    pdf_html = email_html.replace(
-        "cid:project_ranger_burndown",
-        image_uri
+    pdf_path = create_project_ranger_pdf(
+        email_html,
+        chart_path
     )
 
-    # Add print formatting
-    print_css = """
-    <style>
-        @page {
-            size: letter portrait;
-            margin: 0.35in;
-        }
-
-        html, body {
-            -webkit-print-color-adjust: exact;
-            print-color-adjust: exact;
-        }
-
-        img {
-            max-width: 100%;
-            height: auto;
-        }
-
-        tr {
-            break-inside: avoid;
-        }
-    </style>
-    """
-
-    pdf_html = re.sub(
-        r"</head>",
-        lambda m: print_css + m.group(0),
-        pdf_html,
-        count=1,
-        flags=re.IGNORECASE
-    ) if re.search(r"</head>", pdf_html, re.I) else (
-        pdf_html.replace("<html>", "<html><head>" + print_css + "</head>", 1)
-    )
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-
-        page = browser.new_page(
-            viewport={"width": 1100, "height": 1400},
-            device_scale_factor=1
-        )
-
-        page.set_content(pdf_html, wait_until="load")
-
-        page.pdf(
-            path=str(pdf_path),
-            format="Letter",
-            print_background=True,
-            prefer_css_page_size=True,
-            scale=0.75
-        )
-
-        browser.close()
-
-    return str(pdf_path)
+    print(f"PDF saved to: {pdf_path}")
