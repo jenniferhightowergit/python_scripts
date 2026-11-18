@@ -1,80 +1,77 @@
-import random
-from datetime import datetime, timedelta
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+import base64
+import re
 
-def build_daily_activity(days=90):
-    rng = random.Random(42)
 
-    categories = [
-        "Battery Change",
-        "Bad LCD",
-        "Meter Change"
-    ]
+def create_project_ranger_pdf(email_html, chart_path):
 
-    start = datetime.now().date() - timedelta(days=days - 1)
+    pdf_path = Path("project_ranger_report.pdf").resolve()
 
-    activity = []
+    # Convert the burndown PNG to an embedded image
+    with open(chart_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
 
-    for i in range(days):
-        day = start + timedelta(days=i)
+    image_uri = f"data:image/png;base64,{encoded}"
 
-        total_orders = max(
-            0,
-            200 + i // 3 + rng.randint(-25, 25)
-        )
-
-        predictions = {
-            "Battery Change": rng.randint(35, 70),
-            "Bad LCD": rng.randint(20, 50),
-            "Meter Change": rng.randint(45, 85)
-        }
-
-        activity.append({
-            "date": day.isoformat(),
-            "total_orders": total_orders,
-            "predictions": predictions
-        })
-
-    return activity
-
-def build_report_json(df, activity):
-
-    records = df.to_dict(orient="records")
-
-    total_predictions = sum(
-        sum(day["predictions"].values())
-        for day in activity
+    # Replace Outlook's CID image reference for PDF rendering
+    pdf_html = email_html.replace(
+        "cid:project_ranger_burndown",
+        image_uri
     )
 
-    active_models = int(df["active_flag"].sum())
+    # Add print formatting
+    print_css = """
+    <style>
+        @page {
+            size: letter portrait;
+            margin: 0.35in;
+        }
 
-    report = {
-        "summary": {
-            "total_models": len(df),
-            "active_models": active_models,
-            "inactive_models": len(df) - active_models,
-            "average_accuracy": (
-                float(df["accuracy"].mean())
-                if df["accuracy"].notna().any()
-                else None
-            )
-        },
+        html, body {
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+        }
 
-        "model_performance": records,
+        img {
+            max-width: 100%;
+            height: auto;
+        }
 
-        "category_overview": {
-            "total_categories": int(df["category"].nunique()),
-            "active_models": active_models,
-            "predictions_90_days": total_predictions,
-            "average_predictions_per_day": (
-                total_predictions / len(activity)
-                if activity else 0
-            )
-        },
+        tr {
+            break-inside: avoid;
+        }
+    </style>
+    """
 
-        "daily_activity": activity
-    }
+    pdf_html = re.sub(
+        r"</head>",
+        lambda m: print_css + m.group(0),
+        pdf_html,
+        count=1,
+        flags=re.IGNORECASE
+    ) if re.search(r"</head>", pdf_html, re.I) else (
+        pdf_html.replace("<html>", "<html><head>" + print_css + "</head>", 1)
+    )
 
-    return report
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
 
+        page = browser.new_page(
+            viewport={"width": 1100, "height": 1400},
+            device_scale_factor=1
+        )
 
+        page.set_content(pdf_html, wait_until="load")
 
+        page.pdf(
+            path=str(pdf_path),
+            format="Letter",
+            print_background=True,
+            prefer_css_page_size=True,
+            scale=0.75
+        )
+
+        browser.close()
+
+    return str(pdf_path)
