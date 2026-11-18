@@ -1,190 +1,142 @@
-"""Reusable HTML email -> printable PDF utility for Jupyter and standalone Python.
+############## ALL TOWN HARDWARE DATA  — optimized
+# Two modes:
+#   MODE = "full"         -> full refresh, but much faster fetch + no duplicate columns (recommended)
+#   MODE = "incremental"  -> pulls only METERNO keys, adds new meters / removes gone meters
+#                            (does NOT pick up changed flags on meters that already exist)
+import os
+import time
 
-Requires: playwright, Pillow, reportlab, Microsoft Edge (msedge channel).
-The public create_report_pdf() always launches a separate Python process to avoid
-Playwright's synchronous API conflicting with Jupyter's asyncio event loop.
+import keyring
+import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+from sqlalchemy import create_engine, text
+
+MODE = "full"
+PARQUET_PATH = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\ALLTown.parquet"
+FETCH_SIZE = 50_000      # rows per network round trip (driver default is ~100 -> thousands of trips)
+LOWERCASE_COLS = True    # pd.read_sql via SQLAlchemy lowercased Oracle names in your old file; keep them matching
+
+# Computed columns first, then A.* ONCE.
+# The old query listed SERIAL_NBR, MFG_CD, REGTYPE, ... AND A.*, so every one of those
+# columns came over the network twice and was then thrown away with columns.duplicated().
+FULL_SQL = """
+SELECT TRIM(A.SERIAL_NBR) || TRIM(A.MFG_CD) AS METERNO,
+       TRUNC(A.MTR_INSTL_D)                AS METER_INSTALL_DATE,
+       A.*
+FROM RPTUSER.CM_ALL_TOWN A
 """
 
-from __future__ import annotations
+KEYS_SQL = """
+SELECT TRIM(A.SERIAL_NBR) || TRIM(A.MFG_CD) AS METERNO,
+       TRIM(A.SERIAL_NBR)                  AS SERIAL_NBR
+FROM RPTUSER.CM_ALL_TOWN A
+"""
 
-import argparse
-import base64
-import json
-import math
-import re
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
-from typing import Mapping
+conn_string = keyring.get_password('ods_sqlalchemy', 'connection_string')
+engine = create_engine(conn_string, arraysize=FETCH_SIZE)
 
 
-def create_report_pdf(
-    html: str,
-    images: Mapping[str, str | Path] | None = None,
-    output: str | Path = "report.pdf",
-    page_size: str = "letter",
-    orientation: str = "portrait",
-    multipage: bool = False,
-    keep_debug: bool = False,
-) -> str:
-    """Convert a complete Outlook-style HTML report to a PDF.
-
-    images maps CID names (without 'cid:') to local PNG/JPEG image paths.
-    Returns an absolute PDF path. Runs rendering in a separate process.
-    """
-    if not isinstance(html, str) or not html.strip():
-        raise ValueError("html must be a nonempty string")
-    if page_size.lower() not in {"letter", "a4", "legal"}:
-        raise ValueError("page_size must be 'letter', 'a4', or 'legal'")
-    if orientation.lower() not in {"portrait", "landscape"}:
-        raise ValueError("orientation must be 'portrait' or 'landscape'")
-
-    output_path = Path(output).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image_paths = {}
-    for cid, path in (images or {}).items():
-        clean_cid = str(cid).removeprefix("cid:")
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"Missing image for CID {clean_cid!r}: {resolved}")
-        image_paths[clean_cid] = str(resolved)
-
-    with tempfile.TemporaryDirectory(prefix="report_pdf_") as temp:
-        work = Path(temp)
-        html_path = work / "source.html"
-        config_path = work / "config.json"
-        html_path.write_text(html, encoding="utf-8")
-        config_path.write_text(json.dumps({
-            "html_path": str(html_path),
-            "output": str(output_path),
-            "images": image_paths,
-            "page_size": page_size.lower(),
-            "orientation": orientation.lower(),
-            "multipage": bool(multipage),
-            "debug_dir": str(output_path.parent) if keep_debug else None,
-        }), encoding="utf-8")
-
-        proc = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--worker", str(config_path)],
-            capture_output=True, text=True, check=False,
-        )
-        if proc.returncode:
-            raise RuntimeError(
-                "PDF generation failed.\n" + (proc.stderr or proc.stdout or "No error details returned.")
-            )
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise RuntimeError("PDF worker exited successfully but produced no PDF.")
-        if proc.stdout.strip():
-            print(proc.stdout.strip())
-    return str(output_path)
+def log(msg, t0):
+    print(f"{msg}: {time.perf_counter() - t0:,.1f}s")
 
 
-def _embed_images(html: str, images: dict[str, str]) -> str:
-    for cid, filename in images.items():
-        path = Path(filename)
-        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(path.suffix.lower())
-        if mime is None:
-            raise ValueError(f"Unsupported image format for {cid}: {path.suffix}")
-        uri = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
-        # Match this CID only, without modifying unrelated CID references.
-        html = re.sub(re.escape("cid:" + cid) + r"(?=[\"'\s<>]|$)", lambda _: uri, html, flags=re.I)
-    unresolved = re.findall(r"cid:[^\"'\s<>]+", html, flags=re.I)
-    if unresolved:
-        raise ValueError(f"Unresolved inline image CID references: {unresolved}")
-    return html
+def _clean_names(table: pa.Table) -> pa.Table:
+    names = [n.lower() if LOWERCASE_COLS else n for n in table.column_names]
+    table = table.rename_columns(names)
+    # guard in case A.* ever contains a column with the same name as a computed one
+    seen, keep = set(), []
+    for i, n in enumerate(names):
+        if n not in seen:
+            seen.add(n)
+            keep.append(i)
+    return table.select(keep)
 
 
-def _run_worker(config_path: Path) -> None:
-    from PIL import Image
-    from playwright.sync_api import sync_playwright
-    from reportlab.lib.pagesizes import A4, legal, letter, landscape
-    from reportlab.lib.utils import ImageReader
-    from reportlab.pdfgen import canvas
+def fetch_arrow(sql, params=None) -> pa.Table:
+    """Fetch straight into Arrow (python-oracledb 3.0+), else fall back to pandas."""
+    raw = engine.raw_connection()
+    try:
+        conn = getattr(raw, "driver_connection", None)
+        if conn is not None and hasattr(conn, "fetch_df_all"):
+            odf = conn.fetch_df_all(statement=sql, parameters=params, arraysize=FETCH_SIZE)
+            tbl = pa.Table.from_arrays(odf.column_arrays(), names=odf.column_names())
+            return _clean_names(tbl)
+    finally:
+        raw.close()
 
-    cfg = json.loads(config_path.read_text(encoding="utf-8"))
-    html = Path(cfg["html_path"]).read_text(encoding="utf-8")
-    html = _embed_images(html, cfg["images"])
-    css = """<style>
-    html, body { background: white !important; }
-    body { margin: 0 !important; padding: 12px !important; box-sizing: border-box; }
-    img { max-width: 100%; height: auto; }
-    table { border-collapse: collapse; }
-    </style>"""
-    if re.search(r"</head\s*>", html, re.I):
-        html = re.sub(r"</head\s*>", lambda m: css + m.group(0), html, count=1, flags=re.I)
-    else:
-        html = css + html
+    with engine.connect() as c:
+        df = pd.read_sql(text(sql), c, params=params)
+    return _clean_names(pa.Table.from_pandas(df, preserve_index=False))
 
-    debug_dir = Path(cfg["debug_dir"]) if cfg["debug_dir"] else None
-    if debug_dir:
-        (debug_dir / "report_pdf_preview.html").write_text(html, encoding="utf-8")
 
-    with tempfile.TemporaryDirectory(prefix="report_render_") as temp:
-        image_path = Path(temp) / "render.png"
-        with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=True)
-            try:
-                page = browser.new_page(viewport={"width": 1100, "height": 900}, device_scale_factor=2)
-                page.emulate_media(media="screen")
-                page.set_content(html, wait_until="load", timeout=60000)
-                page.evaluate("""async () => {
-                    await Promise.all(Array.from(document.images).map(img => {
-                        if (img.complete) return Promise.resolve();
-                        return new Promise(resolve => { img.onload = resolve; img.onerror = resolve; });
-                    }));
-                    if (document.fonts) await document.fonts.ready;
-                }""")
-                missing = page.evaluate("""() => Array.from(document.images)
-                    .filter(img => !img.complete || img.naturalWidth === 0)
-                    .map(img => img.getAttribute('src')?.slice(0, 120))""")
-                if missing:
-                    raise RuntimeError(f"Images failed to load: {missing}")
-                page.screenshot(path=str(image_path), full_page=True, animations="disabled")
-            finally:
-                browser.close()
+def write_atomic(table: pa.Table, path: str):
+    tmp = path + ".tmp"
+    pq.write_table(table, tmp, compression="snappy")
+    os.replace(tmp, path)  # anything reading the file never sees a half-written one
 
-        if debug_dir:
-            from shutil import copyfile
-            copyfile(image_path, debug_dir / "report_pdf_render.png")
 
-        sizes = {"letter": letter, "a4": A4, "legal": legal}
-        paper = sizes[cfg["page_size"]]
-        if cfg["orientation"] == "landscape":
-            paper = landscape(paper)
-        page_w, page_h = paper
-        margin = 18
-        usable_w, usable_h = page_w - 2 * margin, page_h - 2 * margin
-        pdf = canvas.Canvas(cfg["output"], pagesize=paper)
-        pdf.setTitle("Report")
+def full_refresh():
+    t0 = time.perf_counter()
+    tbl = fetch_arrow(FULL_SQL)
+    log(f"Fetched {tbl.num_rows:,} rows", t0)
+    write_atomic(tbl, PARQUET_PATH)
+    log("Wrote parquet", t0)
 
-        with Image.open(image_path) as img:
-            img_w, img_h = img.size
-            if cfg["multipage"]:
-                # Render at readable page width and slice the tall image into pages.
-                px_per_page = max(1, int(usable_h * img_w / usable_w))
-                for top in range(0, img_h, px_per_page):
-                    bottom = min(img_h, top + px_per_page)
-                    tile = img.crop((0, top, img_w, bottom))
-                    tile_h_pt = (bottom - top) * usable_w / img_w
-                    pdf.drawImage(ImageReader(tile), margin, page_h - margin - tile_h_pt,
-                                  width=usable_w, height=tile_h_pt, mask="auto")
-                    pdf.showPage()
-            else:
-                factor = min(usable_w / img_w, usable_h / img_h)
-                draw_w, draw_h = img_w * factor, img_h * factor
-                pdf.drawImage(ImageReader(img), (page_w - draw_w) / 2,
-                              page_h - margin - draw_h, width=draw_w,
-                              height=draw_h, mask="auto")
-                pdf.showPage()
-                if draw_w < usable_w * 0.65:
-                    print("WARNING: Tall report scaled to one page; text may be small.")
-        pdf.save()
-    print(f"PDF created: {cfg['output']}")
+
+def apply_key_diff(existing: pa.Table, ora_keys: pa.Table, fetch_rows) -> pa.Table | None:
+    """Return the updated table, or None if nothing changed.
+    fetch_rows(list_of_serials) -> pa.Table of full rows for those serials."""
+    ora_set = set(ora_keys.column("meterno").to_pylist())
+    pq_set = set(existing.column("meterno").to_pylist())
+    new_meters = ora_set - pq_set
+    gone_meters = pq_set - ora_set
+    print(f"New: {len(new_meters):,}  Removed: {len(gone_meters):,}")
+    if not new_meters and not gone_meters:
+        return None
+
+    kept = existing
+    if gone_meters:
+        mask = pc.is_in(existing.column("meterno"), value_set=pa.array(list(gone_meters)))
+        kept = existing.filter(pc.invert(mask))
+
+    if not new_meters:
+        return kept
+
+    is_new = pc.is_in(ora_keys.column("meterno"), value_set=pa.array(list(new_meters)))
+    serials = sorted(set(ora_keys.filter(is_new).column("serial_nbr").to_pylist()))
+    added = fetch_rows(serials)
+    # a serial can map to more than one MFG_CD, so keep only the exact new METERNOs
+    added = added.filter(pc.is_in(added.column("meterno"), value_set=pa.array(list(new_meters))))
+    added = added.select(kept.column_names).cast(kept.schema)
+    return pa.concat_tables([kept, added])
+
+
+def fetch_rows_by_serial(serials, chunk=1000):  # Oracle caps IN lists at 1000
+    parts = []
+    for i in range(0, len(serials), chunk):
+        batch = serials[i:i + chunk]
+        binds = ", ".join(f":s{j}" for j in range(len(batch)))
+        sql = FULL_SQL + f" WHERE TRIM(A.SERIAL_NBR) IN ({binds})"
+        parts.append(fetch_arrow(sql, {f"s{j}": v for j, v in enumerate(batch)}))
+    return pa.concat_tables(parts, promote_options="default")
+
+
+def incremental_sync():
+    t0 = time.perf_counter()
+    if not os.path.exists(PARQUET_PATH):
+        return full_refresh()
+    existing = pq.read_table(PARQUET_PATH)
+    ora_keys = fetch_arrow(KEYS_SQL)
+    log(f"Fetched {ora_keys.num_rows:,} keys", t0)
+    updated = apply_key_diff(existing, ora_keys, fetch_rows_by_serial)
+    if updated is None:
+        log("No changes, parquet left as is", t0)
+        return
+    write_atomic(updated, PARQUET_PATH)
+    log(f"Wrote parquet ({updated.num_rows:,} rows)", t0)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", type=Path, required=True)
-    args = parser.parse_args()
-    _run_worker(args.worker)
+    full_refresh() if MODE == "full" else incremental_sync()
