@@ -1,45 +1,275 @@
-import subprocess
+
+# ============================================================
+# PROJECT RANGER - PRINTABLE PDF CREATOR
+# ============================================================
+
 import sys
+import re
+import base64
 from pathlib import Path
 
-# Save the completed HTML report
-html_path = Path("project_ranger_temp.html").resolve()
-html_path.write_text(email_html, encoding="utf-8")
-
-# Run PDF generation outside Jupyter
-result = subprocess.run(
-    [
-        sys.executable,
-        "project_ranger_pdf.py",
-        str(html_path),
-        str(Path(chart_path).resolve())
-    ],
-    check=True,
-    capture_output=True,
-    text=True
-)
-
-pdf_path = str(Path("project_ranger_report.pdf").resolve())
-
-print(f"PDF created: {pdf_path}")
-
-# Send the report
-send_report(email_html, chart_path, pdf_path)
+from playwright.sync_api import sync_playwright
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from PIL import Image
 
 
+def create_project_ranger_pdf(email_html, chart_path):
+
+    # --------------------------------------------------------
+    # 1. FILE PATHS
+    # --------------------------------------------------------
+
+    output_dir = Path(__file__).resolve().parent
+
+    pdf_path = output_dir / "project_ranger_report.pdf"
+    preview_path = output_dir / "project_ranger_pdf_preview.html"
+    image_path = output_dir / "project_ranger_pdf_render.png"
+
+    chart_file = Path(chart_path).resolve()
+
+    if not chart_file.is_file():
+        raise FileNotFoundError(
+            f"Burndown chart not found: {chart_file}"
+        )
+
+    # --------------------------------------------------------
+    # 2. EMBED BURNDOWN CHART
+    # --------------------------------------------------------
+
+    encoded = base64.b64encode(
+        chart_file.read_bytes()
+    ).decode("ascii")
+
+    image_uri = f"data:image/png;base64,{encoded}"
+
+    # Replace any CID-based image reference.
+    # Outlook uses CID references, but a browser cannot
+    # resolve those references without the email attachment.
+
+    pdf_html, replacement_count = re.subn(
+        r'cid:[^"\'\s>]+',
+        lambda match: image_uri,
+        email_html,
+        flags=re.IGNORECASE
+    )
+
+    print("CID references replaced:", replacement_count)
+
+    # --------------------------------------------------------
+    # 3. PREPARE HTML FOR BROWSER RENDERING
+    # --------------------------------------------------------
+
+    screen_css = """
+    <style>
+        html {
+            background: white !important;
+        }
+
+        body {
+            background: white !important;
+            margin: 0 !important;
+            padding: 12px !important;
+            box-sizing: border-box;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+
+        table {
+            border-collapse: collapse;
+        }
+    </style>
+    """
+
+    if re.search(r"</head\s*>", pdf_html, re.I):
+        pdf_html = re.sub(
+            r"</head\s*>",
+            lambda match: screen_css + match.group(0),
+            pdf_html,
+            count=1,
+            flags=re.I
+        )
+    else:
+        pdf_html = screen_css + pdf_html
+
+    preview_path.write_text(
+        pdf_html,
+        encoding="utf-8"
+    )
+
+    print("HTML preview:", preview_path)
+
+    # --------------------------------------------------------
+    # 4. RENDER COMPLETE HTML USING MICROSOFT EDGE
+    # --------------------------------------------------------
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch(
+            channel="msedge",
+            headless=True
+        )
+
+        try:
+            page = browser.new_page(
+                viewport={
+                    "width": 1100,
+                    "height": 900
+                },
+                device_scale_factor=2
+            )
+
+            # Use screen styling to preserve the
+            # existing Outlook report appearance.
+            page.emulate_media(media="screen")
+
+            page.set_content(
+                pdf_html,
+                wait_until="load",
+                timeout=60000
+            )
+
+            # Wait for images to finish loading.
+            page.evaluate("""
+                async () => {
+                    await Promise.all(
+                        Array.from(document.images).map(img => {
+                            if (img.complete) return Promise.resolve();
+
+                            return new Promise(resolve => {
+                                img.onload = resolve;
+                                img.onerror = resolve;
+                            });
+                        })
+                    );
+                }
+            """)
+
+            # Diagnostics
+            diagnostics = page.evaluate("""
+                () => ({
+                    height: document.documentElement.scrollHeight,
+                    width: document.documentElement.scrollWidth,
+                    images: Array.from(document.images).map(img => ({
+                        loaded: img.complete && img.naturalWidth > 0,
+                        width: img.naturalWidth,
+                        height: img.naturalHeight
+                    })),
+                    tables: document.querySelectorAll('table').length
+                })
+            """)
+
+            print("Rendered HTML diagnostics:", diagnostics)
+
+            if any(
+                not img["loaded"]
+                for img in diagnostics["images"]
+            ):
+                raise RuntimeError(
+                    "One or more report images failed to load."
+                )
+
+            # Capture the ENTIRE report, not just
+            # the visible browser viewport.
+            page.screenshot(
+                path=str(image_path),
+                full_page=True,
+                animations="disabled"
+            )
+
+        finally:
+            browser.close()
+
+    # --------------------------------------------------------
+    # 5. FIT THE COMPLETE REPORT ONTO ONE PDF PAGE
+    # --------------------------------------------------------
+
+    with Image.open(image_path) as img:
+        image_width, image_height = img.size
+
+    page_width, page_height = letter
+
+    margin = 18
+
+    available_width = page_width - (2 * margin)
+    available_height = page_height - (2 * margin)
+
+    scale = min(
+        available_width / image_width,
+        available_height / image_height
+    )
+
+    draw_width = image_width * scale
+    draw_height = image_height * scale
+
+    x = (page_width - draw_width) / 2
+    y = page_height - margin - draw_height
+
+    c = canvas.Canvas(
+        str(pdf_path),
+        pagesize=letter
+    )
+
+    c.setTitle(
+        "Project Ranger - S4E Removal Report"
+    )
+
+    c.drawImage(
+        ImageReader(str(image_path)),
+        x,
+        y,
+        width=draw_width,
+        height=draw_height,
+        preserveAspectRatio=True,
+        mask="auto"
+    )
+
+    c.showPage()
+    c.save()
+
+    print("PDF created:", pdf_path)
+    print("Original image dimensions:",
+          image_width, image_height)
+    print("PDF scaling factor:", round(scale, 3))
+
+    if draw_width < available_width * 0.65:
+        print(
+            "WARNING: Report is very tall relative to its width. "
+            "Text may be too small for comfortable printing."
+        )
+
+    return str(pdf_path)
+
+
+# ============================================================
+# STANDALONE ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
 
-    html_path = Path(sys.argv[1])
-    chart_path = sys.argv[2]
+    if len(sys.argv) != 3:
+        raise SystemExit(
+            "Usage: python project_ranger_pdf.py "
+            "<html_path> <chart_path>"
+        )
 
-    email_html = html_path.read_text(encoding="utf-8")
+    html_path = Path(sys.argv[1]).resolve()
+    chart_path = Path(sys.argv[2]).resolve()
+
+    if not html_path.is_file():
+        raise FileNotFoundError(html_path)
+
+    email_html = html_path.read_text(
+        encoding="utf-8"
+    )
 
     pdf_path = create_project_ranger_pdf(
         email_html,
         chart_path
     )
 
-    print(f"PDF saved to: {pdf_path}")
+    print("SUCCESS:", pdf_path)
