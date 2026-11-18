@@ -1,275 +1,190 @@
+"""Reusable HTML email -> printable PDF utility for Jupyter and standalone Python.
 
-# ============================================================
-# PROJECT RANGER - PRINTABLE PDF CREATOR
-# ============================================================
+Requires: playwright, Pillow, reportlab, Microsoft Edge (msedge channel).
+The public create_report_pdf() always launches a separate Python process to avoid
+Playwright's synchronous API conflicting with Jupyter's asyncio event loop.
+"""
 
-import sys
-import re
+from __future__ import annotations
+
+import argparse
 import base64
+import json
+import math
+import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
-
-from playwright.sync_api import sync_playwright
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
-from PIL import Image
+from typing import Mapping
 
 
-def create_project_ranger_pdf(email_html, chart_path):
+def create_report_pdf(
+    html: str,
+    images: Mapping[str, str | Path] | None = None,
+    output: str | Path = "report.pdf",
+    page_size: str = "letter",
+    orientation: str = "portrait",
+    multipage: bool = False,
+    keep_debug: bool = False,
+) -> str:
+    """Convert a complete Outlook-style HTML report to a PDF.
 
-    # --------------------------------------------------------
-    # 1. FILE PATHS
-    # --------------------------------------------------------
-
-    output_dir = Path(__file__).resolve().parent
-
-    pdf_path = output_dir / "project_ranger_report.pdf"
-    preview_path = output_dir / "project_ranger_pdf_preview.html"
-    image_path = output_dir / "project_ranger_pdf_render.png"
-
-    chart_file = Path(chart_path).resolve()
-
-    if not chart_file.is_file():
-        raise FileNotFoundError(
-            f"Burndown chart not found: {chart_file}"
-        )
-
-    # --------------------------------------------------------
-    # 2. EMBED BURNDOWN CHART
-    # --------------------------------------------------------
-
-    encoded = base64.b64encode(
-        chart_file.read_bytes()
-    ).decode("ascii")
-
-    image_uri = f"data:image/png;base64,{encoded}"
-
-    # Replace any CID-based image reference.
-    # Outlook uses CID references, but a browser cannot
-    # resolve those references without the email attachment.
-
-    pdf_html, replacement_count = re.subn(
-        r'cid:[^"\'\s>]+',
-        lambda match: image_uri,
-        email_html,
-        flags=re.IGNORECASE
-    )
-
-    print("CID references replaced:", replacement_count)
-
-    # --------------------------------------------------------
-    # 3. PREPARE HTML FOR BROWSER RENDERING
-    # --------------------------------------------------------
-
-    screen_css = """
-    <style>
-        html {
-            background: white !important;
-        }
-
-        body {
-            background: white !important;
-            margin: 0 !important;
-            padding: 12px !important;
-            box-sizing: border-box;
-        }
-
-        img {
-            max-width: 100%;
-            height: auto;
-        }
-
-        table {
-            border-collapse: collapse;
-        }
-    </style>
+    images maps CID names (without 'cid:') to local PNG/JPEG image paths.
+    Returns an absolute PDF path. Runs rendering in a separate process.
     """
+    if not isinstance(html, str) or not html.strip():
+        raise ValueError("html must be a nonempty string")
+    if page_size.lower() not in {"letter", "a4", "legal"}:
+        raise ValueError("page_size must be 'letter', 'a4', or 'legal'")
+    if orientation.lower() not in {"portrait", "landscape"}:
+        raise ValueError("orientation must be 'portrait' or 'landscape'")
 
-    if re.search(r"</head\s*>", pdf_html, re.I):
-        pdf_html = re.sub(
-            r"</head\s*>",
-            lambda match: screen_css + match.group(0),
-            pdf_html,
-            count=1,
-            flags=re.I
+    output_path = Path(output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image_paths = {}
+    for cid, path in (images or {}).items():
+        clean_cid = str(cid).removeprefix("cid:")
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Missing image for CID {clean_cid!r}: {resolved}")
+        image_paths[clean_cid] = str(resolved)
+
+    with tempfile.TemporaryDirectory(prefix="report_pdf_") as temp:
+        work = Path(temp)
+        html_path = work / "source.html"
+        config_path = work / "config.json"
+        html_path.write_text(html, encoding="utf-8")
+        config_path.write_text(json.dumps({
+            "html_path": str(html_path),
+            "output": str(output_path),
+            "images": image_paths,
+            "page_size": page_size.lower(),
+            "orientation": orientation.lower(),
+            "multipage": bool(multipage),
+            "debug_dir": str(output_path.parent) if keep_debug else None,
+        }), encoding="utf-8")
+
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--worker", str(config_path)],
+            capture_output=True, text=True, check=False,
         )
+        if proc.returncode:
+            raise RuntimeError(
+                "PDF generation failed.\n" + (proc.stderr or proc.stdout or "No error details returned.")
+            )
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError("PDF worker exited successfully but produced no PDF.")
+        if proc.stdout.strip():
+            print(proc.stdout.strip())
+    return str(output_path)
+
+
+def _embed_images(html: str, images: dict[str, str]) -> str:
+    for cid, filename in images.items():
+        path = Path(filename)
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(path.suffix.lower())
+        if mime is None:
+            raise ValueError(f"Unsupported image format for {cid}: {path.suffix}")
+        uri = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        # Match this CID only, without modifying unrelated CID references.
+        html = re.sub(re.escape("cid:" + cid) + r"(?=[\"'\s<>]|$)", lambda _: uri, html, flags=re.I)
+    unresolved = re.findall(r"cid:[^\"'\s<>]+", html, flags=re.I)
+    if unresolved:
+        raise ValueError(f"Unresolved inline image CID references: {unresolved}")
+    return html
+
+
+def _run_worker(config_path: Path) -> None:
+    from PIL import Image
+    from playwright.sync_api import sync_playwright
+    from reportlab.lib.pagesizes import A4, legal, letter, landscape
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    html = Path(cfg["html_path"]).read_text(encoding="utf-8")
+    html = _embed_images(html, cfg["images"])
+    css = """<style>
+    html, body { background: white !important; }
+    body { margin: 0 !important; padding: 12px !important; box-sizing: border-box; }
+    img { max-width: 100%; height: auto; }
+    table { border-collapse: collapse; }
+    </style>"""
+    if re.search(r"</head\s*>", html, re.I):
+        html = re.sub(r"</head\s*>", lambda m: css + m.group(0), html, count=1, flags=re.I)
     else:
-        pdf_html = screen_css + pdf_html
+        html = css + html
 
-    preview_path.write_text(
-        pdf_html,
-        encoding="utf-8"
-    )
+    debug_dir = Path(cfg["debug_dir"]) if cfg["debug_dir"] else None
+    if debug_dir:
+        (debug_dir / "report_pdf_preview.html").write_text(html, encoding="utf-8")
 
-    print("HTML preview:", preview_path)
+    with tempfile.TemporaryDirectory(prefix="report_render_") as temp:
+        image_path = Path(temp) / "render.png"
+        with sync_playwright() as p:
+            browser = p.chromium.launch(channel="msedge", headless=True)
+            try:
+                page = browser.new_page(viewport={"width": 1100, "height": 900}, device_scale_factor=2)
+                page.emulate_media(media="screen")
+                page.set_content(html, wait_until="load", timeout=60000)
+                page.evaluate("""async () => {
+                    await Promise.all(Array.from(document.images).map(img => {
+                        if (img.complete) return Promise.resolve();
+                        return new Promise(resolve => { img.onload = resolve; img.onerror = resolve; });
+                    }));
+                    if (document.fonts) await document.fonts.ready;
+                }""")
+                missing = page.evaluate("""() => Array.from(document.images)
+                    .filter(img => !img.complete || img.naturalWidth === 0)
+                    .map(img => img.getAttribute('src')?.slice(0, 120))""")
+                if missing:
+                    raise RuntimeError(f"Images failed to load: {missing}")
+                page.screenshot(path=str(image_path), full_page=True, animations="disabled")
+            finally:
+                browser.close()
 
-    # --------------------------------------------------------
-    # 4. RENDER COMPLETE HTML USING MICROSOFT EDGE
-    # --------------------------------------------------------
+        if debug_dir:
+            from shutil import copyfile
+            copyfile(image_path, debug_dir / "report_pdf_render.png")
 
-    with sync_playwright() as p:
+        sizes = {"letter": letter, "a4": A4, "legal": legal}
+        paper = sizes[cfg["page_size"]]
+        if cfg["orientation"] == "landscape":
+            paper = landscape(paper)
+        page_w, page_h = paper
+        margin = 18
+        usable_w, usable_h = page_w - 2 * margin, page_h - 2 * margin
+        pdf = canvas.Canvas(cfg["output"], pagesize=paper)
+        pdf.setTitle("Report")
 
-        browser = p.chromium.launch(
-            channel="msedge",
-            headless=True
-        )
+        with Image.open(image_path) as img:
+            img_w, img_h = img.size
+            if cfg["multipage"]:
+                # Render at readable page width and slice the tall image into pages.
+                px_per_page = max(1, int(usable_h * img_w / usable_w))
+                for top in range(0, img_h, px_per_page):
+                    bottom = min(img_h, top + px_per_page)
+                    tile = img.crop((0, top, img_w, bottom))
+                    tile_h_pt = (bottom - top) * usable_w / img_w
+                    pdf.drawImage(ImageReader(tile), margin, page_h - margin - tile_h_pt,
+                                  width=usable_w, height=tile_h_pt, mask="auto")
+                    pdf.showPage()
+            else:
+                factor = min(usable_w / img_w, usable_h / img_h)
+                draw_w, draw_h = img_w * factor, img_h * factor
+                pdf.drawImage(ImageReader(img), (page_w - draw_w) / 2,
+                              page_h - margin - draw_h, width=draw_w,
+                              height=draw_h, mask="auto")
+                pdf.showPage()
+                if draw_w < usable_w * 0.65:
+                    print("WARNING: Tall report scaled to one page; text may be small.")
+        pdf.save()
+    print(f"PDF created: {cfg['output']}")
 
-        try:
-            page = browser.new_page(
-                viewport={
-                    "width": 1100,
-                    "height": 900
-                },
-                device_scale_factor=2
-            )
-
-            # Use screen styling to preserve the
-            # existing Outlook report appearance.
-            page.emulate_media(media="screen")
-
-            page.set_content(
-                pdf_html,
-                wait_until="load",
-                timeout=60000
-            )
-
-            # Wait for images to finish loading.
-            page.evaluate("""
-                async () => {
-                    await Promise.all(
-                        Array.from(document.images).map(img => {
-                            if (img.complete) return Promise.resolve();
-
-                            return new Promise(resolve => {
-                                img.onload = resolve;
-                                img.onerror = resolve;
-                            });
-                        })
-                    );
-                }
-            """)
-
-            # Diagnostics
-            diagnostics = page.evaluate("""
-                () => ({
-                    height: document.documentElement.scrollHeight,
-                    width: document.documentElement.scrollWidth,
-                    images: Array.from(document.images).map(img => ({
-                        loaded: img.complete && img.naturalWidth > 0,
-                        width: img.naturalWidth,
-                        height: img.naturalHeight
-                    })),
-                    tables: document.querySelectorAll('table').length
-                })
-            """)
-
-            print("Rendered HTML diagnostics:", diagnostics)
-
-            if any(
-                not img["loaded"]
-                for img in diagnostics["images"]
-            ):
-                raise RuntimeError(
-                    "One or more report images failed to load."
-                )
-
-            # Capture the ENTIRE report, not just
-            # the visible browser viewport.
-            page.screenshot(
-                path=str(image_path),
-                full_page=True,
-                animations="disabled"
-            )
-
-        finally:
-            browser.close()
-
-    # --------------------------------------------------------
-    # 5. FIT THE COMPLETE REPORT ONTO ONE PDF PAGE
-    # --------------------------------------------------------
-
-    with Image.open(image_path) as img:
-        image_width, image_height = img.size
-
-    page_width, page_height = letter
-
-    margin = 18
-
-    available_width = page_width - (2 * margin)
-    available_height = page_height - (2 * margin)
-
-    scale = min(
-        available_width / image_width,
-        available_height / image_height
-    )
-
-    draw_width = image_width * scale
-    draw_height = image_height * scale
-
-    x = (page_width - draw_width) / 2
-    y = page_height - margin - draw_height
-
-    c = canvas.Canvas(
-        str(pdf_path),
-        pagesize=letter
-    )
-
-    c.setTitle(
-        "Project Ranger - S4E Removal Report"
-    )
-
-    c.drawImage(
-        ImageReader(str(image_path)),
-        x,
-        y,
-        width=draw_width,
-        height=draw_height,
-        preserveAspectRatio=True,
-        mask="auto"
-    )
-
-    c.showPage()
-    c.save()
-
-    print("PDF created:", pdf_path)
-    print("Original image dimensions:",
-          image_width, image_height)
-    print("PDF scaling factor:", round(scale, 3))
-
-    if draw_width < available_width * 0.65:
-        print(
-            "WARNING: Report is very tall relative to its width. "
-            "Text may be too small for comfortable printing."
-        )
-
-    return str(pdf_path)
-
-
-# ============================================================
-# STANDALONE ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-
-    if len(sys.argv) != 3:
-        raise SystemExit(
-            "Usage: python project_ranger_pdf.py "
-            "<html_path> <chart_path>"
-        )
-
-    html_path = Path(sys.argv[1]).resolve()
-    chart_path = Path(sys.argv[2]).resolve()
-
-    if not html_path.is_file():
-        raise FileNotFoundError(html_path)
-
-    email_html = html_path.read_text(
-        encoding="utf-8"
-    )
-
-    pdf_path = create_project_ranger_pdf(
-        email_html,
-        chart_path
-    )
-
-    print("SUCCESS:", pdf_path)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", type=Path, required=True)
+    args = parser.parse_args()
+    _run_worker(args.worker)
