@@ -1,44 +1,33 @@
-############## ALL METERS V2 — CG_RFASSET hardware (contains metervolt, instrate) -> hw_asset_V2.parquet
+############## DIM LOCATION -> df_location.parquet
 # Refresh + keep history (never delete):
-#   assets still in Oracle -> re-pulled every run, so changed values are updated
-#   new assets             -> added
-#   assets gone from Oracle -> kept from the old parquet as last seen
+#   locations still in Oracle -> re-pulled every run, so changed values are updated
+#   new locations             -> added
+#   locations gone from Oracle -> kept from the old parquet as last seen
 from pathlib import Path
 
 from fast_oracle import Timer, fetch_arrow, make_engine, upsert_keep_history, write_parquet_atomic
 
-OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "hw_asset_V2.parquet"
+OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "df_location.parquet"
+KEY = "client_co_location_id"
 
-# Same columns as your draft. SERIALNUM / MANUFACTURER are qualified with b. (VW_ASSET) —
-# unqualified, Oracle errors with "column ambiguously defined" if CG_RFASSET also has them.
-# DISTINCT guards against VW_ASSET holding the same assetnum on more than one site.
+# Same query as before
 QUERY = """
-SELECT DISTINCT
-    TRIM(TO_CHAR(b.SERIALNUM)) || TRIM(TO_CHAR(b.MANUFACTURER)) AS meterno,
-    a.assetnum,
-    a.FORMNO,
-    a.FRMWAREV,
-    a.HANFWV,
-    a.HANTYPE,
-    a.INSTRATE,
-    a."INTERVAL",
-    a.KH,
-    a.KWHMULT,
-    a.MAXKW,
-    a.METRFWVR,
-    a.METRVOLT,
-    a.MFGTYPE,
-    a.ONCORPGM,
-    a.RADPWR,
-    a.REACTIVE,
-    a.REGTYPE,
-    a.REV AS revisionid,
-    a.SFTWAREV,
-    a.CLASSAMP,
-    a.AMRTYPE
-FROM MXRADS.CG_RFASSET a
-JOIN MXRADS.VW_ASSET b ON a.ASSETNUM = b.ASSETNUM
--- WHERE UPPER(a.REV) LIKE '%S4E%'
+SELECT
+    substr(CLIENT_CO_LOCATION_ID, 8, 10) esi_loc,
+    CLIENT_CO_LOCATION_ID,
+    ADDRESS_LINE_1,
+    ZIP,
+    CITY,
+    a.county,
+    STATE,
+    a.FEEDER,
+    a.SUBSTATION,
+    a.WEATHER_ZONE,
+    LATITUDE,
+    LONGITUDE
+FROM WACSMDMS.VW_LOCATION a
+JOIN CENTRALSERVICES.VW_SERVICELOCATIONS b ON b.SERVLOC = CLIENT_CO_LOCATION_ID
+JOIN CENTRALSERVICES.VW_GPSLOCATIONS c     ON c.GPSLOCATIONID = b.GPSLOCATIONID
 """
 
 if __name__ == "__main__":
@@ -46,96 +35,6 @@ if __name__ == "__main__":
     engine = make_engine("edw_sqlalchemy")
     tbl = fetch_arrow(engine, QUERY)
     t.log(f"Fetched {tbl.num_rows:,} rows from Oracle")
-    tbl = upsert_keep_history(tbl, OUT_PATH, key="assetnum")
+    tbl = upsert_keep_history(tbl, OUT_PATH, key=KEY)
     write_parquet_atomic(tbl, OUT_PATH)
     t.log(f"Wrote parquet ({tbl.num_rows:,} rows)")
-
-
-
-
-
-
-
-
-
-
-
-
-############## ALL METERS — LG hardware assets (hw_asset.parquet) — fast full refresh
-# Refresh + keep history:
-#   every asset Oracle still has is re-pulled, so firmware/software revisions, STATUS and
-#   DESCRIPTION stay current. Assets that disappear from Oracle are kept from the old
-#   parquet as last seen (this dataset tracks historical meters too).
-# Why it's fast now:
-#   - VW_ASSETSPEC is read ONCE and pivoted with MAX(CASE ...), instead of 10 self-joins
-#     (each one a separate pass over the spec table)
-#   - fast_oracle: 50k-row fetch batches + Arrow, no pandas round trip
-from pathlib import Path
-
-from fast_oracle import Timer, fetch_arrow, make_engine, upsert_keep_history, write_parquet_atomic
-
-OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "hw_asset.parquet"
-
-# (output column, ASSETATTRID) — same attributes and aliases as before
-SPEC_ATTRS = [
-    ("registertype", "REGTYPE"),
-    ("revisionid",   "REV"),
-    ("formno",       "FORMNO"),
-    ("frmwarev",     "FRMWAREV"),
-    ("sftwarev",     "SFTWAREV"),
-    ("metrfwvr",     "METRFWVR"),
-    ("metrfwdt",     "METRFWDT"),
-    ("hantype",      "HANTYPE"),
-    ("hanctype",     "HANCTYPE"),
-    ("hanfw",        "HANFWV"),   # attr id is HANFWV, column was aliased HANFW — kept as before
-]
-
-pivot_cols = ",\n        ".join(
-    f"MAX(CASE WHEN s.assetattrid = '{attr}' THEN s.alnvalue END) AS {col}"
-    for col, attr in SPEC_ATTRS
-)
-spec_select = ", ".join(f"spec.{col}" for col, _ in SPEC_ATTRS)
-
-QUERY = f"""
-WITH lg AS (
-    SELECT DISTINCT
-        a.assetnum,
-        a.cg_purchasedate,
-        a.manufacturer,
-        TRIM(TO_CHAR(a.serialnum)) || TRIM(TO_CHAR(a.manufacturer)) AS meterno,
-        a.initial_install_dt
-    FROM mxrads.vw_asset a
-    WHERE a.manufacturer IN ('LG')
-),
-spec AS (
-    SELECT
-        s.assetnum,
-        {pivot_cols}
-    FROM mxrads.vw_assetspec s
-    WHERE s.assetnum IN (SELECT assetnum FROM lg)
-    GROUP BY s.assetnum
-)
-SELECT DISTINCT
-    spec.revisionid AS hardware_model,
-    spec.assetnum,
-    {spec_select},
-    asset.status,
-    asset.description,
-    asset.cg_purchasedate,
-    lg.manufacturer,
-    lg.meterno,
-    lg.initial_install_dt
-FROM spec
-JOIN mxrads.vw_asset asset ON asset.assetnum = spec.assetnum
-JOIN lg                    ON lg.assetnum    = spec.assetnum
-"""
-
-if __name__ == "__main__":
-    t = Timer()
-    engine = make_engine("edw_sqlalchemy")
-    tbl = fetch_arrow(engine, QUERY)
-    t.log(f"Fetched {tbl.num_rows:,} rows from Oracle")
-    tbl = upsert_keep_history(tbl, OUT_PATH, key="assetnum")
-    write_parquet_atomic(tbl, OUT_PATH)
-    t.log(f"Wrote parquet ({tbl.num_rows:,} rows)")
-
