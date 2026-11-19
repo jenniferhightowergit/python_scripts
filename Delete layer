@@ -1,45 +1,240 @@
+############## METER EFFECTIVE DATE CHANGE HISTORY — incremental
+# How it works:
+#   lag()/lead() run per esi_loc, so one change can alter other rows at the SAME esi_loc
+#   (prev_meterno, inferred removal dates). So the unit of update is the whole esi_loc:
+#     1. Find "affected" esi_locs:
+#          a) any esi_loc with an INSTALL_DATE or REMOVE_DATE in the last LOOKBACK_DAYS (Oracle)
+#          b) any esi_loc whose ACTIVE meters no longer match ALLTown.parquet
+#     2. Pull full Oracle history for just those esi_locs and rebuild them with the
+#        exact same DuckDB logic as the full run.
+#     3. Old parquet minus affected esi_locs + rebuilt rows -> new parquet.
+#   A weekly full rebuild catches anything the window can't see (e.g. back-dated edits).
+import datetime as dt
+import os
+import time
+
+import duckdb
 import keyring
-import oracledb
+import pandas as pd
+import pyarrow as pa
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
-# Retrieve the connection string you already saved
-conn_string = keyring.get_password(
-    "ods_sqlalchemy",
-    "connection_string"
+MODE = "auto"              # "auto" | "full" | "incremental"
+FULL_REBUILD_WEEKDAY = 6   # auto mode does a full rebuild on Sundays (Mon=0); None = never
+LOOKBACK_DAYS = 30
+FETCH_SIZE = 50_000
+
+ALLTOWN_PATH = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\ALLTown.parquet"
+OUT_PATH = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\METER_EFFECTIVEDATE_CHANGE.parquet"
+
+
+def esi(alias):
+    return f"substr(to_char(trim({alias}.CLIENT_CO_LOCATION_ID)), 8, 10)"
+
+
+HIST_SQL = f"""
+SELECT mtr.LOCATION_ID,
+       {esi('mtr')}                AS esi_loc,
+       mtr.MR_MDVC_NUMBER          AS meterno,
+       MIN(TRUNC(mtr.INSTALL_DATE)) AS eff_dt,
+       MAX(TRUNC(mtr.REMOVE_DATE))  AS end_dt
+FROM WACSMDMS.METERING_DEVICE mtr
+{{where}}
+GROUP BY mtr.LOCATION_ID, {esi('mtr')}, mtr.MR_MDVC_NUMBER
+"""
+
+# Upper bound matters: open meters carry REMOVE_DATE 4000-12-31, which would otherwise
+# match ">= today - 30" and pull back every active meter.
+WINDOW_WHERE = f"""
+WHERE {esi('mtr')} IN (
+    SELECT {esi('w')}
+    FROM WACSMDMS.METERING_DEVICE w
+    WHERE (w.INSTALL_DATE >= TRUNC(SYSDATE) - :days AND w.INSTALL_DATE < TRUNC(SYSDATE) + 1)
+       OR (w.REMOVE_DATE  >= TRUNC(SYSDATE) - :days AND w.REMOVE_DATE  < TRUNC(SYSDATE) + 1)
 )
+"""
 
-if not conn_string:
-    raise RuntimeError("ODS connection string not found in keyring.")
+# Your original DuckDB logic, unchanged except: reads hist / at_active / at_all views,
+# and dates are cast to TIMESTAMP so the file keeps the same types your pandas version wrote.
+BUILD_SQL = """
+CREATE OR REPLACE TEMP VIEW new_rows AS
+SELECT meterno, prev_meterno, esi_loc,
+       CAST(installation_date  AS TIMESTAMP) AS installation_date,
+       CAST(meter_removal_date AS TIMESTAMP) AS meter_removal_date,
+       status
+FROM (
+    SELECT meterno,
+           lag(meterno) OVER (PARTITION BY esi_loc ORDER BY meter_install_date) AS prev_meterno,
+           esi_loc,
+           meter_install_date AS installation_date,
+           CASE WHEN status = 'INACTIVE' AND meter_removal_date = DATE '3001-01-01'
+                THEN lead(meter_install_date) OVER (PARTITION BY esi_loc ORDER BY meter_install_date)
+                ELSE meter_removal_date END AS meter_removal_date,
+           status
+    FROM (
+        SELECT meterno, prem_h AS esi_loc,
+               CAST(meter_install_date AS DATE) AS meter_install_date,
+               DATE '3001-01-01' AS meter_removal_date,
+               'ACTIVE' AS status
+        FROM at_active
+        UNION
+        SELECT a.meterno, a.esi_loc,
+               CAST(eff_dt AS DATE) AS meter_install_date,
+               CASE WHEN CAST(end_dt AS DATE) = DATE '4000-12-31' THEN DATE '3001-01-01'
+                    WHEN CAST(end_dt AS DATE) IS NULL THEN DATE '3001-01-01'
+                    ELSE CAST(end_dt AS DATE) END AS meter_removal_date,
+               'INACTIVE' AS status
+        FROM hist a
+        WHERE NOT EXISTS (SELECT 1 FROM at_all c WHERE c.meterno = a.meterno)  -- full ALLTown, always
+    ) t1
+) t2
+"""
 
-# Parse the existing URL and switch drivers
-url = make_url(conn_string)
-url = url.set(drivername="oracle+oracledb")
+# esi_locs where ALLTown's active meters differ from the ACTIVE rows already in the parquet,
+# plus esi_locs holding an INACTIVE row for a meter that is back in ALLTown.
+ALLTOWN_DIFF_SQL = """
+WITH cur AS (
+    SELECT meterno, prem_h AS esi_loc, CAST(meter_install_date AS DATE) AS d FROM at_all
+), old_act AS (
+    SELECT meterno, esi_loc, CAST(installation_date AS DATE) AS d FROM old WHERE status = 'ACTIVE'
+), changed AS (
+    (SELECT * FROM cur EXCEPT SELECT * FROM old_act)
+    UNION ALL
+    (SELECT * FROM old_act EXCEPT SELECT * FROM cur)
+), reactivated AS (
+    SELECT o.esi_loc FROM old o JOIN cur c USING (meterno) WHERE o.status = 'INACTIVE'
+)
+SELECT DISTINCT esi_loc
+FROM (SELECT esi_loc FROM changed UNION ALL SELECT esi_loc FROM reactivated)
+WHERE esi_loc IS NOT NULL
+"""
 
-print("Testing Oracle Thin mode...")
-print("Thin mode:", oracledb.is_thin_mode())
+MERGE_SQL = """
+SELECT * FROM old o
+WHERE NOT EXISTS (SELECT 1 FROM affected f WHERE f.esi_loc = o.esi_loc)
+UNION ALL BY NAME
+SELECT * FROM new_rows
+"""
 
-engine = create_engine(url)
 
-try:
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT 1 FROM DUAL")
-        ).scalar()
+# ---------- helpers ----------
+def log(msg, t0):
+    print(f"{msg}: {time.perf_counter() - t0:,.1f}s")
 
-        print("ODS connection successful!")
-        print("Test result:", result)
 
-except Exception as e:
-    print("Connection failed.")
-    print("Error type:", type(e).__name__)
+def q(path):  # quote a file path for DuckDB SQL
+    return "'" + path.replace("'", "''") + "'"
 
-    # Show the underlying driver error code,
-    # without printing the connection string.
-    original = getattr(e, "orig", e)
-    error = original.args[0] if original.args else original
 
-    print("Error code:", getattr(error, "code", "Unavailable"))
+def copy_atomic(con, select_sql, path):
+    tmp = path + ".tmp"
+    con.execute(f"CREATE OR REPLACE TEMP TABLE _final AS {select_sql}")
+    con.execute(f"COPY _final TO {q(tmp)} (FORMAT parquet, COMPRESSION snappy)")
+    n = con.execute("SELECT count(*) FROM _final").fetchone()[0]
+    con.execute("DROP TABLE _final")
+    os.replace(tmp, path)
+    return n
 
-finally:
-    engine.dispose()
+
+def make_engine():
+    conn_string = keyring.get_password("ods_sqlalchemy", "connection_string")
+    if not conn_string:
+        raise RuntimeError("ODS connection string not found in keyring.")
+    url = make_url(conn_string).set(drivername="oracle+oracledb")
+    return create_engine(url, arraysize=FETCH_SIZE)
+
+
+def fetch_arrow(engine, sql, params=None) -> pa.Table:
+    raw = engine.raw_connection()
+    try:
+        conn = getattr(raw, "driver_connection", None)
+        if conn is not None and hasattr(conn, "fetch_df_all"):  # python-oracledb 3.0+
+            odf = conn.fetch_df_all(statement=sql, parameters=params, arraysize=FETCH_SIZE)
+            tbl = pa.Table.from_arrays(odf.column_arrays(), names=odf.column_names())
+            return tbl.rename_columns([n.lower() for n in tbl.column_names])
+    finally:
+        raw.close()
+    with engine.connect() as c:
+        df = pd.read_sql(text(sql), c, params=params)
+    df.columns = [c.lower() for c in df.columns]
+    return pa.Table.from_pandas(df, preserve_index=False)
+
+
+def oracle_fetchers(engine):
+    def fetch_all():
+        return fetch_arrow(engine, HIST_SQL.format(where=""))
+
+    def fetch_window(days):
+        return fetch_arrow(engine, HIST_SQL.format(where=WINDOW_WHERE), {"days": days})
+
+    def fetch_by_locs(locs, chunk=1000):  # Oracle caps IN lists at 1000
+        parts = []
+        for i in range(0, len(locs), chunk):
+            batch = locs[i:i + chunk]
+            binds = ", ".join(f":l{j}" for j in range(len(batch)))
+            where = f"WHERE {esi('mtr')} IN ({binds})"
+            parts.append(fetch_arrow(engine, HIST_SQL.format(where=where),
+                                     {f"l{j}": v for j, v in enumerate(batch)}))
+        return parts
+
+    return fetch_all, fetch_window, fetch_by_locs
+
+
+# ---------- the two modes ----------
+def full_rebuild(con, fetch_all):
+    t0 = time.perf_counter()
+    con.register("hist", fetch_all())
+    log("Fetched full Oracle history", t0)
+    con.execute(f"CREATE OR REPLACE TEMP VIEW at_all AS SELECT * FROM read_parquet({q(ALLTOWN_PATH)})")
+    con.execute("CREATE OR REPLACE TEMP VIEW at_active AS SELECT * FROM at_all")
+    con.execute(BUILD_SQL)
+    n = copy_atomic(con, "SELECT * FROM new_rows", OUT_PATH)
+    log(f"Full rebuild wrote {n:,} rows", t0)
+
+
+def incremental(con, fetch_window, fetch_by_locs, days=LOOKBACK_DAYS):
+    t0 = time.perf_counter()
+    con.execute(f"CREATE OR REPLACE TEMP VIEW at_all AS SELECT * FROM read_parquet({q(ALLTOWN_PATH)})")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW old AS SELECT * FROM read_parquet({q(OUT_PATH)})")
+
+    alltown_locs = {r[0] for r in con.execute(ALLTOWN_DIFF_SQL).fetchall()}
+    hist_w = fetch_window(days)
+    window_locs = {x for x in hist_w.column("esi_loc").to_pylist() if x is not None}
+    extra = sorted(alltown_locs - window_locs)
+    log(f"Affected esi_locs: {len(window_locs):,} from date window, {len(extra):,} more from ALLTown", t0)
+
+    affected = window_locs | alltown_locs
+    if not affected:
+        log("Nothing changed, parquet left as is", t0)
+        return
+
+    con.register("hist_w", hist_w)
+    union = ["SELECT * FROM hist_w"]
+    for i, part in enumerate(fetch_by_locs(extra) if extra else []):
+        con.register(f"hist_x{i}", part)
+        union.append(f"SELECT * FROM hist_x{i}")
+    con.execute("CREATE OR REPLACE TEMP VIEW hist AS " + " UNION ALL BY NAME ".join(union))
+
+    con.register("affected", pa.table({"esi_loc": pa.array(sorted(affected), pa.string())}))
+    con.execute("CREATE OR REPLACE TEMP VIEW at_active AS "
+                "SELECT * FROM at_all WHERE prem_h IN (SELECT esi_loc FROM affected)")
+    con.execute(BUILD_SQL)
+    n = copy_atomic(con, MERGE_SQL, OUT_PATH)
+    log(f"Incremental update wrote {n:,} rows", t0)
+
+
+if __name__ == "__main__":
+    engine = make_engine()
+    fetch_all, fetch_window, fetch_by_locs = oracle_fetchers(engine)
+    con = duckdb.connect()
+
+    mode = MODE
+    if mode == "auto":
+        rebuild_day = FULL_REBUILD_WEEKDAY is not None and dt.date.today().weekday() == FULL_REBUILD_WEEKDAY
+        mode = "full" if (rebuild_day or not os.path.exists(OUT_PATH)) else "incremental"
+
+    if mode == "full":
+        full_rebuild(con, fetch_all)
+    else:
+        incremental(con, fetch_window, fetch_by_locs)
