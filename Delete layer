@@ -1,1 +1,45 @@
-Get-ChildItem "C:\Oracle", "C:\Program Files\Oracle", "C:\Users\UMUE" -Filter oci.dll -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+import keyring
+import oracledb
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+
+# Retrieve the connection string you already saved
+conn_string = keyring.get_password(
+    "ods_sqlalchemy",
+    "connection_string"
+)
+
+if not conn_string:
+    raise RuntimeError("ODS connection string not found in keyring.")
+
+# Parse the existing URL and switch drivers
+url = make_url(conn_string)
+url = url.set(drivername="oracle+oracledb")
+
+print("Testing Oracle Thin mode...")
+print("Thin mode:", oracledb.is_thin_mode())
+
+engine = create_engine(url)
+
+try:
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT 1 FROM DUAL")
+        ).scalar()
+
+        print("ODS connection successful!")
+        print("Test result:", result)
+
+except Exception as e:
+    print("Connection failed.")
+    print("Error type:", type(e).__name__)
+
+    # Show the underlying driver error code,
+    # without printing the connection string.
+    original = getattr(e, "orig", e)
+    error = original.args[0] if original.args else original
+
+    print("Error code:", getattr(error, "code", "Unavailable"))
+
+finally:
+    engine.dispose()
