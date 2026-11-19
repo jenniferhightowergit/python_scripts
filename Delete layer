@@ -1,93 +1,141 @@
-"""fast_oracle.py — shared helpers for fast Oracle -> parquet loads.
+############## ALL METERS V2 — CG_RFASSET hardware (contains metervolt, instrate) -> hw_asset_V2.parquet
+# Refresh + keep history (never delete):
+#   assets still in Oracle -> re-pulled every run, so changed values are updated
+#   new assets             -> added
+#   assets gone from Oracle -> kept from the old parquet as last seen
+from pathlib import Path
 
-Usage:
-    from fast_oracle import make_engine, fetch_arrow, write_parquet_atomic
-    engine = make_engine("edw_sqlalchemy")
-    tbl = fetch_arrow(engine, "SELECT ...")
-    write_parquet_atomic(tbl, r"C:\\...\\MyTable.parquet")
+from fast_oracle import Timer, fetch_arrow, make_engine, upsert_keep_history, write_parquet_atomic
+
+OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "hw_asset_V2.parquet"
+
+# Same columns as your draft. SERIALNUM / MANUFACTURER are qualified with b. (VW_ASSET) —
+# unqualified, Oracle errors with "column ambiguously defined" if CG_RFASSET also has them.
+# DISTINCT guards against VW_ASSET holding the same assetnum on more than one site.
+QUERY = """
+SELECT DISTINCT
+    TRIM(TO_CHAR(b.SERIALNUM)) || TRIM(TO_CHAR(b.MANUFACTURER)) AS meterno,
+    a.assetnum,
+    a.FORMNO,
+    a.FRMWAREV,
+    a.HANFWV,
+    a.HANTYPE,
+    a.INSTRATE,
+    a."INTERVAL",
+    a.KH,
+    a.KWHMULT,
+    a.MAXKW,
+    a.METRFWVR,
+    a.METRVOLT,
+    a.MFGTYPE,
+    a.ONCORPGM,
+    a.RADPWR,
+    a.REACTIVE,
+    a.REGTYPE,
+    a.REV AS revisionid,
+    a.SFTWAREV,
+    a.CLASSAMP,
+    a.AMRTYPE
+FROM MXRADS.CG_RFASSET a
+JOIN MXRADS.VW_ASSET b ON a.ASSETNUM = b.ASSETNUM
+-- WHERE UPPER(a.REV) LIKE '%S4E%'
 """
-import os
-import time
 
-import keyring
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
-
-FETCH_SIZE = 50_000  # rows per network round trip (driver default is ~100)
+if __name__ == "__main__":
+    t = Timer()
+    engine = make_engine("edw_sqlalchemy")
+    tbl = fetch_arrow(engine, QUERY)
+    t.log(f"Fetched {tbl.num_rows:,} rows from Oracle")
+    tbl = upsert_keep_history(tbl, OUT_PATH, key="assetnum")
+    write_parquet_atomic(tbl, OUT_PATH)
+    t.log(f"Wrote parquet ({tbl.num_rows:,} rows)")
 
 
-def make_engine(keyring_service, keyring_user="connection_string", fetch_size=FETCH_SIZE):
-    """Engine from a keyring connection string, switched to python-oracledb with big fetch batches."""
-    conn_string = keyring.get_password(keyring_service, keyring_user)
-    if not conn_string:
-        raise RuntimeError(f"Connection string not found in keyring ({keyring_service}).")
-    url = make_url(conn_string)
-    if url.get_backend_name() == "oracle":
-        url = url.set(drivername="oracle+oracledb")
-        return create_engine(url, arraysize=fetch_size)
-    return create_engine(url)
 
 
-def fetch_arrow(engine, sql, params=None, lowercase=True, fetch_size=FETCH_SIZE) -> pa.Table:
-    """Run a query and return a pyarrow Table.
-    Uses python-oracledb 3.0+ fetch_df_all (no per-value Python objects); falls back to pandas.
-    lowercase=True matches the lowercase column names pd.read_sql gave your existing files."""
-    raw = engine.raw_connection()
-    try:
-        conn = getattr(raw, "driver_connection", None)
-        if conn is not None and hasattr(conn, "fetch_df_all"):
-            odf = conn.fetch_df_all(statement=sql, parameters=params, arraysize=fetch_size)
-            tbl = pa.Table.from_arrays(odf.column_arrays(), names=odf.column_names())
-            return tbl.rename_columns([n.lower() for n in tbl.column_names]) if lowercase else tbl
-    finally:
-        raw.close()
-    with engine.connect() as c:
-        df = pd.read_sql(text(sql), c, params=params)
-    if lowercase:
-        df.columns = [c.lower() for c in df.columns]
-    return pa.Table.from_pandas(df, preserve_index=False)
 
 
-def write_parquet_atomic(table: pa.Table, path, compression="snappy"):
-    """Write to a temp file, then swap it in, so readers never see a half-written file."""
-    tmp = str(path) + ".tmp"
-    pq.write_table(table, tmp, compression=compression)
-    os.replace(tmp, path)
 
 
-def upsert_keep_history(new_tbl: pa.Table, path, key="assetnum") -> pa.Table:
-    """Merge a fresh pull with the existing parquet, never deleting:
-       - keys in new_tbl  -> new_tbl's version wins (updates + new rows)
-       - keys only in the old file -> carried forward as last seen
-    Old columns the query no longer returns are dropped; new columns are null for carried rows."""
-    import pyarrow.compute as pc
-    from pathlib import Path
-
-    path = Path(path)
-    if not path.exists():
-        return new_tbl
-    old_cols = set(pq.read_schema(path).names)
-    if key not in old_cols:
-        raise ValueError(f"Key column '{key}' not found in existing file {path.name}")
-    old = pq.read_table(path, columns=[c for c in new_tbl.column_names if c in old_cols])
-
-    gone = old.filter(pc.invert(pc.is_in(old[key], value_set=new_tbl[key])))
-    print(f"Carrying forward {gone.num_rows:,} rows whose {key} is no longer in the source")
-    if gone.num_rows == 0:
-        return new_tbl
-
-    arrays = [gone[f.name].cast(f.type) if f.name in gone.column_names
-              else pa.nulls(gone.num_rows, f.type) for f in new_tbl.schema]
-    return pa.concat_tables([new_tbl, pa.Table.from_arrays(arrays, schema=new_tbl.schema)])
 
 
-class Timer:
-    """t = Timer(); ...; t.log("Fetched")  ->  'Fetched: 12.3s'"""
-    def __init__(self):
-        self.t0 = time.perf_counter()
 
-    def log(self, msg):
-        print(f"{msg}: {time.perf_counter() - self.t0:,.1f}s")
+
+############## ALL METERS — LG hardware assets (hw_asset.parquet) — fast full refresh
+# Refresh + keep history:
+#   every asset Oracle still has is re-pulled, so firmware/software revisions, STATUS and
+#   DESCRIPTION stay current. Assets that disappear from Oracle are kept from the old
+#   parquet as last seen (this dataset tracks historical meters too).
+# Why it's fast now:
+#   - VW_ASSETSPEC is read ONCE and pivoted with MAX(CASE ...), instead of 10 self-joins
+#     (each one a separate pass over the spec table)
+#   - fast_oracle: 50k-row fetch batches + Arrow, no pandas round trip
+from pathlib import Path
+
+from fast_oracle import Timer, fetch_arrow, make_engine, upsert_keep_history, write_parquet_atomic
+
+OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "hw_asset.parquet"
+
+# (output column, ASSETATTRID) — same attributes and aliases as before
+SPEC_ATTRS = [
+    ("registertype", "REGTYPE"),
+    ("revisionid",   "REV"),
+    ("formno",       "FORMNO"),
+    ("frmwarev",     "FRMWAREV"),
+    ("sftwarev",     "SFTWAREV"),
+    ("metrfwvr",     "METRFWVR"),
+    ("metrfwdt",     "METRFWDT"),
+    ("hantype",      "HANTYPE"),
+    ("hanctype",     "HANCTYPE"),
+    ("hanfw",        "HANFWV"),   # attr id is HANFWV, column was aliased HANFW — kept as before
+]
+
+pivot_cols = ",\n        ".join(
+    f"MAX(CASE WHEN s.assetattrid = '{attr}' THEN s.alnvalue END) AS {col}"
+    for col, attr in SPEC_ATTRS
+)
+spec_select = ", ".join(f"spec.{col}" for col, _ in SPEC_ATTRS)
+
+QUERY = f"""
+WITH lg AS (
+    SELECT DISTINCT
+        a.assetnum,
+        a.cg_purchasedate,
+        a.manufacturer,
+        TRIM(TO_CHAR(a.serialnum)) || TRIM(TO_CHAR(a.manufacturer)) AS meterno,
+        a.initial_install_dt
+    FROM mxrads.vw_asset a
+    WHERE a.manufacturer IN ('LG')
+),
+spec AS (
+    SELECT
+        s.assetnum,
+        {pivot_cols}
+    FROM mxrads.vw_assetspec s
+    WHERE s.assetnum IN (SELECT assetnum FROM lg)
+    GROUP BY s.assetnum
+)
+SELECT DISTINCT
+    spec.revisionid AS hardware_model,
+    spec.assetnum,
+    {spec_select},
+    asset.status,
+    asset.description,
+    asset.cg_purchasedate,
+    lg.manufacturer,
+    lg.meterno,
+    lg.initial_install_dt
+FROM spec
+JOIN mxrads.vw_asset asset ON asset.assetnum = spec.assetnum
+JOIN lg                    ON lg.assetnum    = spec.assetnum
+"""
+
+if __name__ == "__main__":
+    t = Timer()
+    engine = make_engine("edw_sqlalchemy")
+    tbl = fetch_arrow(engine, QUERY)
+    t.log(f"Fetched {tbl.num_rows:,} rows from Oracle")
+    tbl = upsert_keep_history(tbl, OUT_PATH, key="assetnum")
+    write_parquet_atomic(tbl, OUT_PATH)
+    t.log(f"Wrote parquet ({tbl.num_rows:,} rows)")
+
