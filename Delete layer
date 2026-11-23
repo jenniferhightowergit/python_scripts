@@ -1,40 +1,16 @@
-############## DIM LOCATION -> df_location.parquet
-# Refresh + keep history (never delete):
-#   locations still in Oracle -> re-pulled every run, so changed values are updated
-#   new locations             -> added
-#   locations gone from Oracle -> kept from the old parquet as last seen
-from pathlib import Path
+import sys
+import os
+import cx_Oracle
 
-from fast_oracle import Timer, fetch_arrow, make_engine, upsert_keep_history, write_parquet_atomic
+print("Python:", sys.executable)
+print("Oracle Client folder exists:",
+      os.path.isdir(r"C:\Users\UMUE\Documents\instantclient_19_9"))
 
-OUT_PATH = Path.home() / "Documents" / "JensFakeDW" / "Staging" / "parquet" / "df_location.parquet"
-KEY = "client_co_location_id"
+print("oci.dll exists:",
+      os.path.isfile(r"C:\Users\UMUE\Documents\instantclient_19_9\oci.dll"))
 
-# Same query as before
-QUERY = """
-SELECT
-    substr(CLIENT_CO_LOCATION_ID, 8, 10) esi_loc,
-    CLIENT_CO_LOCATION_ID,
-    ADDRESS_LINE_1,
-    ZIP,
-    CITY,
-    a.county,
-    STATE,
-    a.FEEDER,
-    a.SUBSTATION,
-    a.WEATHER_ZONE,
-    LATITUDE,
-    LONGITUDE
-FROM WACSMDMS.VW_LOCATION a
-JOIN CENTRALSERVICES.VW_SERVICELOCATIONS b ON b.SERVLOC = CLIENT_CO_LOCATION_ID
-JOIN CENTRALSERVICES.VW_GPSLOCATIONS c     ON c.GPSLOCATIONID = b.GPSLOCATIONID
-"""
+cx_Oracle.init_oracle_client(
+    lib_dir=r"C:\Users\UMUE\Documents\instantclient_19_9"
+)
 
-if __name__ == "__main__":
-    t = Timer()
-    engine = make_engine("edw_sqlalchemy")
-    tbl = fetch_arrow(engine, QUERY)
-    t.log(f"Fetched {tbl.num_rows:,} rows from Oracle")
-    tbl = upsert_keep_history(tbl, OUT_PATH, key=KEY)
-    write_parquet_atomic(tbl, OUT_PATH)
-    t.log(f"Wrote parquet ({tbl.num_rows:,} rows)")
+print("Oracle Client:", cx_Oracle.clientversion())
