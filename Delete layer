@@ -1,4 +1,126 @@
-@echo off
-cd /d "C:\Users\UMUE\Documents\Loading Schedule"
-"C:\Users\UMUE\.conda\envs\AMS\python.exe" "C:\Users\UMUE\Documents\Loading Schedule\...\Schedule_reporting_4.py" >> task_log.txt 2>&1
-echo Finished %date% %time% (exit %errorlevel%) >> task_log.txt
+# %%
+# OPS_AREA_BY_ESILOC — incremental append
+# Data never changes once an ESI_LOC exists, so we only pull ESI_LOCs that are
+# not already in the parquet and append them. Nothing is ever removed.
+
+import os
+import time
+
+import keyring
+import oracledb
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# Fetch big chunks per network round trip (python-oracledb default is 100 rows)
+oracledb.defaults.arraysize = 10000
+oracledb.defaults.prefetchrows = 10000
+
+PARQUET_PATH = r"C:\Users\UMUE\Documents\JensFakeDW\Staging\parquet\OPSAREA_BY_ESILOC.parquet"
+BATCH_SIZE = 1000               # Oracle's max items in an IN (...) list
+FULL_PULL_THRESHOLD = 50_000    # above this many new keys, one full query beats many batches
+
+conn_string = keyring.get_password("ods_sqlalchemy", "connection_string")
+ods_alchemy_engine = create_engine(conn_string)
+
+t0 = time.time()
+
+# %%
+# Queries
+# One row per ESI_LOC: lowest SP_ID (same as the old rn = 1 ordered by SP_ID)
+# and that SP's op area. KEEP (DENSE_RANK FIRST ...) does it in one aggregation
+# instead of GROUP BY + ROW_NUMBER window + outer filter.
+BASE_FROM = """
+FROM CISADM.CI_SP a
+JOIN CISADM.CI_PREM_GEO b    ON a.PREM_ID = b.PREM_ID
+JOIN CISADM.CI_SP_OP_AREA c  ON a.SP_ID   = c.SP_ID
+WHERE b.GEO_TYPE_CD = 'ESI_LOC'
+"""
+
+DETAIL_SELECT = """
+SELECT
+    1 AS rn,
+    MIN(a.SP_ID) AS sp_id,
+    b.GEO_VAL    AS esi_loc,
+    MIN(c.OP_AREA_CD) KEEP (DENSE_RANK FIRST ORDER BY a.SP_ID) AS op_area_cd
+"""
+
+# Light query: just the list of ESI_LOCs that would appear in the output
+KEYS_SQL = "SELECT DISTINCT b.GEO_VAL AS esi_loc " + BASE_FROM
+
+FULL_SQL = DETAIL_SELECT + BASE_FROM + " GROUP BY b.GEO_VAL"
+
+
+def detail_for_keys(conn, keys):
+    """Pull detail rows for a list of ESI_LOCs, 1000 at a time with bind variables."""
+    frames = []
+    for i in range(0, len(keys), BATCH_SIZE):
+        chunk = keys[i:i + BATCH_SIZE]
+        binds = {f"k{j}": v for j, v in enumerate(chunk)}
+        in_list = ", ".join(f":k{j}" for j in range(len(chunk)))
+        sql = DETAIL_SELECT + BASE_FROM + f" AND b.GEO_VAL IN ({in_list}) GROUP BY b.GEO_VAL"
+        frames.append(pd.read_sql(text(sql), conn, params=binds))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def norm(s):
+    """Compare keys without CHAR padding / dtype differences."""
+    return s.astype("string").str.strip()
+
+
+# %%
+# Load what we already have
+if os.path.exists(PARQUET_PATH):
+    existing = pd.read_parquet(PARQUET_PATH)
+    have = set(norm(existing["esi_loc"]))
+else:
+    existing = None
+    have = set()
+
+print(f"Existing rows in parquet: {len(have):,}")
+
+# %%
+# Find and pull only the new ESI_LOCs
+with ods_alchemy_engine.connect() as sql_connection:
+    if existing is None:
+        print("No parquet yet: running full pull")
+        new_rows = pd.read_sql(text(FULL_SQL), sql_connection)
+    else:
+        oracle_keys = pd.read_sql(text(KEYS_SQL), sql_connection)["esi_loc"]
+        new_keys = [k for k, n in zip(oracle_keys, norm(oracle_keys)) if n not in have]
+        print(f"ESI_LOCs in Oracle: {len(oracle_keys):,}  |  new: {len(new_keys):,}")
+
+        if not new_keys:
+            new_rows = pd.DataFrame()
+        elif len(new_keys) > FULL_PULL_THRESHOLD:
+            print("Lots of new keys: one full pull, then filter")
+            full = pd.read_sql(text(FULL_SQL), sql_connection)
+            new_rows = full[~norm(full["esi_loc"]).isin(have)]
+        else:
+            new_rows = detail_for_keys(sql_connection, new_keys)
+
+# %%
+# Append and write
+if new_rows.empty:
+    print("Nothing new. Parquet unchanged.")
+else:
+    new_rows = new_rows.convert_dtypes()
+    for col in new_rows.columns:
+        if new_rows[col].dtype == "object":
+            new_rows[col] = new_rows[col].astype("string")
+
+    if existing is not None:
+        new_rows = new_rows[existing.columns].astype(existing.dtypes.to_dict())
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+    else:
+        combined = new_rows
+
+    # Safety net: never let a key appear twice
+    combined = combined[~norm(combined["esi_loc"]).duplicated(keep="first")]
+
+    # Write to a temp file, then swap, so a crash mid-write can't corrupt the parquet
+    tmp_path = PARQUET_PATH + ".tmp"
+    combined.to_parquet(tmp_path, engine="pyarrow", compression="snappy", index=False)
+    os.replace(tmp_path, PARQUET_PATH)
+    print(f"Appended {len(new_rows):,} rows. Total now {len(combined):,}.")
+
+print(f"Done in {time.time() - t0:,.1f}s")
