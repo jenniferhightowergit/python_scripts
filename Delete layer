@@ -26,7 +26,6 @@ SOURCE_FOLDERS = [
 SUMMARY_CSV = Path(r"PUT\THE\PATH\TO\summary_df.csv")   # <-- from Tableau: Data > Edit Connection
 BACKUP_FOLDER = SUMMARY_CSV.parent / "backups"
 RETENTION_DAYS = 365
-SHEET_NAME = "DATA"
 
 FILE_PATTERN = re.compile(r"^NON COMM (\d{1,2})_(\d{1,2})_(\d{4})\.xlsx$", re.IGNORECASE)
 
@@ -119,24 +118,49 @@ def find_source_files() -> list:
     return [(fdate, f, mtime) for fdate, (f, mtime) in sorted(found.items())]
 
 
+def norm(name) -> str:
+    """'NUMBER OF DAYS', 'Number_Of_Days ' -> 'NUMBEROFDAYS' so header spelling doesn't matter."""
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
+
+
+REQUIRED = [norm(c) for c in ("MR_MDVC_NUMBER", "LAST_GOOD_READ_DATE", "NUMBER_OF_DAYS")]
+
+
+def find_raw_data(path: Path):
+    """Look at EVERY tab and return the one whose header row has the raw-data columns.
+    Tab names (DATA, Sheet1, Sheet4...) don't matter; pivot tabs don't have these headers so they're skipped."""
+    sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object, engine="openpyxl")
+    for tab, grid in sheets.items():
+        for r in range(min(10, len(grid))):          # header is usually row 1, allow a few junk rows above
+            headers = [norm(v) for v in grid.iloc[r]]
+            if all(req in headers for req in REQUIRED):
+                df = grid.iloc[r + 1:].copy()
+                df.columns = headers
+                return tab, df
+    return None, None
+
+
 def read_source_file(path: Path, columns: list) -> pd.DataFrame:
-    try:
-        raw = pd.read_excel(path, sheet_name=SHEET_NAME, dtype=object, engine="openpyxl")
-    except ValueError:  # no DATA tab -> use the first tab
-        raw = pd.read_excel(path, sheet_name=0, dtype=object, engine="openpyxl")
-    raw.columns = [str(c).strip() for c in raw.columns]
-    # match source headers to csv headers ignoring case/spaces
-    by_upper = {c.upper(): c for c in raw.columns}
+    tab, raw = find_raw_data(path)
+    if raw is None:
+        print(f"  ! {path.name}: no tab with MR_MDVC_NUMBER / LAST_GOOD_READ_DATE / NUMBER_OF_DAYS -- SKIPPED")
+        return None
     picked = pd.DataFrame(index=raw.index)
     for col in columns:
-        src = by_upper.get(col.upper())
-        if src is not None:
-            picked[col] = raw[src]
-    # drop fully blank rows (Excel tables often have trailing empties)
-    key = by_upper.get("MR_MDVC_NUMBER")
-    if key is not None:
-        picked = picked[raw[key].notna()]
+        if norm(col) in raw.columns:
+            picked[col] = raw[norm(col)]
+    # drop blank rows (Excel tables often have trailing empties)
+    picked = picked[raw[norm("MR_MDVC_NUMBER")].notna()]
+    print(f"  + {path.name} [tab '{tab}']: {len(picked):,} rows")
     return picked
+
+
+def drop_incomplete(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Rows missing a last good read date or number of days don't go in the report."""
+    bad = df["LAST_GOOD_READ_DATE"].isna() | df["NUMBER_OF_DAYS"].isna()
+    if bad.any():
+        print(f"  - {label}: dropped {bad.sum():,} rows missing LAST_GOOD_READ_DATE or NUMBER_OF_DAYS")
+    return df[~bad]
 
 
 def main():
@@ -147,6 +171,8 @@ def main():
     existing = pd.read_csv(SUMMARY_CSV, dtype=str, keep_default_na=False)
     columns = list(existing.columns)
     existing = enforce_types(existing, columns)
+    # cleans out the blank rows from the bad run too; those dates then get re-read from their files
+    existing = drop_incomplete(existing, "existing csv")
     print(f"Existing csv: {len(existing):,} rows, "
           f"file_date {existing['file_date'].min():%m/%d/%Y} -> {existing['file_date'].max():%m/%d/%Y}")
 
@@ -161,16 +187,18 @@ def main():
         if old_mtime is not None and pd.notna(old_mtime) and old_mtime >= mtime:
             continue
         df = read_source_file(path, columns)
+        if df is None or df.empty:
+            continue
         df["file_date"] = fdate
         df["file_modified_time"] = mtime
         new_parts.append(df)
-        print(f"  + {path.name}: {len(df):,} rows")
 
     if not new_parts:
         print("No new files. csv left as is.")
         return
 
     new = enforce_types(pd.concat(new_parts, ignore_index=True), columns)
+    new = drop_incomplete(new, "new files")
     combined = pd.concat([existing, new], ignore_index=True)
 
     # ---- one version per file_date (newest file wins), rolling window
