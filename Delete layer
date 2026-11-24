@@ -1,400 +1,205 @@
 """
-run_ranger_refresh.py  -  Project Ranger daily refresh (single entry point)
+S4e event counts: how often each event type fired over the last N days
+for RF Enhanced S4e meters (optionally limited to ALL TOWN meters).
 
-What it does
-  1. Pulls 5 source tables from Oracle (ODS + EDW) IN PARALLEL
-  2. Stores them as tables in one DuckDB file:  data/ranger.duckdb
-  3. Builds the 5-Year Plan + Status Report from those tables
-  4. Sends the email report
+Run it from a terminal, not the notebook, so it can't tie up your kernel:
+    start "" /low python s4e_event_counts.py
 
-Schedule it with Task Scheduler:
-  Program:   <path to python.exe in the project venv>
-  Arguments: run_ranger_refresh.py
-  Start in:  <this folder>          (script also works without this)
-
-Exit code 0 = success, 1 = failure (Task Scheduler shows it as "Last Run Result").
-Logs: logs/ranger_YYYY-MM-DD.log
+You can safely run it again. Days that already finished are skipped, so if it
+dies at day 37 you just rerun it. Tomorrow's run only pulls one new day.
 """
-
-import logging
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
-import keyring
-import oracledb
 import pandas as pd
-from sqlalchemy import create_engine, text
 
-# ----------------------------------------------------------------------------
-# Config - everything path/credential related lives here
-# ----------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
-DB_PATH = DATA_DIR / "ranger.duckdb"
-STARTING_LIST_XLSX = BASE_DIR / "Adjusted_Starting_List.xlsx"
+from helpers import run_query  # <-- change to wherever your run_query(sql, db) lives
 
-KEYRING_ODS = "ods_sqlalchemy"
-KEYRING_EDW = "edw_sqlalchemy"
-KEYRING_USER = "connection_string"
+# ---------------------------------------------------------------- settings
+DAYS_BACK = 60                      # set to 1 for a quick timing test first
+HW_MODEL = 'RF Enhanced S4e'
+LIMIT_TO_ALL_TOWN = True            # False = every RF Enhanced S4e meter
+OUT_DIR = Path(r'C:\Users\UMUE\Documents\S4E EVENT DATA PULL\event_counts')
+MAX_RETRIES = 3
 
-ORACLE_ARRAYSIZE = 50_000   # rows per network round trip (driver default is 100)
-EXPORT_PARQUET = False      # True = also write each source table to data/*.parquet
+EVENTS = sorted(set([
+    4556, 4557, 4558, 4559, 4560, 4561, 4562, 4563, 3231, 3229, 4555, 4575, 4554, 4474, 4473, 4468,
+    4609, 3226, 2042, 4478, 4523, 4448, 4600, 3248, 3247, 4608, 5438, 4566, 4565, 4605, 2046, 4531,
+    4532, 4541, 4542, 4543, 4544, 4545, 4546, 4533, 4534, 4535, 4536, 4537, 4538, 4539, 4540, 4,  # <- is "4" real?
+    4602, 3234, 3219, 3230, 3242, 3249, 3225, 5097, 3783, 3785, 3787, 3239, 4564, 4530, 5439, 4607,
+    5105, 3246, 4572, 4571, 5101, 3224, 3217, 3233, 3232, 4604, 3223, 3228, 2044, 2045, 4606, 4569,
+    2043, 4570, 4567, 4568, 3238, 2034, 3227, 5441, 2041, 4603, 3235, 4471, 4601, 3241, 3214, 5107,
+    3215, 5108, 3216, 5443, 5442, 5440, 4526, 5121, 5094, 5445, 5444, 4469, 1010, 5100, 5093, 2039,
+    3236, 3237, 3222, 2277, 2040, 4529, 5112, 3209, 2038, 4470, 5104, 5103, 3218, 4528, 3212, 3221,
+    5091, 2276, 4525, 1338, 3210, 4472, 3208, 3213, 4527, 4551, 3244, 4524, 3245, 3240, 5115,
+]))
+EVENT_SQL = ','.join(map(str, EVENTS))
 
-DATA_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s %(threadName)-12s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / f"ranger_{date.today():%Y-%m-%d}.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("ranger")
+DAY_DIR = OUT_DIR / 'daily'
+METERS_FILE = OUT_DIR / 'meters.parquet'
+NAMES_FILE = OUT_DIR / 'event_names.parquet'
 
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-@contextmanager
-def step(name):
-    t0 = time.perf_counter()
-    log.info("START %s", name)
-    yield
-    log.info("DONE  %s  (%.1f min)", name, (time.perf_counter() - t0) / 60)
+def log(msg):
+    print(f'{time.strftime("%H:%M:%S")}  {msg}', flush=True)
 
 
-def make_engine(keyring_service):
-    conn_string = keyring.get_password(keyring_service, KEYRING_USER)
-    if not conn_string:
-        raise RuntimeError(
-            f"No keyring entry for '{keyring_service}'. The Windows account running "
-            f"this task needs its own Credential Manager entry."
-        )
-    return create_engine(conn_string, arraysize=ORACLE_ARRAYSIZE)
+def query_with_retry(sql, db, label):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return run_query(sql, db)
+        except Exception as e:  # dropped connection, timeout, etc.
+            log(f'{label}: attempt {attempt} failed: {e}')
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(30 * attempt)
 
 
-def fetch(engine, sql, name):
-    with step(f"pull {name}"):
-        with engine.connect() as c:
-            df = pd.read_sql(text(sql), c)
-    log.info("%s: %s rows", name, f"{len(df):,}")
-    return df
+# ---------------------------------------------------------------- step 1: small reference tables
+def pull_reference():
+    meters = query_with_retry(f"""
+        SELECT METERNO, METERPGMCD, FIRMWAREVERSION
+        FROM AMSDESIGN.EDE_VW
+        WHERE HW_MODEL = '{HW_MODEL}'
+          AND FIRMWAREVERSION IS NOT NULL
+    """, 'edw', 'meter population')
+    meters = meters.drop_duplicates('METERNO')
+
+    if LIMIT_TO_ALL_TOWN:
+        town = query_with_retry(
+            'SELECT DISTINCT SERIAL_NBR FROM RPTUSER.CM_ALL_TOWN_VW', 'ods', 'all town')
+        town_ids = set(town['SERIAL_NBR'].astype(str).str.strip() + 'LG')
+        meters = meters[meters['METERNO'].isin(town_ids)]
+
+    meters.to_parquet(METERS_FILE, index=False)
+    log(f'meter population: {len(meters):,} meters')
+
+    names = query_with_retry(f"""
+        SELECT EVENTTYPEID, NAME
+        FROM CENTRALSERVICES.VW_EVENTTYPES
+        WHERE EVENTTYPEID IN ({EVENT_SQL})
+    """, 'edw', 'event names')
+    names['EVENTTYPEID'] = names['EVENTTYPEID'].astype('int64')
+    # keep every requested event, even ones with no name row
+    names = pd.DataFrame({'EVENTTYPEID': EVENTS}).merge(names, how='left')
+    names['NAME'] = names['NAME'].fillna('(no name in VW_EVENTTYPES)')
+    names.to_parquet(NAMES_FILE, index=False)
 
 
-def clean(df):
-    """Drop duplicate column names, normalize dtypes (fixed: result is now assigned)."""
-    df = df.loc[:, ~df.columns.duplicated()].convert_dtypes()
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].astype("string")
-    return df
+# ---------------------------------------------------------------- step 2: one small query per day
+def pull_day(d):
+    out = DAY_DIR / f'{d:%Y-%m-%d}.parquet'
+    if out.exists():
+        return
+    t0 = time.time()
+    # Oracle does the counting: we get back meter x event counts, not raw event rows
+    df = query_with_retry(f"""
+        SELECT ede.METERNO, ve.EVENTTYPEID, COUNT(*) AS EVENT_COUNT
+        FROM CENTRALSERVICES.VW_EVENTLOG ve
+        JOIN AMSDESIGN.EDE_VW ede ON ede.ENDPOINTID = ve.ENDPOINTID
+        WHERE ede.HW_MODEL = '{HW_MODEL}'
+          AND ve.EVENTTYPEID IN ({EVENT_SQL})
+          AND ve.EVENTDATE >= DATE '{d:%Y-%m-%d}'
+          AND ve.EVENTDATE <  DATE '{d + timedelta(days=1):%Y-%m-%d}'
+        GROUP BY ede.METERNO, ve.EVENTTYPEID
+    """, 'edw', str(d))
+    df['EVENTTYPEID'] = df['EVENTTYPEID'].astype('int64')
+    df['EVENT_COUNT'] = df['EVENT_COUNT'].astype('int64')
+    df['EVENT_DATE'] = pd.Timestamp(d)
+    tmp = out.with_suffix('.tmp')      # write then rename, so a crash never leaves a half file
+    df.to_parquet(tmp, index=False)
+    tmp.replace(out)
+    log(f'{d}: {len(df):,} meter/event rows in {time.time() - t0:,.0f}s')
 
 
-def save(con, name, df):
-    """Write a dataframe to a persistent table in ranger.duckdb."""
-    con.register("_incoming", clean(df))
-    con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM _incoming")
-    con.unregister("_incoming")
-    if EXPORT_PARQUET:
-        con.execute(f"COPY {name} TO '{DATA_DIR / (name + '.parquet')}' (FORMAT parquet)")
+# ---------------------------------------------------------------- step 3: summarize locally with DuckDB
+def summarize(days):
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW meters AS SELECT * FROM read_parquet('{METERS_FILE.as_posix()}')")
+    con.execute(f"CREATE VIEW names  AS SELECT * FROM read_parquet('{NAMES_FILE.as_posix()}')")
+    con.execute(f"""
+        CREATE VIEW ev AS
+        SELECT e.METERNO, e.EVENTTYPEID, e.EVENT_COUNT, CAST(e.EVENT_DATE AS DATE) AS EVENT_DATE,
+               m.METERPGMCD, m.FIRMWAREVERSION
+        FROM read_parquet('{DAY_DIR.as_posix()}/*.parquet', union_by_name = true) e
+        JOIN meters m USING (METERNO)
+        WHERE CAST(e.EVENT_DATE AS DATE) BETWEEN DATE '{days[0]}' AND DATE '{days[-1]}'
+    """)
+    n_meters = con.execute('SELECT COUNT(*) FROM meters').fetchone()[0]
 
+    summary = con.execute(f"""
+        SELECT n.EVENTTYPEID, n.NAME,
+               COALESCE(SUM(ev.EVENT_COUNT), 0)                        AS TOTAL_EVENTS,
+               COUNT(DISTINCT ev.METERNO)                              AS METERS_REPORTING,
+               ROUND(100.0 * COUNT(DISTINCT ev.METERNO) / {n_meters}, 2) AS PCT_METERS_REPORTING,
+               COUNT(DISTINCT ev.EVENT_DATE)                           AS DAYS_SEEN,
+               MAX(ev.EVENT_DATE)                                      AS LAST_SEEN,
+               CASE WHEN COUNT(ev.METERNO) = 0 THEN 'NOT SEEN' END     AS FLAG
+        FROM names n
+        LEFT JOIN ev USING (EVENTTYPEID)
+        GROUP BY n.EVENTTYPEID, n.NAME
+        ORDER BY TOTAL_EVENTS, n.EVENTTYPEID
+    """).df()
 
-# ----------------------------------------------------------------------------
-# Source queries (Oracle)
-# ----------------------------------------------------------------------------
-SQL_ALLTOWN = """   -- ODS  (was ALLTown.py)
-SELECT
-    TRIM(SERIAL_NBR)||TRIM(MFG_CD) METERNO,
-    SERIAL_NBR, MFG_CD, REGTYPE,
-    TRUNC(MTR_INSTL_D) METER_INSTALL_DATE,
-    SVCDISC, SP_STATUS_FLG, SP_SRC_STATUS_FLG, MTR_STATUS_FLG, MTR_ON_OFF_FLG,
-    SA_STATUS_FLG, DISCREAS, MTRVOLTS, MTRPHASE, TECHNLGY, FORMNO, CLASSAMP,
-    A.*
-FROM RPTUSER.CM_ALL_TOWN A
-"""
-
-SQL_METERING_DEVICE = """   -- ODS  (was the first half of ALL_MC_HISTORY.py)
-SELECT
-    LOCATION_ID,
-    substr(to_char(trim(mtr.CLIENT_CO_LOCATION_ID)), 8, 10) esi_loc,
-    MR_MDVC_NUMBER meterno,
-    min(trunc(INSTALL_DATE)) eff_dt,
-    max(trunc(REMOVE_DATE))  end_dt
-FROM WACSMDMS.METERING_DEVICE mtr
-GROUP BY LOCATION_ID,
-         substr(to_char(trim(mtr.CLIENT_CO_LOCATION_ID)), 8, 10),
-         MR_MDVC_NUMBER
-"""
-
-SQL_OPS_AREA = """   -- ODS  (was OPS_AREA_BY_ESILOC.py)
-WITH dups AS (
-    SELECT row_number() over (partition by b.GEO_VAL order by a.SP_ID) rn,
-           a.SP_ID, b.GEO_VAL esi_loc, c.OP_AREA_CD
-    FROM CISADM.CI_SP a
-    JOIN CISADM.CI_PREM_GEO b    ON a.PREM_ID = b.PREM_ID
-    JOIN CISADM.CI_SP_OP_AREA c  ON a.SP_ID   = c.SP_ID
-    WHERE b.GEO_TYPE_CD = 'ESI_LOC'
-    GROUP BY a.SP_ID, b.GEO_VAL, c.OP_AREA_CD
-)
-SELECT * FROM dups WHERE rn = 1
-"""
-
-SQL_FW_HARDWARE = """   -- EDW  (was FW_HARDWARE.py, ~24 min)
-SELECT DISTINCT
-    m.meterno,
-    rf.STOCKNO,
-    a.status,
-    case when lower(epm.name) like '%capability%' then 'G5 Integrated Focus AXei'
-         else epm.name end hardware_model,
-    rf.classamp CLASS,
-    rf.formno   FORM,
-    rf.metrvolt VOLT,
-    rf.FRMWAREV,
-    rf.SFTWAREV,
-    rf.MFGTYPE,
-    -- TODO: paste the remaining columns from FW_HARDWARE.py lines ~55-77
-    ede.HW_MODEL
-FROM centralservices.meters m
-LEFT JOIN mxrads.vw_asset a                     ON substr(m.meterno, 0, 9) = a.serialnum
-LEFT JOIN mxrads.cg_rfasset rf                  ON a.assetnum = rf.assetnum
-LEFT JOIN mxrads.vw_locations loc               ON a.location = loc.location
-JOIN centralservices.vw_endpoints ep            ON m.meterid = ep.meterid
-LEFT JOIN centralservices.vw_groups g           ON ep.configurationgroupid = g.groupid
-LEFT JOIN centralservices.vw_servicelocations sl ON m.servicelocationid = sl.servicelocationid
-LEFT JOIN centralservices.vw_rfendpointproperties rfp ON ep.endpointid = rfp.endpointid
-JOIN centralservices.vw_endpointmodels epm      ON ep.hwmodelid = epm.endpointmodelid
-LEFT JOIN AMSDESIGN.EDE_VW ede                  ON ede.meterno = m.meterno
-WHERE ede.HW_MODEL NOT LIKE '%Router%'
-  AND ede.HW_MODEL NOT LIKE '%Sensor%'
-  AND ede.HW_MODEL NOT LIKE '%Collector%'
-  AND ede.HW_MODEL NOT LIKE '%Series%'
-  AND ede.HW_MODEL NOT LIKE '%Underground%'
-  AND ede.HW_MODEL NOT LIKE '%Inventory%'
-  AND ede.HW_MODEL NOT LIKE '%Network%'
-"""
-
-# CHANGE: the S4X/S4E filter used to run later in DuckDB (stock3 -> stock2).
-# Pushing it into Oracle means only S4 rows cross the network.
-SQL_STOCK_INVENTORY = """   -- EDW  (was StockInventory.py)
-SELECT
-    rf.MFGTYPE, a.status, m.meterno, rf.STOCKNO,
-    rf.classamp CLASS, rf.formno FORM, rf.metrvolt VOLT
-FROM centralservices.meters m
-LEFT JOIN mxrads.vw_asset a        ON substr(m.meterno, 0, 9) = a.serialnum
-LEFT JOIN mxrads.cg_rfasset rf     ON a.assetnum = rf.assetnum
-LEFT JOIN mxrads.vw_locations loc  ON a.location = loc.location
-WHERE lower(rf.MFGTYPE) LIKE '%s4x%'
-   OR lower(rf.MFGTYPE) LIKE '%s4e%'
-"""
-
-
-# ----------------------------------------------------------------------------
-# Stage 1: pull all sources in parallel
-# ----------------------------------------------------------------------------
-def pull_sources(con):
-    oracledb.init_oracle_client()          # thick mode, once per run
-    ods = make_engine(KEYRING_ODS)
-    edw = make_engine(KEYRING_EDW)
-
-    jobs = {
-        "fw_hardware":      (edw, SQL_FW_HARDWARE),      # slowest: start first
-        "stock_inventory":  (edw, SQL_STOCK_INVENTORY),
-        "alltown":          (ods, SQL_ALLTOWN),
-        "metering_device":  (ods, SQL_METERING_DEVICE),
-        "ops_area_by_esiloc": (ods, SQL_OPS_AREA),
-    }
-
-    with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="pull") as ex:
-        futures = {name: ex.submit(fetch, eng, sql, name) for name, (eng, sql) in jobs.items()}
-        # DuckDB writes stay on the main thread; .result() re-raises any pull error
-        for name, fut in futures.items():
-            save(con, name, fut.result())
-
-    ods.dispose()
-    edw.dispose()
-
-
-# ----------------------------------------------------------------------------
-# Stage 2: derived tables (pure DuckDB, no Oracle)
-# ----------------------------------------------------------------------------
-def build_meter_effectivedate_change(con):
-    """Was the DuckDB half of ALL_MC_HISTORY.py -> METER_EFFECTIVEDATE_CHANGE.parquet"""
-    with step("meter_effectivedate_change"):
-        con.execute("""
-        CREATE OR REPLACE TABLE meter_effectivedate_change AS
-        SELECT
-            meterno,
-            lag(meterno) OVER (PARTITION BY esi_loc ORDER BY meter_install_date) AS prev_meterno,
-            esi_loc,
-            meter_install_date AS installation_date,
-            CASE WHEN status = 'INACTIVE' AND meter_removal_date = DATE '3001-01-01'
-                 THEN lead(meter_install_date) OVER (PARTITION BY esi_loc ORDER BY meter_install_date)
-                 ELSE meter_removal_date END AS meter_removal_date,
-            status
-        FROM (
-            SELECT meterno, prem_h AS esi_loc,
-                   CAST(meter_install_date AS DATE) AS meter_install_date,
-                   DATE '3001-01-01' AS meter_removal_date,
-                   'ACTIVE' AS status
-            FROM alltown
-
-            UNION
-
-            SELECT a.meterno, a.esi_loc,
-                   CAST(eff_dt AS DATE) AS meter_install_date,
-                   CASE WHEN CAST(end_dt AS DATE) = DATE '4000-12-31' THEN DATE '3001-01-01'
-                        WHEN end_dt IS NULL THEN DATE '3001-01-01'
-                        ELSE CAST(end_dt AS DATE) END AS meter_removal_date,
-                   'INACTIVE' AS status
-            FROM metering_device a
-            WHERE NOT EXISTS (SELECT 1 FROM alltown c WHERE c.meterno = a.meterno)
-        ) t1
-        """)
-
-
-# ----------------------------------------------------------------------------
-# Stage 3: reports
-# ----------------------------------------------------------------------------
-def build_5yr_plan(con):
-    """Was ProjectRanger5YearPlan.py. Intermediates are TEMP tables, not pandas."""
-    with step("5-year plan"):
-        starting = pd.read_excel(STARTING_LIST_XLSX)
-        log.info("Adjusted starting list: %s rows", f"{len(starting):,}")
-        con.register("Adjusted_Totals_2025", starting)
-
-        # Same names the original SQL used, so pasted queries keep working
-        con.execute("CREATE OR REPLACE TEMP VIEW df_all_mc AS SELECT * FROM meter_effectivedate_change")
-        con.execute("CREATE OR REPLACE TEMP VIEW stock2   AS SELECT * FROM stock_inventory")
-        con.execute("CREATE OR REPLACE TEMP VIEW assets   AS SELECT * FROM fw_hardware")
-
-        con.execute("""
-        CREATE OR REPLACE TEMP TABLE mc_max AS
-        SELECT meterno, max(meter_removal_date) AS meter_removal_date
-        FROM df_all_mc
-        WHERE status = 'INACTIVE'
-        GROUP BY meterno
-        """)
-
-        con.execute("""
-        CREATE OR REPLACE TEMP TABLE base AS
-        SELECT
-            sl.METERNO,
-            mr.meter_removal_date,
-            CASE WHEN date_trunc('month', mr.meter_removal_date) = date_trunc('month', current_date)
-                 THEN 1 ELSE 0 END AS curr_mo_flag,
-            CASE WHEN mr.meter_removal_date <= current_date THEN year(mr.meter_removal_date)  END AS REMOVAL_YEAR,
-            CASE WHEN mr.meter_removal_date <= current_date THEN month(mr.meter_removal_date) END AS REMOVAL_MONTH,
-            CASE WHEN mr.meter_removal_date <= current_date THEN 1 ELSE 0 END AS isRemoved
-        FROM Adjusted_Totals_2025 sl
-        LEFT JOIN mc_max mr ON trim(sl.meterno) = mr.meterno
-        """)
-
-        overall = con.execute("""
-        WITH _all AS (
-            SELECT count(DISTINCT meterno) AS Total_S4Es,
-                   count(DISTINCT CASE WHEN isremoved = 1 THEN meterno END) AS Total_Removed
-            FROM base
-        )
-        SELECT Total_S4Es, Total_Removed,
-               Total_S4Es - Total_Removed AS Total_Remaining,
-               Total_Removed / Total_S4Es AS Pct_Complete
-        FROM _all
+    def pct_by(col):
+        # % of meters in each program code / firmware that reported each event
+        long = con.execute(f"""
+            WITH pop  AS (SELECT {col}, COUNT(*) AS n FROM meters GROUP BY 1),
+                 hits AS (SELECT {col}, EVENTTYPEID, COUNT(DISTINCT METERNO) AS m FROM ev GROUP BY 1, 2)
+            SELECT nm.EVENTTYPEID, p.{col} || ' (' || p.n || ' meters)' AS GRP,
+                   ROUND(100.0 * COALESCE(h.m, 0) / p.n, 2) AS PCT
+            FROM names nm
+            CROSS JOIN pop p
+            LEFT JOIN hits h ON h.EVENTTYPEID = nm.EVENTTYPEID AND h.{col} = p.{col}
         """).df()
-        row = overall.iloc[0]
-        log.info("S4Es %s | removed %s | remaining %s | %.1f%% complete",
-                 f"{row.Total_S4Es:,}", f"{row.Total_Removed:,}",
-                 f"{row.Total_Remaining:,}", row.Pct_Complete * 100)
+        wide = long.pivot(index='EVENTTYPEID', columns='GRP', values='PCT').reset_index()
+        return summary[['EVENTTYPEID', 'NAME']].merge(wide, how='left')
 
-        # ---------------------------------------------------------------
-        # TODO: paste ProjectRanger5YearPlan.py lines ~155-553 here
-        #   - any `x = conn.execute(...).df()` that only feeds another query
-        #     -> change to con.execute("CREATE OR REPLACE TEMP TABLE x AS ...")
-        #   - keep .df() for things you format into the email (report1, etc.)
-        # ---------------------------------------------------------------
+    daily = con.execute('SELECT EVENTTYPEID, EVENT_DATE, SUM(EVENT_COUNT) AS N FROM ev GROUP BY 1, 2').df()
+    daily = (daily.pivot(index='EVENTTYPEID', columns='EVENT_DATE', values='N')
+                  .reindex(index=EVENTS, columns=pd.to_datetime(days)).fillna(0).astype('int64'))
+    daily.columns = [c.strftime('%m-%d') for c in daily.columns]
+    daily = summary[['EVENTTYPEID', 'NAME']].merge(daily.reset_index(names='EVENTTYPEID'))
 
-        stock = con.execute("""
-        WITH s4es AS (
-            SELECT count(DISTINCT a.meterno) AS NEEDED_AMOUNT, class, form, volt
-            FROM base a
-            JOIN stock2 rf ON trim(rf.meterno) = trim(a.meterno)
-            WHERE isRemoved = 0 AND lower(MFGTYPE) LIKE '%s4e%'
-            GROUP BY class, form, volt
-        ),
-        s4xs AS (
-            SELECT count(rf.STOCKNO) AS STOCK_AMOUNT, rf.CLASS, rf.FORM, rf.VOLT
-            FROM stock2 rf
-            WHERE trim(rf.status) IN ('ST') AND lower(MFGTYPE) LIKE '%s4x%'
-            GROUP BY rf.CLASS, rf.FORM, rf.VOLT
-        ),
-        combined AS (
-            SELECT DISTINCT rf.STOCKNO,
-                   coalesce(alt.NEEDED_AMOUNT, 0) AS NEEDED_AMOUNT,
-                   coalesce(altx.STOCK_AMOUNT, 0) AS STOCK_AMOUNT,
-                   rf.CLASS, rf.FORM, rf.VOLT
-            FROM stock2 rf
-            LEFT JOIN s4es alt ON coalesce(alt.class,'') = coalesce(rf.class,'')
-                              AND coalesce(alt.form,'')  = coalesce(rf.form,'')
-                              AND coalesce(alt.volt,'')  = coalesce(rf.volt,'')
-            LEFT JOIN s4xs altx ON coalesce(altx.class,'') = coalesce(rf.class,'')
-                               AND coalesce(altx.form,'')  = coalesce(rf.form,'')
-                               AND coalesce(altx.volt,'')  = coalesce(rf.volt,'')
-        ),
-        test AS (
-            SELECT CLASS, FORM, VOLT,
-                   max(NEEDED_AMOUNT) AS NEEDED_AMOUNT,
-                   sum(STOCK_AMOUNT)  AS STOCK_AMOUNT,
-                   string_agg(DISTINCT CAST(stockno AS varchar), ', ') AS STOCKNO
-            FROM combined
-            GROUP BY CLASS, FORM, VOLT
-        )
-        SELECT * FROM test
-        WHERE NEEDED_AMOUNT + STOCK_AMOUNT <> 0
-        ORDER BY stockno
-        """).df()
+    info = pd.DataFrame({'item': ['window start', 'window end', 'hardware', 'limited to ALL TOWN',
+                                  'meters in population', 'event types requested', 'run at'],
+                         'value': [str(days[0]), str(days[-1]), HW_MODEL, LIMIT_TO_ALL_TOWN,
+                                   n_meters, len(EVENTS), time.strftime('%Y-%m-%d %H:%M')]})
 
-        # TODO: paste the rest (stock_clean, HTML build, send_report) here
-        return overall, stock
+    xlsx = OUT_DIR / f'S4e_event_counts_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.xlsx'
+    with pd.ExcelWriter(xlsx, engine='openpyxl') as xw:
+        for name, frame in [('Summary', summary), ('By program code', pct_by('METERPGMCD')),
+                            ('By firmware', pct_by('FIRMWAREVERSION')), ('Daily counts', daily),
+                            ('Run info', info)]:
+            frame.to_excel(xw, sheet_name=name, index=False)
+            ws = xw.sheets[name]
+            ws.freeze_panes = 'C2' if name != 'Run info' else 'A2'
+            for col in ws.columns:
+                width = max(len(str(c.value or '')) for c in col[:200]) + 2
+                ws.column_dimensions[col[0].column_letter].width = min(width, 45)
+    log(f'wrote {xlsx}')
+    log(f'{(summary.FLAG == "NOT SEEN").sum()} of {len(EVENTS)} event types never fired')
 
 
-def build_status_report_by_dgroup(con):
-    """Was ProjectRangerStatusReport_by_MeterTechDgroup.py"""
-    with step("status report by meter tech / dgroup"):
-        # TODO: paste report code. Replace pd.read_parquet("X.parquet") with
-        #       con.table("x").df()  or query the table directly in SQL:
-        #   ALLTown.parquet                     -> alltown
-        #   METER_EFFECTIVEDATE_CHANGE.parquet  -> meter_effectivedate_change
-        #   fw_hardware.parquet                 -> fw_hardware
-        #   StockInventory.parquet              -> stock_inventory
-        #   OPSAREA_BY_ESILOC.parquet           -> ops_area_by_esiloc
-        pass
-
-
-# ----------------------------------------------------------------------------
 def main():
-    t0 = time.perf_counter()
-    log.info("=== Project Ranger refresh starting (db: %s) ===", DB_PATH)
-    con = duckdb.connect(str(DB_PATH))
-    try:
-        pull_sources(con)
-        build_meter_effectivedate_change(con)
-        build_5yr_plan(con)
-        build_status_report_by_dgroup(con)
-    finally:
-        con.close()
-    log.info("=== Finished in %.1f min ===", (time.perf_counter() - t0) / 60)
+    DAY_DIR.mkdir(parents=True, exist_ok=True)
+    today = date.today()
+    days = [today - timedelta(days=i) for i in range(DAYS_BACK, 0, -1)]  # whole days, excludes today
+    pull_reference()
+    failed = []
+    for d in days:
+        try:
+            pull_day(d)
+        except Exception as e:
+            log(f'{d}: giving up for now ({e})')
+            failed.append(d)
+    if failed:
+        log(f'{len(failed)} day(s) failed; rerun the script to fill them in: {failed}')
+        return
+    summarize(days)
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        log.exception("RUN FAILED")
-        sys.exit(1)
+if __name__ == '__main__':
+    main()
