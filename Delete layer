@@ -1,205 +1,213 @@
 """
-S4e event counts: how often each event type fired over the last N days
-for RF Enhanced S4e meters (optionally limited to ALL TOWN meters).
+SecConfig refresh  ->  summary_df.csv  (feeds the "Sent to AMS Design: 20 Day Aging" Tableau report)
 
-Run it from a terminal, not the notebook, so it can't tie up your kernel:
-    start "" /low python s4e_event_counts.py
-
-You can safely run it again. Days that already finished are skipped, so if it
-dies at day 37 you just rerun it. Tomorrow's run only pulls one new day.
+What it does
+  1. Reads the existing summary_df.csv (that file's header is the schema: column names and order).
+  2. Scans AMS DESIGN IMPORT + AMS DESIGN ARCHIVE for files named exactly "NON COMM m_d_yyyy.xlsx".
+  3. Loads only files that are new (file_date not in the csv yet) or newer than what's in the csv.
+  4. Forces every column to one data type so Tableau never sees mixed types.
+  5. Keeps one file per file_date (newest file_modified_time wins) and a rolling 1-year window.
+  6. Backs up the old csv, then writes the new one in a single step (temp file + swap).
 """
-import time
-from datetime import date, timedelta
+
+import os
+import re
+import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import duckdb
 import pandas as pd
 
-from helpers import run_query  # <-- change to wherever your run_query(sql, db) lives
+# ---------------------------------------------------------------- CONFIG
+SOURCE_FOLDERS = [
+    Path(r"\\eucprdnas01\u_support\AMS DESIGN IMPORT"),
+    Path(r"\\eucprdnas01\u_support\AMS DESIGN IMPORT\AMS DESIGN ARCHIVE"),
+]
+SUMMARY_CSV = Path(r"PUT\THE\PATH\TO\summary_df.csv")   # <-- from Tableau: Data > Edit Connection
+BACKUP_FOLDER = SUMMARY_CSV.parent / "backups"
+RETENTION_DAYS = 365
+SHEET_NAME = "DATA"
 
-# ---------------------------------------------------------------- settings
-DAYS_BACK = 60                      # set to 1 for a quick timing test first
-HW_MODEL = 'RF Enhanced S4e'
-LIMIT_TO_ALL_TOWN = True            # False = every RF Enhanced S4e meter
-OUT_DIR = Path(r'C:\Users\UMUE\Documents\S4E EVENT DATA PULL\event_counts')
-MAX_RETRIES = 3
+FILE_PATTERN = re.compile(r"^NON COMM (\d{1,2})_(\d{1,2})_(\d{4})\.xlsx$", re.IGNORECASE)
 
-EVENTS = sorted(set([
-    4556, 4557, 4558, 4559, 4560, 4561, 4562, 4563, 3231, 3229, 4555, 4575, 4554, 4474, 4473, 4468,
-    4609, 3226, 2042, 4478, 4523, 4448, 4600, 3248, 3247, 4608, 5438, 4566, 4565, 4605, 2046, 4531,
-    4532, 4541, 4542, 4543, 4544, 4545, 4546, 4533, 4534, 4535, 4536, 4537, 4538, 4539, 4540, 4,  # <- is "4" real?
-    4602, 3234, 3219, 3230, 3242, 3249, 3225, 5097, 3783, 3785, 3787, 3239, 4564, 4530, 5439, 4607,
-    5105, 3246, 4572, 4571, 5101, 3224, 3217, 3233, 3232, 4604, 3223, 3228, 2044, 2045, 4606, 4569,
-    2043, 4570, 4567, 4568, 3238, 2034, 3227, 5441, 2041, 4603, 3235, 4471, 4601, 3241, 3214, 5107,
-    3215, 5108, 3216, 5443, 5442, 5440, 4526, 5121, 5094, 5445, 5444, 4469, 1010, 5100, 5093, 2039,
-    3236, 3237, 3222, 2277, 2040, 4529, 5112, 3209, 2038, 4470, 5104, 5103, 3218, 4528, 3212, 3221,
-    5091, 2276, 4525, 1338, 3210, 4472, 3208, 3213, 4527, 4551, 3244, 4524, 3245, 3240, 5115,
-]))
-EVENT_SQL = ','.join(map(str, EVENTS))
+DATE_COLS = ["LAST_GOOD_READ_DATE", "file_date"]
+DATETIME_COLS = ["file_modified_time"]
+INT_COLS = ["NUMBER_OF_DAYS"]
+FLOAT_COLS = ["LATITUDE", "LONGITUDE"]
+# Every other column is text, except the per-row count columns (Total_Row..., Distinct_C...,
+# TDistinct_Count_Meters). They aren't in the source files; each row is one meter, so they're 1.
 
-DAY_DIR = OUT_DIR / 'daily'
-METERS_FILE = OUT_DIR / 'meters.parquet'
-NAMES_FILE = OUT_DIR / 'event_names.parquet'
+DATE_FMT = "%Y-%m-%d"
+DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+# ------------------------------------------------------------------------
 
 
-def log(msg):
-    print(f'{time.strftime("%H:%M:%S")}  {msg}', flush=True)
+def to_date(series: pd.Series) -> pd.Series:
+    """Excel dates, Excel serial numbers, and text dates in any common format -> datetime (NaT if hopeless)."""
+    s = series.copy()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    # 1) real datetimes
+    is_dt = s.apply(lambda v: isinstance(v, (datetime, pd.Timestamp)))
+    out[is_dt] = pd.to_datetime(s[is_dt], errors="coerce")
+
+    # 2) Excel serial numbers (e.g. 46324) -- numbers or numeric text
+    num = pd.to_numeric(s[~is_dt], errors="coerce")
+    is_serial = num.between(20000, 80000)
+    idx = num[is_serial].index
+    out[idx] = pd.to_datetime(num[is_serial], unit="D", origin="1899-12-30")
+
+    # 3) text: try known formats one at a time, then a last-chance generic parse
+    rest = s[out.isna() & s.notna()].astype(str).str.strip()
+    rest = rest[rest != ""]
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %I:%M:%S %p",
+                "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%d-%b-%y", "%d-%b-%Y", "%m/%d/%y"):
+        if rest.empty:
+            break
+        parsed = pd.to_datetime(rest, format=fmt, errors="coerce")
+        hit = parsed.notna()
+        out[rest[hit].index] = parsed[hit]
+        rest = rest[~hit]
+    if not rest.empty:
+        parsed = pd.to_datetime(rest, errors="coerce")
+        out[rest.index] = parsed
+    return out
 
 
-def query_with_retry(sql, db, label):
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return run_query(sql, db)
-        except Exception as e:  # dropped connection, timeout, etc.
-            log(f'{label}: attempt {attempt} failed: {e}')
-            if attempt == MAX_RETRIES:
-                raise
-            time.sleep(30 * attempt)
+def enforce_types(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """Put df in the csv's column order with one fixed type per column."""
+    df = df.reindex(columns=columns)
+    for col in columns:
+        if col in DATE_COLS or col in DATETIME_COLS:
+            df[col] = to_date(df[col])
+        elif col in INT_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round().astype("Int64")
+        elif col in FLOAT_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+        elif is_count_col(col):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(1).astype("Int64")
+        else:
+            df[col] = df[col].astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return df
 
 
-# ---------------------------------------------------------------- step 1: small reference tables
-def pull_reference():
-    meters = query_with_retry(f"""
-        SELECT METERNO, METERPGMCD, FIRMWAREVERSION
-        FROM AMSDESIGN.EDE_VW
-        WHERE HW_MODEL = '{HW_MODEL}'
-          AND FIRMWAREVERSION IS NOT NULL
-    """, 'edw', 'meter population')
-    meters = meters.drop_duplicates('METERNO')
-
-    if LIMIT_TO_ALL_TOWN:
-        town = query_with_retry(
-            'SELECT DISTINCT SERIAL_NBR FROM RPTUSER.CM_ALL_TOWN_VW', 'ods', 'all town')
-        town_ids = set(town['SERIAL_NBR'].astype(str).str.strip() + 'LG')
-        meters = meters[meters['METERNO'].isin(town_ids)]
-
-    meters.to_parquet(METERS_FILE, index=False)
-    log(f'meter population: {len(meters):,} meters')
-
-    names = query_with_retry(f"""
-        SELECT EVENTTYPEID, NAME
-        FROM CENTRALSERVICES.VW_EVENTTYPES
-        WHERE EVENTTYPEID IN ({EVENT_SQL})
-    """, 'edw', 'event names')
-    names['EVENTTYPEID'] = names['EVENTTYPEID'].astype('int64')
-    # keep every requested event, even ones with no name row
-    names = pd.DataFrame({'EVENTTYPEID': EVENTS}).merge(names, how='left')
-    names['NAME'] = names['NAME'].fillna('(no name in VW_EVENTTYPES)')
-    names.to_parquet(NAMES_FILE, index=False)
+def is_count_col(col: str) -> bool:
+    c = col.upper()
+    return c.startswith("TOTAL_") or c.startswith("DISTINCT_") or c.startswith("TDISTINCT_")
 
 
-# ---------------------------------------------------------------- step 2: one small query per day
-def pull_day(d):
-    out = DAY_DIR / f'{d:%Y-%m-%d}.parquet'
-    if out.exists():
-        return
-    t0 = time.time()
-    # Oracle does the counting: we get back meter x event counts, not raw event rows
-    df = query_with_retry(f"""
-        SELECT ede.METERNO, ve.EVENTTYPEID, COUNT(*) AS EVENT_COUNT
-        FROM CENTRALSERVICES.VW_EVENTLOG ve
-        JOIN AMSDESIGN.EDE_VW ede ON ede.ENDPOINTID = ve.ENDPOINTID
-        WHERE ede.HW_MODEL = '{HW_MODEL}'
-          AND ve.EVENTTYPEID IN ({EVENT_SQL})
-          AND ve.EVENTDATE >= DATE '{d:%Y-%m-%d}'
-          AND ve.EVENTDATE <  DATE '{d + timedelta(days=1):%Y-%m-%d}'
-        GROUP BY ede.METERNO, ve.EVENTTYPEID
-    """, 'edw', str(d))
-    df['EVENTTYPEID'] = df['EVENTTYPEID'].astype('int64')
-    df['EVENT_COUNT'] = df['EVENT_COUNT'].astype('int64')
-    df['EVENT_DATE'] = pd.Timestamp(d)
-    tmp = out.with_suffix('.tmp')      # write then rename, so a crash never leaves a half file
-    df.to_parquet(tmp, index=False)
-    tmp.replace(out)
-    log(f'{d}: {len(df):,} meter/event rows in {time.time() - t0:,.0f}s')
+def find_source_files() -> list:
+    found = {}
+    for folder in SOURCE_FOLDERS:
+        if not folder.exists():
+            print(f"  ! folder not found, skipping: {folder}")
+            continue
+        for f in folder.iterdir():
+            m = FILE_PATTERN.match(f.name)
+            if not m:
+                continue
+            month, day, year = map(int, m.groups())
+            try:
+                fdate = pd.Timestamp(year=year, month=month, day=day)
+            except ValueError:
+                print(f"  ! bad date in file name, skipping: {f.name}")
+                continue
+            mtime = pd.Timestamp(datetime.fromtimestamp(f.stat().st_mtime)).floor("s")
+            # same file_date in both folders -> keep the newer copy
+            if fdate not in found or mtime > found[fdate][1]:
+                found[fdate] = (f, mtime)
+    return [(fdate, f, mtime) for fdate, (f, mtime) in sorted(found.items())]
 
 
-# ---------------------------------------------------------------- step 3: summarize locally with DuckDB
-def summarize(days):
-    con = duckdb.connect()
-    con.execute(f"CREATE VIEW meters AS SELECT * FROM read_parquet('{METERS_FILE.as_posix()}')")
-    con.execute(f"CREATE VIEW names  AS SELECT * FROM read_parquet('{NAMES_FILE.as_posix()}')")
-    con.execute(f"""
-        CREATE VIEW ev AS
-        SELECT e.METERNO, e.EVENTTYPEID, e.EVENT_COUNT, CAST(e.EVENT_DATE AS DATE) AS EVENT_DATE,
-               m.METERPGMCD, m.FIRMWAREVERSION
-        FROM read_parquet('{DAY_DIR.as_posix()}/*.parquet', union_by_name = true) e
-        JOIN meters m USING (METERNO)
-        WHERE CAST(e.EVENT_DATE AS DATE) BETWEEN DATE '{days[0]}' AND DATE '{days[-1]}'
-    """)
-    n_meters = con.execute('SELECT COUNT(*) FROM meters').fetchone()[0]
-
-    summary = con.execute(f"""
-        SELECT n.EVENTTYPEID, n.NAME,
-               COALESCE(SUM(ev.EVENT_COUNT), 0)                        AS TOTAL_EVENTS,
-               COUNT(DISTINCT ev.METERNO)                              AS METERS_REPORTING,
-               ROUND(100.0 * COUNT(DISTINCT ev.METERNO) / {n_meters}, 2) AS PCT_METERS_REPORTING,
-               COUNT(DISTINCT ev.EVENT_DATE)                           AS DAYS_SEEN,
-               MAX(ev.EVENT_DATE)                                      AS LAST_SEEN,
-               CASE WHEN COUNT(ev.METERNO) = 0 THEN 'NOT SEEN' END     AS FLAG
-        FROM names n
-        LEFT JOIN ev USING (EVENTTYPEID)
-        GROUP BY n.EVENTTYPEID, n.NAME
-        ORDER BY TOTAL_EVENTS, n.EVENTTYPEID
-    """).df()
-
-    def pct_by(col):
-        # % of meters in each program code / firmware that reported each event
-        long = con.execute(f"""
-            WITH pop  AS (SELECT {col}, COUNT(*) AS n FROM meters GROUP BY 1),
-                 hits AS (SELECT {col}, EVENTTYPEID, COUNT(DISTINCT METERNO) AS m FROM ev GROUP BY 1, 2)
-            SELECT nm.EVENTTYPEID, p.{col} || ' (' || p.n || ' meters)' AS GRP,
-                   ROUND(100.0 * COALESCE(h.m, 0) / p.n, 2) AS PCT
-            FROM names nm
-            CROSS JOIN pop p
-            LEFT JOIN hits h ON h.EVENTTYPEID = nm.EVENTTYPEID AND h.{col} = p.{col}
-        """).df()
-        wide = long.pivot(index='EVENTTYPEID', columns='GRP', values='PCT').reset_index()
-        return summary[['EVENTTYPEID', 'NAME']].merge(wide, how='left')
-
-    daily = con.execute('SELECT EVENTTYPEID, EVENT_DATE, SUM(EVENT_COUNT) AS N FROM ev GROUP BY 1, 2').df()
-    daily = (daily.pivot(index='EVENTTYPEID', columns='EVENT_DATE', values='N')
-                  .reindex(index=EVENTS, columns=pd.to_datetime(days)).fillna(0).astype('int64'))
-    daily.columns = [c.strftime('%m-%d') for c in daily.columns]
-    daily = summary[['EVENTTYPEID', 'NAME']].merge(daily.reset_index(names='EVENTTYPEID'))
-
-    info = pd.DataFrame({'item': ['window start', 'window end', 'hardware', 'limited to ALL TOWN',
-                                  'meters in population', 'event types requested', 'run at'],
-                         'value': [str(days[0]), str(days[-1]), HW_MODEL, LIMIT_TO_ALL_TOWN,
-                                   n_meters, len(EVENTS), time.strftime('%Y-%m-%d %H:%M')]})
-
-    xlsx = OUT_DIR / f'S4e_event_counts_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.xlsx'
-    with pd.ExcelWriter(xlsx, engine='openpyxl') as xw:
-        for name, frame in [('Summary', summary), ('By program code', pct_by('METERPGMCD')),
-                            ('By firmware', pct_by('FIRMWAREVERSION')), ('Daily counts', daily),
-                            ('Run info', info)]:
-            frame.to_excel(xw, sheet_name=name, index=False)
-            ws = xw.sheets[name]
-            ws.freeze_panes = 'C2' if name != 'Run info' else 'A2'
-            for col in ws.columns:
-                width = max(len(str(c.value or '')) for c in col[:200]) + 2
-                ws.column_dimensions[col[0].column_letter].width = min(width, 45)
-    log(f'wrote {xlsx}')
-    log(f'{(summary.FLAG == "NOT SEEN").sum()} of {len(EVENTS)} event types never fired')
+def read_source_file(path: Path, columns: list) -> pd.DataFrame:
+    try:
+        raw = pd.read_excel(path, sheet_name=SHEET_NAME, dtype=object, engine="openpyxl")
+    except ValueError:  # no DATA tab -> use the first tab
+        raw = pd.read_excel(path, sheet_name=0, dtype=object, engine="openpyxl")
+    raw.columns = [str(c).strip() for c in raw.columns]
+    # match source headers to csv headers ignoring case/spaces
+    by_upper = {c.upper(): c for c in raw.columns}
+    picked = pd.DataFrame(index=raw.index)
+    for col in columns:
+        src = by_upper.get(col.upper())
+        if src is not None:
+            picked[col] = raw[src]
+    # drop fully blank rows (Excel tables often have trailing empties)
+    key = by_upper.get("MR_MDVC_NUMBER")
+    if key is not None:
+        picked = picked[raw[key].notna()]
+    return picked
 
 
 def main():
-    DAY_DIR.mkdir(parents=True, exist_ok=True)
-    today = date.today()
-    days = [today - timedelta(days=i) for i in range(DAYS_BACK, 0, -1)]  # whole days, excludes today
-    pull_reference()
-    failed = []
-    for d in days:
-        try:
-            pull_day(d)
-        except Exception as e:
-            log(f'{d}: giving up for now ({e})')
-            failed.append(d)
-    if failed:
-        log(f'{len(failed)} day(s) failed; rerun the script to fill them in: {failed}')
+    today = pd.Timestamp.today().normalize()
+    cutoff = today - timedelta(days=RETENTION_DAYS)
+
+    # ---- existing data
+    existing = pd.read_csv(SUMMARY_CSV, dtype=str, keep_default_na=False)
+    columns = list(existing.columns)
+    existing = enforce_types(existing, columns)
+    print(f"Existing csv: {len(existing):,} rows, "
+          f"file_date {existing['file_date'].min():%m/%d/%Y} -> {existing['file_date'].max():%m/%d/%Y}")
+
+    have = existing.groupby("file_date")["file_modified_time"].max().to_dict()
+
+    # ---- new / updated files
+    new_parts = []
+    for fdate, path, mtime in find_source_files():
+        if fdate < cutoff:
+            continue
+        old_mtime = have.get(fdate)
+        if old_mtime is not None and pd.notna(old_mtime) and old_mtime >= mtime:
+            continue
+        df = read_source_file(path, columns)
+        df["file_date"] = fdate
+        df["file_modified_time"] = mtime
+        new_parts.append(df)
+        print(f"  + {path.name}: {len(df):,} rows")
+
+    if not new_parts:
+        print("No new files. csv left as is.")
         return
-    summarize(days)
+
+    new = enforce_types(pd.concat(new_parts, ignore_index=True), columns)
+    combined = pd.concat([existing, new], ignore_index=True)
+
+    # ---- one version per file_date (newest file wins), rolling window
+    latest = combined.groupby("file_date")["file_modified_time"].transform("max")
+    combined = combined[combined["file_modified_time"] == latest]
+    combined = combined[combined["file_date"] >= cutoff]
+    combined = combined.sort_values(["file_date", "LAST_GOOD_READ_DATE"]).reset_index(drop=True)
+
+    # ---- guardrail report
+    bad_lgrd = combined["LAST_GOOD_READ_DATE"].isna().sum()
+    bad_days = combined["NUMBER_OF_DAYS"].isna().sum()
+    if bad_lgrd or bad_days:
+        print(f"  ! rows with unreadable LAST_GOOD_READ_DATE: {bad_lgrd}, NUMBER_OF_DAYS: {bad_days}")
+
+    # ---- write: dates as text in ONE format so Tableau reads them the same every time
+    out = combined.copy()
+    for col in DATE_COLS:
+        out[col] = out[col].dt.strftime(DATE_FMT)
+    for col in DATETIME_COLS:
+        out[col] = out[col].dt.strftime(DATETIME_FMT)
+
+    BACKUP_FOLDER.mkdir(exist_ok=True)
+    backup = BACKUP_FOLDER / f"summary_df_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    shutil.copy2(SUMMARY_CSV, backup)
+
+    tmp = SUMMARY_CSV.with_suffix(".tmp")
+    out.to_csv(tmp, index=False)
+    os.replace(tmp, SUMMARY_CSV)
+
+    print(f"Wrote {len(out):,} rows, file_date {combined['file_date'].min():%m/%d/%Y} -> "
+          f"{combined['file_date'].max():%m/%d/%Y}")
+    print(f"Backup: {backup}")
+    print("\nCheck vs the email pivot (latest file_date):")
+    last = combined[combined["file_date"] == combined["file_date"].max()]
+    print(last.groupby("NUMBER_OF_DAYS").size().sort_index(ascending=False).to_string())
+    print(f"Total: {len(last)}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
